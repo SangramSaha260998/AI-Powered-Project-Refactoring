@@ -1,0 +1,17 @@
+# Dependency directories
+node_modules/
+frontend/node_modules/
+server/node_modules/
+
+# Production builds
+frontend/dist/
+frontend/.angular/
+
+# Environment configurations and secret API keys
+.env
+server/.env
+
+# Operating System temporary tracking files
+Thumbs.db
+Desktop.ini
+.DS_Store

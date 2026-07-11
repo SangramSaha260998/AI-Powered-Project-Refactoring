@@ -1,38 +1,9 @@
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import admZip from 'adm-zip';
-import path from 'path';
 import fs from 'fs';
+import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const EXTRACT_DIR = path.join(__dirname, 'extracted');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-if (!fs.existsSync(EXTRACT_DIR)) fs.mkdirSync(EXTRACT_DIR);
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
-});
-
-const upload = multer({
-  storage,
-  fileFilter: (req, file, cb) => {
-    if (path.extname(file.originalname).toLowerCase() !== '.zip') {
-      return cb(new Error('Only ZIP files are allowed!'), false);
-    }
-    cb(null, true);
-  }
-});
 
 const FRAMEWORK_SIGNATURES = {
   angular: ['@angular/core'],
@@ -77,6 +48,11 @@ function hasFilesWithExtensions(dirPath, extensions, maxDepth = 5) {
 
 function validateProjectFramework(extractPath, expectedFramework) {
   const expected = (expectedFramework || '').toLowerCase().trim();
+  console.log(`\nvalidateProjectFramework called:`);
+  console.log(`  extractPath: ${extractPath}`);
+  console.log(`  expectedFramework: ${expectedFramework}`);
+  console.log(`  expected (lower): ${expected}`);
+  
   if (!expected || (expected !== 'angular' && expected !== 'react')) {
     return { valid: false, reason: `Unknown target framework: "${expectedFramework}".` };
   }
@@ -87,12 +63,21 @@ function validateProjectFramework(extractPath, expectedFramework) {
   const candidates = [path.join(extractPath, 'package.json')];
   try {
     const entries = fs.readdirSync(extractPath, { withFileTypes: true });
+    console.log(`  entries in extractPath:`);
     for (const entry of entries) {
+      console.log(`    ${entry.name} (isDirectory: ${entry.isDirectory()})`);
       if (entry.isDirectory()) {
         candidates.push(path.join(extractPath, entry.name, 'package.json'));
       }
     }
-  } catch {}
+  } catch (e) {
+    console.log(`  Error reading dir: ${e.message}`);
+  }
+
+  console.log(`  candidate package.json paths:`);
+  for (const c of candidates) {
+    console.log(`    ${c} (exists: ${fs.existsSync(c)})`);
+  }
 
   let packageJsonPath = null;
   for (const candidate of candidates) {
@@ -104,13 +89,17 @@ function validateProjectFramework(extractPath, expectedFramework) {
 
   if (!packageJsonPath) {
     failures.push('No package.json found in the uploaded project.');
+    console.log(`  No package.json found`);
   } else {
+    console.log(`  Found package.json at: ${packageJsonPath}`);
     let packageData;
     try {
       const raw = fs.readFileSync(packageJsonPath, 'utf-8');
       packageData = JSON.parse(raw);
-    } catch {
+      console.log(`  Parsed package.json, name: ${packageData.name}`);
+    } catch (e) {
       failures.push('Found package.json but it could not be parsed.');
+      console.log(`  Error parsing package.json: ${e.message}`);
     }
     if (packageData) {
       const allDeps = {
@@ -119,8 +108,11 @@ function validateProjectFramework(extractPath, expectedFramework) {
         ...(packageData.peerDependencies || {})
       };
       const depNames = Object.keys(allDeps);
+      console.log(`  Dependencies found: ${depNames.slice(0, 10).join(', ')}...`);
       const expectedSignatures = FRAMEWORK_SIGNATURES[expected] || [];
+      console.log(`  Looking for: ${expectedSignatures.join(', ')}`);
       const foundFramework = expectedSignatures.some(sig => depNames.includes(sig));
+      console.log(`  foundFramework: ${foundFramework}`);
       if (!foundFramework) {
         failures.push(`Missing ${expectedDisplay} dependency: expected ${expectedSignatures.join(' or ')} in package.json.`);
       }
@@ -129,15 +121,21 @@ function validateProjectFramework(extractPath, expectedFramework) {
 
   // CHECK 2: Structural signal
   if (expected === 'angular') {
-    if (!findConfigFile(extractPath, 'angular.json')) {
+    const configFile = findConfigFile(extractPath, 'angular.json');
+    console.log(`  angular.json found: ${configFile}`);
+    if (!configFile) {
       failures.push('No angular.json found — this is not a standard Angular CLI project.');
     }
   } else if (expected === 'react') {
-    if (!hasFilesWithExtensions(extractPath, ['.jsx', '.tsx'])) {
+    const hasJsxTsx = hasFilesWithExtensions(extractPath, ['.jsx', '.tsx']);
+    console.log(`  Has .jsx/.tsx files: ${hasJsxTsx}`);
+    if (!hasJsxTsx) {
       failures.push('No .jsx or .tsx files found — this does not look like a React project.');
     }
   }
 
+  console.log(`  failures: ${failures.length > 0 ? failures.join(' | ') : 'NONE'}`);
+  
   if (failures.length > 0) {
     return {
       valid: false,
@@ -147,72 +145,21 @@ function validateProjectFramework(extractPath, expectedFramework) {
   return { valid: true };
 }
 
-function removeDirectoryRecursive(dirPath) {
-  if (fs.existsSync(dirPath)) {
-    fs.rmSync(dirPath, { recursive: true, force: true });
-  }
+// TEST: Test against BOTH old and new extraction directories
+const paths = [
+  path.join(__dirname, 'extracted', '1783788916720-angular_project'),
+  path.join(__dirname, 'extracted', '1783789972001-1783788916720-angular_project')
+];
+
+for (const p of paths) {
+  console.log('\n' + '='.repeat(70));
+  console.log(`Testing: ${p}`);
+  console.log('='.repeat(70));
+  console.log('\n--- with fromTech = "React" ---');
+  const result1 = validateProjectFramework(p, 'React');
+  console.log('Result:', JSON.stringify(result1, null, 2));
+  
+  console.log('\n--- with fromTech = "Angular" ---');
+  const result2 = validateProjectFramework(p, 'Angular');
+  console.log('Result:', JSON.stringify(result2, null, 2));
 }
-
-function removeFile(filePath) {
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
-}
-
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'Backend engine online and ready to extract packages!' });
-});
-
-app.post('/api/upload', upload.single('projectZip'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'Please upload a valid ZIP file.' });
-  }
-
-  const fromTech = req.body.fromTech || 'Unknown';
-  const toTech = req.body.toTech || 'Unknown';
-  const prompt = req.body.prompt || '';
-
-  console.log(`\nNew Migration Request Received!`);
-  console.log(`Pipeline Path: Converting from [${fromTech}] to [${toTech}]`);
-  console.log(`User Prompt: ${prompt}`);
-  console.log(`File Saved As: ${req.file.filename}`);
-
-  const sourceZipPath = req.file.path;
-  const projectSessionName = path.parse(req.file.filename).name;
-  const currentTargetExtractPath = path.join(EXTRACT_DIR, projectSessionName);
-
-  try {
-    const zip = new admZip(sourceZipPath);
-    zip.extractAllTo(currentTargetExtractPath, true);
-    console.log(`Extracted to: ${currentTargetExtractPath}`);
-
-    const validation = validateProjectFramework(currentTargetExtractPath, fromTech);
-
-    if (!validation.valid) {
-      console.error(`Validation failed: ${validation.reason}`);
-      removeDirectoryRecursive(currentTargetExtractPath);
-      removeFile(sourceZipPath);
-      return res.status(400).json({ error: `Project validation failed: ${validation.reason}` });
-    }
-
-    console.log(`Project validated as ${fromTech}.`);
-
-    res.json({
-      message: `Workspace successfully unpacked! Ready to migrate from ${fromTech} to ${toTech}.`,
-      sessionId: projectSessionName,
-      extractedLocation: currentTargetExtractPath,
-      fromTech,
-      toTech
-    });
-  } catch (error) {
-    console.error('Extraction error:', error);
-    removeDirectoryRecursive(currentTargetExtractPath);
-    removeFile(sourceZipPath);
-    res.status(500).json({ error: 'Failed to extract package files.' });
-  }
-});
-
-const PORT = 5000;
-app.listen(PORT, () => {
-  console.log(`Migration Engine listening on http://localhost:${PORT}`);
-});

@@ -102,7 +102,8 @@ export class App {
       error: (err) => {
         this.isLoading.set(false);
         this.isSuccess.set(false);
-        this.statusMessage.set('❌ Pipeline execution failed. Verify server terminal connection.');
+        const serverError = err?.error?.error || err?.message || 'Unknown server error';
+        this.statusMessage.set(`❌ ${serverError}`);
         console.error(err);
       }
     });

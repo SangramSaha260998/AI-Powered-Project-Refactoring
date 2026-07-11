@@ -1,39 +1,11 @@
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import admZip from 'adm-zip';
-import path from 'path';
 import fs from 'fs';
+import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const EXTRACT_DIR = path.join(__dirname, 'extracted');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-if (!fs.existsSync(EXTRACT_DIR)) fs.mkdirSync(EXTRACT_DIR);
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
-});
-
-const upload = multer({
-  storage,
-  fileFilter: (req, file, cb) => {
-    if (path.extname(file.originalname).toLowerCase() !== '.zip') {
-      return cb(new Error('Only ZIP files are allowed!'), false);
-    }
-    cb(null, true);
-  }
-});
-
+// Copy of the validation logic from index.js
 const FRAMEWORK_SIGNATURES = {
   angular: ['@angular/core'],
   react: ['react', 'react-dom']
@@ -147,72 +119,35 @@ function validateProjectFramework(extractPath, expectedFramework) {
   return { valid: true };
 }
 
-function removeDirectoryRecursive(dirPath) {
-  if (fs.existsSync(dirPath)) {
-    fs.rmSync(dirPath, { recursive: true, force: true });
-  }
-}
+// TEST: Angular project with fromTech = 'React'
+const angularExtractPath = path.join(__dirname, 'extracted', '1783788916720-angular_project');
+console.log('=' .repeat(70));
+console.log('TEST 1: Angular project with fromTech = "React"');
+console.log('=' .repeat(70));
+const result1 = validateProjectFramework(angularExtractPath, 'React');
+console.log('Result:', JSON.stringify(result1, null, 2));
+console.log('');
 
-function removeFile(filePath) {
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
-}
+// TEST: Angular project with fromTech = 'Angular'
+console.log('=' .repeat(70));
+console.log('TEST 2: Angular project with fromTech = "Angular" (should pass)');
+console.log('=' .repeat(70));
+const result2 = validateProjectFramework(angularExtractPath, 'Angular');
+console.log('Result:', JSON.stringify(result2, null, 2));
+console.log('');
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'Backend engine online and ready to extract packages!' });
-});
+// TEST: Does the angular project accidentally have .tsx files?
+console.log('=' .repeat(70));
+console.log('TEST 3: Check if Angular project has .jsx or .tsx files');
+console.log('=' .repeat(70));
+const hasJsx = hasFilesWithExtensions(angularExtractPath, ['.jsx', '.tsx']);
+console.log('Has .jsx/.tsx files:', hasJsx);
+console.log('');
 
-app.post('/api/upload', upload.single('projectZip'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'Please upload a valid ZIP file.' });
-  }
-
-  const fromTech = req.body.fromTech || 'Unknown';
-  const toTech = req.body.toTech || 'Unknown';
-  const prompt = req.body.prompt || '';
-
-  console.log(`\nNew Migration Request Received!`);
-  console.log(`Pipeline Path: Converting from [${fromTech}] to [${toTech}]`);
-  console.log(`User Prompt: ${prompt}`);
-  console.log(`File Saved As: ${req.file.filename}`);
-
-  const sourceZipPath = req.file.path;
-  const projectSessionName = path.parse(req.file.filename).name;
-  const currentTargetExtractPath = path.join(EXTRACT_DIR, projectSessionName);
-
-  try {
-    const zip = new admZip(sourceZipPath);
-    zip.extractAllTo(currentTargetExtractPath, true);
-    console.log(`Extracted to: ${currentTargetExtractPath}`);
-
-    const validation = validateProjectFramework(currentTargetExtractPath, fromTech);
-
-    if (!validation.valid) {
-      console.error(`Validation failed: ${validation.reason}`);
-      removeDirectoryRecursive(currentTargetExtractPath);
-      removeFile(sourceZipPath);
-      return res.status(400).json({ error: `Project validation failed: ${validation.reason}` });
-    }
-
-    console.log(`Project validated as ${fromTech}.`);
-
-    res.json({
-      message: `Workspace successfully unpacked! Ready to migrate from ${fromTech} to ${toTech}.`,
-      sessionId: projectSessionName,
-      extractedLocation: currentTargetExtractPath,
-      fromTech,
-      toTech
-    });
-  } catch (error) {
-    console.error('Extraction error:', error);
-    removeDirectoryRecursive(currentTargetExtractPath);
-    removeFile(sourceZipPath);
-    res.status(500).json({ error: 'Failed to extract package files.' });
-  }
-});
-
-const PORT = 5000;
-app.listen(PORT, () => {
-  console.log(`Migration Engine listening on http://localhost:${PORT}`);
-});
+// TEST: What about the 2nd Angular project zip?
+const angularExtractPath2 = path.join(__dirname, 'extracted', '1783789352619-angular_project');
+console.log('=' .repeat(70));
+console.log('TEST 4: 2nd Angular project with fromTech = "React"');
+console.log('=' .repeat(70));
+const result4 = validateProjectFramework(angularExtractPath2, 'React');
+console.log('Result:', JSON.stringify(result4, null, 2));

@@ -52,9 +52,11 @@ app.post('/api/upload', upload.single('projectZip'), (req, res) => {
   // Capture the From/To framework metadata values from the Angular dropdowns
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
+  const prompt = req.body.prompt || '';
 
   console.log(`\n📦 New Migration Request Received!`);
   console.log(`🔄 Pipeline Path: Converting from [${fromTech}] to [${toTech}]`);
+  console.log(`💬 User Prompt: ${prompt}`);
   console.log(`📁 File Saved Temporarily As: ${req.file.filename}`);
 
   const sourceZipPath = req.file.path;

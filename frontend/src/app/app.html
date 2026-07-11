@@ -30,8 +30,18 @@
       </div>
     </section>
 
+    <section class="prompt-card">
+      <h3>2. Describe Your Migration Prompt</h3>
+      <textarea
+        class="prompt-textarea"
+        placeholder="e.g., Convert Angular components to React functional components with hooks, ensuring all lifecycle methods are replaced appropriately..."
+        (input)="onPromptChange($event)"
+        rows="4"></textarea>
+      <p class="prompt-hint">Provide detailed instructions for the AI migration engine.</p>
+    </section>
+
     <section class="upload-card">
-      <h3>2. Upload Source Code Bundle</h3>
+      <h3>3. Upload Source Code Bundle</h3>
       <div 
         class="dropzone" 
         [class.dragover]="isDragging()"

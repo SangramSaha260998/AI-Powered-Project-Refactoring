@@ -21,6 +21,7 @@ export class App {
   toTech = signal<string>('React');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
+  prompt = signal<string>('');
   isLoading = signal<boolean>(false);
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
@@ -55,6 +56,11 @@ export class App {
     }
   }
 
+  onPromptChange(event: Event) {
+    const value = (event.target as HTMLTextAreaElement).value;
+    this.prompt.set(value);
+  }
+
   onFileSelected(event: Event) {
     const input = event.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
@@ -84,6 +90,7 @@ export class App {
     formData.append('projectZip', file);
     formData.append('fromTech', this.fromTech());
     formData.append('toTech', this.toTech());
+    formData.append('prompt', this.prompt());
 
     // Send payload to our Express engine route
     this.http.post('http://localhost:5000/api/upload', formData).subscribe({

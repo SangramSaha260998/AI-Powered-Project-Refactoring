@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "start:frontend": "cd frontend && ng serve",
-    "start:backend": "cd server && node index.js",
+    "start:backend": "cd server && node src/server.js",
     "start": "concurrently \"npm run start:frontend\" \"npm run start:backend\""
   },
   "devDependencies": {

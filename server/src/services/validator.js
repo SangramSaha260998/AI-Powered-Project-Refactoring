@@ -1,15 +1,14 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { FRAMEWORK_SIGNATURES } from '../config/index.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const FRAMEWORK_SIGNATURES = {
-  angular: ['@angular/core'],
-  react: ['react', 'react-dom']
-};
-
+/**
+ * Searches for a config file (e.g. angular.json) inside the extract directory.
+ * Checks root first, then one level deep.
+ * @param {string} extractPath - Root of the extracted project
+ * @param {string} fileName - Config file name to find
+ * @returns {string|null} Full path to the file if found, null otherwise
+ */
 function findConfigFile(extractPath, fileName) {
   const rootPath = path.join(extractPath, fileName);
   if (fs.existsSync(rootPath)) return rootPath;
@@ -21,11 +20,21 @@ function findConfigFile(extractPath, fileName) {
         if (fs.existsSync(nested)) return nested;
       }
     }
-  } catch {}
+  } catch {
+    // ignore permission errors
+  }
   return null;
 }
 
-function hasFilesWithExtensions(dirPath, extensions, maxDepth = 5) {
+/**
+ * Recursively scans a directory tree to see if any files with the given
+ * extensions exist (up to a max depth).
+ * @param {string} dirPath - Root directory to scan
+ * @param {string[]} extensions - File extensions to look for (e.g. ['.jsx', '.tsx'])
+ * @param {number} maxDepth - Maximum recursion depth
+ * @returns {boolean} True if at least one matching file is found
+ */
+export function hasFilesWithExtensions(dirPath, extensions, maxDepth = 5) {
   function scan(currentPath, depth) {
     if (depth > maxDepth) return false;
     try {
@@ -40,19 +49,27 @@ function hasFilesWithExtensions(dirPath, extensions, maxDepth = 5) {
           if (extensions.includes(ext)) return true;
         }
       }
-    } catch {}
+    } catch {
+      // ignore permission errors
+    }
     return false;
   }
   return scan(dirPath, 0);
 }
 
-function validateProjectFramework(extractPath, expectedFramework) {
+/**
+ * Validates that an extracted project matches the expected frontend framework.
+ *
+ * Checks:
+ *  1. package.json includes the framework's signature dependency.
+ *  2. Structural signals (angular.json for Angular, .jsx/.tsx files for React).
+ *
+ * @param {string} extractPath - Root of the extracted project
+ * @param {string} expectedFramework - 'Angular' or 'React' (case-insensitive)
+ * @returns {{ valid: boolean, reason?: string }} Validation result
+ */
+export function validateProjectFramework(extractPath, expectedFramework) {
   const expected = (expectedFramework || '').toLowerCase().trim();
-  console.log(`\nvalidateProjectFramework called:`);
-  console.log(`  extractPath: ${extractPath}`);
-  console.log(`  expectedFramework: ${expectedFramework}`);
-  console.log(`  expected (lower): ${expected}`);
-  
   if (!expected || (expected !== 'angular' && expected !== 'react')) {
     return { valid: false, reason: `Unknown target framework: "${expectedFramework}".` };
   }
@@ -63,20 +80,13 @@ function validateProjectFramework(extractPath, expectedFramework) {
   const candidates = [path.join(extractPath, 'package.json')];
   try {
     const entries = fs.readdirSync(extractPath, { withFileTypes: true });
-    console.log(`  entries in extractPath:`);
     for (const entry of entries) {
-      console.log(`    ${entry.name} (isDirectory: ${entry.isDirectory()})`);
       if (entry.isDirectory()) {
         candidates.push(path.join(extractPath, entry.name, 'package.json'));
       }
     }
-  } catch (e) {
-    console.log(`  Error reading dir: ${e.message}`);
-  }
-
-  console.log(`  candidate package.json paths:`);
-  for (const c of candidates) {
-    console.log(`    ${c} (exists: ${fs.existsSync(c)})`);
+  } catch {
+    // ignore
   }
 
   let packageJsonPath = null;
@@ -89,17 +99,13 @@ function validateProjectFramework(extractPath, expectedFramework) {
 
   if (!packageJsonPath) {
     failures.push('No package.json found in the uploaded project.');
-    console.log(`  No package.json found`);
   } else {
-    console.log(`  Found package.json at: ${packageJsonPath}`);
     let packageData;
     try {
       const raw = fs.readFileSync(packageJsonPath, 'utf-8');
       packageData = JSON.parse(raw);
-      console.log(`  Parsed package.json, name: ${packageData.name}`);
-    } catch (e) {
+    } catch {
       failures.push('Found package.json but it could not be parsed.');
-      console.log(`  Error parsing package.json: ${e.message}`);
     }
     if (packageData) {
       const allDeps = {
@@ -108,34 +114,27 @@ function validateProjectFramework(extractPath, expectedFramework) {
         ...(packageData.peerDependencies || {})
       };
       const depNames = Object.keys(allDeps);
-      console.log(`  Dependencies found: ${depNames.slice(0, 10).join(', ')}...`);
       const expectedSignatures = FRAMEWORK_SIGNATURES[expected] || [];
-      console.log(`  Looking for: ${expectedSignatures.join(', ')}`);
       const foundFramework = expectedSignatures.some(sig => depNames.includes(sig));
-      console.log(`  foundFramework: ${foundFramework}`);
       if (!foundFramework) {
-        failures.push(`Missing ${expectedDisplay} dependency: expected ${expectedSignatures.join(' or ')} in package.json.`);
+        failures.push(
+          `Missing ${expectedDisplay} dependency: expected ${expectedSignatures.join(' or ')} in package.json.`
+        );
       }
     }
   }
 
   // CHECK 2: Structural signal
   if (expected === 'angular') {
-    const configFile = findConfigFile(extractPath, 'angular.json');
-    console.log(`  angular.json found: ${configFile}`);
-    if (!configFile) {
+    if (!findConfigFile(extractPath, 'angular.json')) {
       failures.push('No angular.json found — this is not a standard Angular CLI project.');
     }
   } else if (expected === 'react') {
-    const hasJsxTsx = hasFilesWithExtensions(extractPath, ['.jsx', '.tsx']);
-    console.log(`  Has .jsx/.tsx files: ${hasJsxTsx}`);
-    if (!hasJsxTsx) {
+    if (!hasFilesWithExtensions(extractPath, ['.jsx', '.tsx'])) {
       failures.push('No .jsx or .tsx files found — this does not look like a React project.');
     }
   }
 
-  console.log(`  failures: ${failures.length > 0 ? failures.join(' | ') : 'NONE'}`);
-  
   if (failures.length > 0) {
     return {
       valid: false,
@@ -143,23 +142,4 @@ function validateProjectFramework(extractPath, expectedFramework) {
     };
   }
   return { valid: true };
-}
-
-// TEST: Test against BOTH old and new extraction directories
-const paths = [
-  path.join(__dirname, 'extracted', '1783788916720-angular_project'),
-  path.join(__dirname, 'extracted', '1783789972001-1783788916720-angular_project')
-];
-
-for (const p of paths) {
-  console.log('\n' + '='.repeat(70));
-  console.log(`Testing: ${p}`);
-  console.log('='.repeat(70));
-  console.log('\n--- with fromTech = "React" ---');
-  const result1 = validateProjectFramework(p, 'React');
-  console.log('Result:', JSON.stringify(result1, null, 2));
-  
-  console.log('\n--- with fromTech = "Angular" ---');
-  const result2 = validateProjectFramework(p, 'Angular');
-  console.log('Result:', JSON.stringify(result2, null, 2));
 }

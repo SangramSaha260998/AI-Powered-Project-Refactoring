@@ -1,19 +1,35 @@
 import fs from 'fs';
 import path from 'path';
 import AdmZip from 'adm-zip';
-import { GoogleGenAI, Type } from '@google/genai';
+import OpenAI from 'openai';
 import {
   IGNORED_FOLDERS,
   TEXT_EXTENSIONS,
-  GEMINI_MODEL,
+  getOpenAIConfig,
   RATE_LIMIT_PAUSE_MS
 } from '../config/index.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 
 // ---------------------------------------------------------------------------
-// Initialise the Gemini client
+// Lazy OpenAI client — created on first call so dotenv has time to load
 // ---------------------------------------------------------------------------
-const ai = new GoogleGenAI({});
+let _openai = null;
+
+function getClient() {
+  if (!_openai) {
+    const config = getOpenAIConfig();
+    if (!config.apiKey) {
+      throw new Error(
+        'OPENAI_API_KEY is not set. Please configure it in server/.env or as an environment variable.'
+      );
+    }
+    _openai = new OpenAI({
+      baseURL: config.baseURL,
+      apiKey: config.apiKey
+    });
+  }
+  return _openai;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,6 +39,31 @@ const ai = new GoogleGenAI({});
  * Simple promise-based delay.
  */
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Makes a chat completion call with the given messages and optional JSON mode.
+ */
+async function callLLM(systemInstruction, userContent, jsonMode = false) {
+  const client = getClient();
+
+  const messages = [
+    { role: 'system', content: systemInstruction },
+    { role: 'user', content: userContent }
+  ];
+
+  const config = getOpenAIConfig();
+  const requestOptions = {
+    model: config.model,
+    messages
+  };
+
+  if (jsonMode) {
+    requestOptions.response_format = { type: 'json_object' };
+  }
+
+  const response = await client.chat.completions.create(requestOptions);
+  return response.choices[0].message.content;
+}
 
 /**
  * Safely filters out framework bloat and reads only real text files.
@@ -377,7 +418,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 // ---------------------------------------------------------------------------
 
 /**
- * Runs the full AI-powered migration pipeline.
+ * Runs the full AI-powered migration pipeline using an OpenAI-compatible API.
  *
  * @param {string} sourceZipPath     - Filesystem path to the uploaded ZIP
  * @param {string} userPrompt        - User's migration instructions
@@ -433,7 +474,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   }
 
   // -----------------------------------------------------------------------
-  // 3. AGENT STEP 1: Generate migration blueprint from Gemini
+  // 3. AGENT STEP 1: Generate migration blueprint
   // -----------------------------------------------------------------------
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
@@ -442,7 +483,7 @@ You are a Principal Software Architect. Your task is to analyze an incoming sour
 Analyze the file directory structure. Provide an array mapping of target framework files that must be created from scratch to fully rebuild the app in the new architecture.
 - If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, etc.
 - If targeting React: convert Angular components into React functional components with hooks.
-Your output must strictly be raw valid JSON matching the exact schema configuration provided. No markdown wrappers.
+Your output must strictly be raw valid JSON. No markdown wrappers. The JSON must have a single top-level key "migrationPlan" whose value is an array of objects. Each object must have these keys: "newPath" (string), "explanationOfSource" (string), "approximateSourceFilesToRead" (array of strings).
 `;
 
   const blueprintPrompt = `
@@ -459,56 +500,19 @@ ${userPrompt}
 [TO TECH] ${toTech}
 `;
 
-  const blueprintResponse = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: blueprintPrompt,
-    config: {
-      systemInstruction: blueprintSystemInstruction,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          migrationPlan: {
-            type: Type.ARRAY,
-            description: 'List of files that must be written/modified to complete the migration',
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                newPath: {
-                  type: Type.STRING,
-                  description:
-                    'The relative folder path and file name for the target architecture (e.g. src/app/components/demo-form/demo-form.component.ts)'
-                },
-                explanationOfSource: {
-                  type: Type.STRING,
-                  description: 'Brief note specifying exactly which original files are related to this file\'s logic'
-                },
-                approximateSourceFilesToRead: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: 'Array of original file paths needed to generate this file.'
-                }
-              },
-              required: ['newPath', 'explanationOfSource', 'approximateSourceFilesToRead']
-            }
-          }
-        },
-        required: ['migrationPlan']
-      }
-    }
-  });
+  const blueprintText = await callLLM(blueprintSystemInstruction, blueprintPrompt, true);
 
-  const parsedPlan = JSON.parse(blueprintResponse.text);
+  const parsedPlan = JSON.parse(blueprintText);
   const targetFileList = parsedPlan.migrationPlan;
 
   if (!targetFileList || !Array.isArray(targetFileList) || targetFileList.length === 0) {
-    throw new Error('Gemini returned an empty migration plan. Please try again with a more specific prompt.');
+    throw new Error('The AI returned an empty migration plan. Please try again with a more specific prompt.');
   }
 
   console.log(`[${sessionId}] Blueprint built. Total files to convert: ${targetFileList.length}`);
 
   // -----------------------------------------------------------------------
-  // 4. AGENT STEP 2: Write each file one-by-one using Gemini
+  // 4. AGENT STEP 2: Write each file one-by-one
   // -----------------------------------------------------------------------
   const fileWriterSystemInstruction = `
 You are an elite Senior Frontend Engineer executing a framework translation.
@@ -549,31 +553,19 @@ Purpose/Details: ${fileTarget.explanationOfSource}
 Migration target framework: ${toTech}
 `;
 
-    let fileContentResult;
+    let fileContent;
     try {
-      fileContentResult = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: individualFileWriterPrompt,
-        config: {
-          systemInstruction: fileWriterSystemInstruction
-        }
-      });
+      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false);
     } catch (err) {
-      console.error(`[${sessionId}] Gemini call failed for ${fileTarget.newPath}:`, err.message);
+      console.error(`[${sessionId}] LLM call failed for ${fileTarget.newPath}:`, err.message);
       // Retry once
       await pause(10000);
-      fileContentResult = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: individualFileWriterPrompt,
-        config: {
-          systemInstruction: fileWriterSystemInstruction
-        }
-      });
+      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false);
     }
 
     const fullWritePath = path.join(migrationWorkspacePath, fileTarget.newPath);
     ensureDirectoryExists(path.dirname(fullWritePath));
-    fs.writeFileSync(fullWritePath, fileContentResult.text.trim(), 'utf-8');
+    fs.writeFileSync(fullWritePath, fileContent.trim(), 'utf-8');
 
     // Rate-limit pause between files (not after the last one)
     if (i < targetFileList.length - 1) {

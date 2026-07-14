@@ -52,9 +52,17 @@ export const TEXT_EXTENSIONS = [
 ];
 
 /**
- * Gemini model to use for AI-powered migration.
+ * OpenAI-compatible API configuration.
+ * Uses environment variables with sensible defaults.
+ * These are read lazily via getters so dotenv has time to load.
  */
-export const GEMINI_MODEL = 'gemini-2.0-flash-001';
+export function getOpenAIConfig() {
+  return {
+    baseURL: process.env.OPENAI_BASE_URL || 'https://zenmux.ai/api/v1',
+    model: process.env.OPENAI_MODEL || 'stepfun/step-3.7-flash-free',
+    apiKey: process.env.OPENAI_API_KEY || ''
+  };
+}
 
 /**
  * Rate-limit pause between AI file generations (in ms).

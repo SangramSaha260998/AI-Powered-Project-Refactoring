@@ -11,6 +11,7 @@
         <div class="control-field">
           <label for="fromTech">Source Framework (From):</label>
           <select id="fromTech" (change)="onFromChange($event)">
+            <option value="" disabled selected>-- Select Source Framework --</option>
             @for (tech of technologies; track tech.id) {
               <option [value]="tech.technology">{{ tech.technology }}</option>
             }
@@ -22,8 +23,9 @@
         <div class="control-field">
           <label for="toTech">Target Framework (To):</label>
           <select id="toTech" (change)="onToChange($event)">
+            <option value="" disabled selected>-- Select Target Framework --</option>
             @for (tech of technologies; track tech.id) {
-              <option [value]="tech.technology" [selected]="tech.id === 2">{{ tech.technology }}</option>
+              <option [value]="tech.technology">{{ tech.technology }}</option>
             }
           </select>
         </div>
@@ -34,7 +36,7 @@
       <h3>2. Describe Your Migration Prompt</h3>
       <textarea
         class="prompt-textarea"
-        placeholder="e.g., Convert Angular components to React functional components with hooks, ensuring all lifecycle methods are replaced appropriately..."
+        [placeholder]="placeholderText"
         (input)="onPromptChange($event)"
         rows="4"></textarea>
       <p class="prompt-hint">Provide detailed instructions for the AI migration engine.</p>

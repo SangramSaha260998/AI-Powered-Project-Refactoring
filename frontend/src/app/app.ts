@@ -17,14 +17,30 @@ export class App {
   ];
 
   // Modern Angular Signals replacing classic variables
-  fromTech = signal<string>('Angular');
-  toTech = signal<string>('React');
+  fromTech = signal<string>('');
+  toTech = signal<string>('');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
   prompt = signal<string>('');
   isLoading = signal<boolean>(false);
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
+
+  get placeholderText(): string {
+    const from = this.fromTech();
+    const to = this.toTech();
+
+    if (!from && !to) {
+      return 'e.g., Convert Angular components to React functional components with hooks...';
+    }
+    if (from && !to) {
+      return `e.g., Convert ${from} components to your target framework...`;
+    }
+    if (!from && to) {
+      return `e.g., Convert your source framework components to ${to}...`;
+    }
+    return `e.g., Convert ${from} components to ${to} functional components with hooks, ensuring all lifecycle methods are replaced appropriately...`;
+  }
 
   constructor(private http: HttpClient) {}
 

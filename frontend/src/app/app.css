@@ -16,6 +16,173 @@ body {
   padding: 0 20px;
 }
 
+/* Responsive Breakpoints */
+@media (max-width: 768px) {
+  .app-container {
+    margin: 20px auto;
+    padding: 0 16px;
+  }
+
+  .app-header h1 {
+    font-size: 1.5rem;
+  }
+
+  .app-header p {
+    font-size: 14px;
+  }
+
+  .config-card, .prompt-card, .upload-card {
+    padding: 16px;
+  }
+
+  .dropdown-group {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .migration-arrow {
+    transform: rotate(90deg);
+    padding-top: 0;
+    margin: 4px 0;
+  }
+
+  .control-field {
+    width: 100%;
+  }
+
+  .control-field select {
+    font-size: 14px;
+    padding: 10px;
+  }
+
+  .dropzone {
+    padding: 24px 16px;
+  }
+
+  .prompt-info p, .file-info p {
+    font-size: 14px;
+  }
+
+  .action-btn {
+    padding: 12px;
+    font-size: 15px;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-container {
+    margin: 12px auto;
+    padding: 0 12px;
+  }
+
+  .app-header h1 {
+    font-size: 1.25rem;
+  }
+
+  .config-card, .prompt-card, .upload-card {
+    padding: 14px;
+    border-radius: 8px;
+  }
+
+  .config-card h3, .prompt-card h3, .upload-card h3 {
+    font-size: 16px;
+    margin-bottom: 14px;
+  }
+
+  .prompt-textarea {
+    font-size: 14px;
+    padding: 12px;
+  }
+
+  .dropzone {
+    padding: 20px 12px;
+  }
+
+  .upload-icon, .file-icon {
+    font-size: 36px;
+  }
+
+  .prompt-info p, .file-info p {
+    font-size: 13px;
+  }
+
+  .action-btn {
+    padding: 14px;
+    font-size: 14px;
+  }
+
+  .status-banner {
+    font-size: 13px;
+    padding: 10px;
+  }
+}
+
+/* Touch-friendly targets */
+@media (hover: none) and (pointer: coarse) {
+  .control-field select {
+    min-height: 44px;
+  }
+
+  .action-btn {
+    min-height: 48px;
+  }
+
+  .dropzone {
+    min-height: 120px;
+  }
+
+  .prompt-textarea {
+    min-height: 100px;
+  }
+}
+
+/* Hover effects for desktop */
+@media (hover: hover) and (pointer: fine) {
+  .action-btn:hover:not(:disabled) {
+    background-color: #1e293b;
+  }
+
+  .dropzone:hover {
+    border-color: #94a3b8;
+    background: #f1f5f9;
+  }
+
+  .control-field select:hover {
+    border-color: #94a3b8;
+  }
+
+  .control-field select:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  }
+}
+
+/* Reduce motion for accessibility */
+@media (prefers-reduced-motion: reduce) {
+  .prompt-textarea,
+  .action-btn,
+  .dropzone,
+  .control-field select {
+    transition: none;
+  }
+}
+
+/* Print styles */
+@media print {
+  .app-container {
+    margin: 0;
+    padding: 0;
+  }
+
+  .dropzone {
+    border: 1px solid #ccc;
+  }
+
+  .action-btn {
+    display: none;
+  }
+}
+
 .app-header {
   text-align: center;
   margin-bottom: 40px;

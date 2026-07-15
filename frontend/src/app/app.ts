@@ -7,13 +7,13 @@ import { DecimalPipe } from '@angular/common';
   standalone: true,
   imports: [DecimalPipe],
   templateUrl: './app.html',
-  styleUrl: './app.css'
+  styleUrl: './app.css',
 })
 export class App {
   // Your custom framework values dictionary
   technologies = [
     { id: 1, technology: 'Angular' },
-    { id: 2, technology: 'React' }
+    { id: 2, technology: 'React' },
   ];
 
   // Modern Angular Signals replacing classic variables
@@ -100,28 +100,55 @@ export class App {
     if (!file) return;
 
     this.isLoading.set(true);
-    this.statusMessage.set('Uploading package and resolving dependencies...');
+    this.statusMessage.set('Running AI migration pipeline...');
 
     const formData = new FormData();
-    formData.append('projectZip', file);
+    formData.append('zipFile', file);
     formData.append('fromTech', this.fromTech());
     formData.append('toTech', this.toTech());
     formData.append('prompt', this.prompt());
 
-    // Send payload to our Express engine route
-    this.http.post('http://localhost:5000/api/upload', formData).subscribe({
-      next: (response: any) => {
-        this.isLoading.set(false);
-        this.isSuccess.set(true);
-        this.statusMessage.set(`🎉 Success: ${response.message}`);
-      },
-      error: (err) => {
-        this.isLoading.set(false);
-        this.isSuccess.set(false);
-        const serverError = err?.error?.error || err?.message || 'Unknown server error';
-        this.statusMessage.set(`❌ ${serverError}`);
-        console.error(err);
-      }
-    });
+    // Send payload to our Express migration engine (returns a downloadable ZIP blob)
+    this.http
+      .post('http://localhost:5000/api/migrate', formData, {
+        responseType: 'blob',
+      })
+      .subscribe({
+        next: (blob: Blob) => {
+          // Trigger browser download of the returned ZIP
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'migrated_project.zip';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+
+          this.isLoading.set(false);
+          this.isSuccess.set(true);
+          this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
+        },
+        error: async (err) => {
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+
+          let errorMessage = 'Unknown server error';
+          if (err.error instanceof Blob) {
+            try {
+              const text = await err.error.text();
+              const parsed = JSON.parse(text);
+              errorMessage = parsed.error || errorMessage;
+            } catch {
+              errorMessage = err.message || errorMessage;
+            }
+          } else {
+            errorMessage = err?.error?.error || err?.message || errorMessage;
+          }
+
+          this.statusMessage.set(`❌ ${errorMessage}`);
+          console.error(err);
+        },
+      });
   }
 }

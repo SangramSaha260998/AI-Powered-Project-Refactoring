@@ -1,4 +1,8 @@
-<div class="app-container">
+<div
+  class="app-container"
+  [loadingOverlay]="isLoading()"
+  [overlayText]="'Running AI migration pipeline...'"
+>
   <header class="app-header">
     <h1>⚡ AI Framework Migration Studio</h1>
     <p>Seamless structural conversion engine for Angular & React ecosystems</p>

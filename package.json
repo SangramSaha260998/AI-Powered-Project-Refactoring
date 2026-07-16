@@ -4,19 +4,12 @@
   "description": "AI-powered framework migration and refactoring pipeline",
   "private": true,
   "scripts": {
-    "start:frontend": "cd frontend && ng serve",
-    "start:backend": "cd server && node src/server.js",
-    "start": "concurrently \"npm run start:frontend\" \"npm run start:backend\""
+    "start:frontend": "npm run start --prefix frontend",
+    "start:backend": "npm run start --prefix server",
+    "start": "concurrently \"npm run start:frontend\" \"npm run start:backend\"",
+    "install:all": "npm install && cd frontend && npm install && cd ../server && npm install"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
-  },
-  "dependencies": {
-    "@google/genai": "^2.11.0",
-    "adm-zip": "^0.5.18",
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "multer": "^2.2.0"
+    "concurrently": "^9.1.2"
   }
 }

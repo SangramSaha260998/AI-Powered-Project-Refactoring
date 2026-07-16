@@ -10,11 +10,11 @@
     "test:debug": "node tests/debug.mjs"
   },
   "dependencies": {
-    "adm-zip": "^0.5.10",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "adm-zip": "^0.5.18",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "multer": "^1.4.5-lts.1",
-    "openai": "^6.46.0"
+    "openai": "^4.77.0"
   }
 }

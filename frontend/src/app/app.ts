@@ -1,4 +1,4 @@
-import { Component, signal } from '@angular/core';
+import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
 
@@ -7,13 +7,15 @@ import { DecimalPipe } from '@angular/common';
   standalone: true,
   imports: [DecimalPipe],
   templateUrl: './app.html',
-  styleUrl: './app.css'
+  styleUrl: './app.css',
 })
 export class App {
+  private readonly fileInput = viewChild<ElementRef<HTMLInputElement>>('fileInput');
+
   // Your custom framework values dictionary
   technologies = [
     { id: 1, technology: 'Angular' },
-    { id: 2, technology: 'React' }
+    { id: 2, technology: 'React' },
   ];
 
   // Modern Angular Signals replacing classic variables
@@ -88,6 +90,7 @@ export class App {
     if (file.name.endsWith('.zip')) {
       this.selectedFile.set(file);
       this.statusMessage.set('');
+      this.isSuccess.set(false);
     } else {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
@@ -95,33 +98,97 @@ export class App {
     }
   }
 
+  /** Reset form controls after a successful migration download. */
+  private clearUiAfterSuccess() {
+    this.fromTech.set('');
+    this.toTech.set('');
+    this.prompt.set('');
+    this.selectedFile.set(null);
+    this.isDragging.set(false);
+    this.isLoading.set(false);
+    this.isSuccess.set(true);
+    this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
+
+    const input = this.fileInput()?.nativeElement;
+    if (input) {
+      input.value = '';
+    }
+  }
+
   uploadProject() {
     const file = this.selectedFile();
     if (!file) return;
 
+    const from = this.fromTech();
+    const to = this.toTech();
+    const promptText = this.prompt().trim();
+
+    if (!from || !to) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please select both source and target frameworks.');
+      return;
+    }
+    if (from === to) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Source and target frameworks must be different.');
+      return;
+    }
+    if (!promptText) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please enter a migration prompt.');
+      return;
+    }
+
     this.isLoading.set(true);
-    this.statusMessage.set('Uploading package and resolving dependencies...');
+    this.isSuccess.set(false);
+    this.statusMessage.set('Running AI migration pipeline...');
 
     const formData = new FormData();
-    formData.append('projectZip', file);
-    formData.append('fromTech', this.fromTech());
-    formData.append('toTech', this.toTech());
-    formData.append('prompt', this.prompt());
+    formData.append('zipFile', file);
+    formData.append('fromTech', from);
+    formData.append('toTech', to);
+    formData.append('prompt', promptText);
 
-    // Send payload to our Express engine route
-    this.http.post('http://localhost:5000/api/upload', formData).subscribe({
-      next: (response: any) => {
-        this.isLoading.set(false);
-        this.isSuccess.set(true);
-        this.statusMessage.set(`🎉 Success: ${response.message}`);
-      },
-      error: (err) => {
-        this.isLoading.set(false);
-        this.isSuccess.set(false);
-        const serverError = err?.error?.error || err?.message || 'Unknown server error';
-        this.statusMessage.set(`❌ ${serverError}`);
-        console.error(err);
-      }
-    });
+    // Send payload to our Express migration engine (returns a downloadable ZIP blob)
+    this.http
+      .post('http://localhost:5000/api/migrate', formData, {
+        responseType: 'blob',
+      })
+      .subscribe({
+        next: (blob: Blob) => {
+          // Trigger browser download of the returned ZIP
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'migrated_project.zip';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+
+          // Clear the form only after a successful API response + download trigger
+          this.clearUiAfterSuccess();
+        },
+        error: async (err) => {
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+
+          let errorMessage = 'Unknown server error';
+          if (err.error instanceof Blob) {
+            try {
+              const text = await err.error.text();
+              const parsed = JSON.parse(text);
+              errorMessage = parsed.error || errorMessage;
+            } catch {
+              errorMessage = err.message || errorMessage;
+            }
+          } else {
+            errorMessage = err?.error?.error || err?.message || errorMessage;
+          }
+
+          this.statusMessage.set(`❌ ${errorMessage}`);
+          console.error(err);
+        },
+      });
   }
 }

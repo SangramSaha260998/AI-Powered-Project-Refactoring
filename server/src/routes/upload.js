@@ -86,18 +86,45 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
  *   - toTech   (string, optional): Target framework
  */
 router.post('/migrate', upload.single('zipFile'), async (req, res) => {
-  const userPrompt = req.body.prompt;
+  const userPrompt = (req.body.prompt || '').trim();
   const zipFile = req.file;
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
 
   if (!zipFile || !userPrompt) {
-    return res.status(400).json({ error: 'Files and prompts are required.' });
+    return res.status(400).json({ error: 'ZIP file and migration prompt are required.' });
+  }
+  if (!fromTech || fromTech === 'Unknown' || !toTech || toTech === 'Unknown') {
+    return res.status(400).json({ error: 'Both source and target frameworks are required.' });
+  }
+  if (fromTech === toTech) {
+    return res.status(400).json({ error: 'Source and target frameworks must be different.' });
   }
 
   const id = Date.now().toString();
   const extractPath = path.join(EXTRACT_DIR, id);
+  const convertedPath = path.join(EXTRACT_DIR, `${id}-converted`);
   const outputZipPath = path.join(EXTRACT_DIR, `${id}-final.zip`);
+
+  // Quick pre-check: unpack just enough to validate source framework before spending AI tokens
+  const preExtractPath = path.join(EXTRACT_DIR, `${id}-precheck`);
+  try {
+    ensureDirectoryExists(preExtractPath);
+    const zip = new AdmZip(zipFile.path);
+    zip.extractAllTo(preExtractPath, true);
+    const validation = validateProjectFramework(preExtractPath, fromTech);
+    removeDirectoryRecursive(preExtractPath);
+
+    if (!validation.valid) {
+      removeFile(zipFile.path);
+      return res.status(400).json({ error: `Project validation failed: ${validation.reason}` });
+    }
+  } catch (error) {
+    removeDirectoryRecursive(preExtractPath);
+    removeFile(zipFile?.path);
+    console.error(`[${id}] Pre-validation failed:`, error);
+    return res.status(400).json({ error: 'Could not validate the uploaded ZIP. Ensure it is a valid project archive.' });
+  }
 
   try {
     const resultZipPath = await runMigrationPipeline(
@@ -110,14 +137,19 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     res.download(resultZipPath, 'migrated_project.zip', (err) => {
       if (err) {
         console.error(`[${id}] Download error:`, err);
+        // Keep artifacts on download failure so the run can be retried/debugged.
+        return;
       }
-      // Cleanup: remove uploaded file and extracted directories
-      cleanupSession(zipFile.path, extractPath, resultZipPath);
+
+      // Successful download → wipe uploaded ZIP + all extracted session folders/files
+      console.log(`[${id}] Download complete. Cleaning extracted session files...`);
+      cleanupSession(zipFile.path, extractPath, resultZipPath, convertedPath);
     });
   } catch (error) {
     console.error(`[${id}] Migration pipeline failed:`, error);
     res.status(500).json({ error: error.message || 'The Agentic processing loop failed.' });
-    cleanupSession(zipFile?.path, extractPath, outputZipPath);
+    // Still clean up on pipeline failure so disk does not fill with partial runs
+    cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
   }
 });
 

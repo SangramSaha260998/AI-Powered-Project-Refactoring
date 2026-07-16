@@ -7,24 +7,6 @@ An AI-powered framework migration and refactoring pipeline that seamlessly conve
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=flat&logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-## 📋 Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [API Endpoints](#api-endpoints)
-- [Project Structure](#project-structure)
-- [How It Works](#how-it-works)
-- [Development](#development)
-- [Testing](#testing)
-- [Known Limitations](#known-limitations)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## 🎯 Overview
 

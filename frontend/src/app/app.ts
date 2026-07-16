@@ -99,14 +99,34 @@ export class App {
     const file = this.selectedFile();
     if (!file) return;
 
+    const from = this.fromTech();
+    const to = this.toTech();
+    const promptText = this.prompt().trim();
+
+    if (!from || !to) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please select both source and target frameworks.');
+      return;
+    }
+    if (from === to) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Source and target frameworks must be different.');
+      return;
+    }
+    if (!promptText) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please enter a migration prompt.');
+      return;
+    }
+
     this.isLoading.set(true);
     this.statusMessage.set('Running AI migration pipeline...');
 
     const formData = new FormData();
     formData.append('zipFile', file);
-    formData.append('fromTech', this.fromTech());
-    formData.append('toTech', this.toTech());
-    formData.append('prompt', this.prompt());
+    formData.append('fromTech', from);
+    formData.append('toTech', to);
+    formData.append('prompt', promptText);
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)
     this.http

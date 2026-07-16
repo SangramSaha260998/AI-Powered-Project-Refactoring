@@ -38,32 +38,36 @@
         class="prompt-textarea"
         [placeholder]="placeholderText"
         (input)="onPromptChange($event)"
-        rows="4"></textarea>
+        rows="4"
+      ></textarea>
       <p class="prompt-hint">Provide detailed instructions for the AI migration engine.</p>
     </section>
 
     <section class="upload-card">
       <h3>3. Upload Source Code Bundle</h3>
-      <div 
-        class="dropzone" 
+      <div
+        class="dropzone"
         [class.dragover]="isDragging()"
         (dragover)="onDragOver($event)"
         (dragleave)="onDragLeave()"
         (drop)="onDrop($event)"
-        (click)="fileInput.click()">
-        
-        <input 
-          #fileInput 
-          type="file" 
-          accept=".zip" 
-          style="display: none;" 
-          (change)="onFileSelected($event)">
+        (click)="fileInput.click()"
+      >
+        <input
+          #fileInput
+          type="file"
+          accept=".zip"
+          style="display: none"
+          (change)="onFileSelected($event)"
+        />
 
         @if (selectedFile()) {
           <div class="file-info">
             <span class="file-icon">📦</span>
             <p class="file-name">{{ selectedFile()?.name }}</p>
-            <p class="file-size">{{ (selectedFile()?.size ?? 0) / 1024 / 1024 | number:'1.2-2' }} MB</p>
+            <p class="file-size">
+              {{ (selectedFile()?.size ?? 0) / 1024 / 1024 | number: '1.2-2' }} MB
+            </p>
           </div>
         } @else {
           <div class="prompt-info">
@@ -74,10 +78,11 @@
         }
       </div>
 
-      <button 
-        class="action-btn" 
-        [disabled]="!selectedFile() || isLoading()" 
-        (click)="uploadProject()">
+      <button
+        class="action-btn"
+        [disabled]="!selectedFile() || !toTech() || !fromTech() || !prompt().trim() || isLoading()"
+        (click)="uploadProject()"
+      >
         @if (isLoading()) {
           <span class="spinner"></span> Processing Package...
         } @else {

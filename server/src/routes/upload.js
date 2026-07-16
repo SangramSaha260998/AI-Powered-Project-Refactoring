@@ -137,12 +137,18 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     res.download(resultZipPath, 'migrated_project.zip', (err) => {
       if (err) {
         console.error(`[${id}] Download error:`, err);
+        // Keep artifacts on download failure so the run can be retried/debugged.
+        return;
       }
+
+      // Successful download → wipe uploaded ZIP + all extracted session folders/files
+      console.log(`[${id}] Download complete. Cleaning extracted session files...`);
       cleanupSession(zipFile.path, extractPath, resultZipPath, convertedPath);
     });
   } catch (error) {
     console.error(`[${id}] Migration pipeline failed:`, error);
     res.status(500).json({ error: error.message || 'The Agentic processing loop failed.' });
+    // Still clean up on pipeline failure so disk does not fill with partial runs
     cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
   }
 });

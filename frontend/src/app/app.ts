@@ -1,4 +1,4 @@
-import { Component, signal } from '@angular/core';
+import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
 
@@ -10,6 +10,8 @@ import { DecimalPipe } from '@angular/common';
   styleUrl: './app.css',
 })
 export class App {
+  private readonly fileInput = viewChild<ElementRef<HTMLInputElement>>('fileInput');
+
   // Your custom framework values dictionary
   technologies = [
     { id: 1, technology: 'Angular' },
@@ -88,10 +90,28 @@ export class App {
     if (file.name.endsWith('.zip')) {
       this.selectedFile.set(file);
       this.statusMessage.set('');
+      this.isSuccess.set(false);
     } else {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
       this.selectedFile.set(null);
+    }
+  }
+
+  /** Reset form controls after a successful migration download. */
+  private clearUiAfterSuccess() {
+    this.fromTech.set('');
+    this.toTech.set('');
+    this.prompt.set('');
+    this.selectedFile.set(null);
+    this.isDragging.set(false);
+    this.isLoading.set(false);
+    this.isSuccess.set(true);
+    this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
+
+    const input = this.fileInput()?.nativeElement;
+    if (input) {
+      input.value = '';
     }
   }
 
@@ -120,6 +140,7 @@ export class App {
     }
 
     this.isLoading.set(true);
+    this.isSuccess.set(false);
     this.statusMessage.set('Running AI migration pipeline...');
 
     const formData = new FormData();
@@ -145,9 +166,8 @@ export class App {
           a.remove();
           window.URL.revokeObjectURL(url);
 
-          this.isLoading.set(false);
-          this.isSuccess.set(true);
-          this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
+          // Clear the form only after a successful API response + download trigger
+          this.clearUiAfterSuccess();
         },
         error: async (err) => {
           this.isLoading.set(false);

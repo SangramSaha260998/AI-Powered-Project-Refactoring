@@ -1557,13 +1557,23 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
 
 /**
  * Cleans up temporary files created during a migration session.
+ * Removes uploaded ZIP, extract dir, converted dir, and final ZIP.
  */
 export function cleanupSession(sourceZipPath, extractPath, outputZipPath, convertedPath) {
   try {
-    if (sourceZipPath && fs.existsSync(sourceZipPath)) fs.unlinkSync(sourceZipPath);
-    if (extractPath && fs.existsSync(extractPath)) fs.rmSync(extractPath, { recursive: true, force: true });
-    if (convertedPath && fs.existsSync(convertedPath)) fs.rmSync(convertedPath, { recursive: true, force: true });
-    if (outputZipPath && fs.existsSync(outputZipPath)) fs.unlinkSync(outputZipPath);
+    const targets = [sourceZipPath, extractPath, convertedPath, outputZipPath].filter(Boolean);
+
+    for (const target of targets) {
+      if (!fs.existsSync(target)) continue;
+      const stat = fs.statSync(target);
+      if (stat.isDirectory()) {
+        fs.rmSync(target, { recursive: true, force: true });
+        console.log(`Removed directory: ${target}`);
+      } else {
+        fs.unlinkSync(target);
+        console.log(`Removed file: ${target}`);
+      }
+    }
   } catch (err) {
     console.error('Cleanup failed:', err);
   }

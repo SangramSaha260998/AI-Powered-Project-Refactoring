@@ -10,8 +10,8 @@
       <div class="dropdown-group">
         <div class="control-field">
           <label for="fromTech">Source Framework (From):</label>
-          <select id="fromTech" (change)="onFromChange($event)">
-            <option value="" disabled selected>-- Select Source Framework --</option>
+          <select id="fromTech" [value]="fromTech()" (change)="onFromChange($event)">
+            <option value="" disabled>-- Select Source Framework --</option>
             @for (tech of technologies; track tech.id) {
               <option [value]="tech.technology">{{ tech.technology }}</option>
             }
@@ -22,8 +22,8 @@
 
         <div class="control-field">
           <label for="toTech">Target Framework (To):</label>
-          <select id="toTech" (change)="onToChange($event)">
-            <option value="" disabled selected>-- Select Target Framework --</option>
+          <select id="toTech" [value]="toTech()" (change)="onToChange($event)">
+            <option value="" disabled>-- Select Target Framework --</option>
             @for (tech of technologies; track tech.id) {
               <option [value]="tech.technology">{{ tech.technology }}</option>
             }
@@ -36,6 +36,7 @@
       <h3>2. Describe Your Migration Prompt</h3>
       <textarea
         class="prompt-textarea"
+        [value]="prompt()"
         [placeholder]="placeholderText"
         (input)="onPromptChange($event)"
         rows="4"

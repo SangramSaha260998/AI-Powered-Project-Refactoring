@@ -3,6 +3,16 @@
   [loadingOverlay]="isLoading()"
   [overlayText]="'Running AI migration pipeline...'"
 >
+  <button
+    type="button"
+    class="theme-toggle"
+    (click)="toggleTheme()"
+    [attr.aria-label]="theme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme'"
+  >
+    <span class="theme-toggle-icon" aria-hidden="true">{{ theme() === 'light' ? '🌙' : '☀️' }}</span>
+    <span>{{ theme() === 'light' ? 'Dark' : 'Light' }}</span>
+  </button>
+
   <header class="app-header">
     <h1>⚡ AI Framework Migration Studio</h1>
     <p>Seamless structural conversion engine for Angular & React ecosystems</p>

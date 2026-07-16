@@ -1,10 +1,97 @@
-/* Global styles */
+/* Theme tokens */
+:root,
+html[data-theme='light'] {
+  color-scheme: light;
 
+  --bg-page: #f1f5f9;
+  --bg-page-accent: #e2e8f0;
+  --bg-surface: #ffffff;
+  --bg-muted: #f8fafc;
+  --bg-muted-hover: #f1f5f9;
+  --bg-dropzone-active: #eff6ff;
+
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --text-placeholder: #94a3b8;
+  --text-inverse: #ffffff;
+
+  --border-default: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --border-hover: #94a3b8;
+  --border-focus: #2563eb;
+
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06);
+  --focus-ring: 0 0 0 3px rgba(37, 99, 235, 0.18);
+
+  --btn-bg: #0f172a;
+  --btn-bg-hover: #1e293b;
+  --btn-bg-disabled: #cbd5e1;
+  --btn-text: #ffffff;
+
+  --status-error-bg: #fef2f2;
+  --status-error-text: #991b1b;
+  --status-success-bg: #f0fdf4;
+  --status-success-text: #166534;
+
+  --overlay-bg: rgba(241, 245, 249, 0.78);
+  --spinner-color: #0f172a;
+  --theme-toggle-bg: #ffffff;
+  --theme-toggle-border: #cbd5e1;
+  --theme-toggle-hover: #f8fafc;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg-page: #0b1220;
+  --bg-page-accent: #111827;
+  --bg-surface: #111827;
+  --bg-muted: #1f2937;
+  --bg-muted-hover: #273449;
+  --bg-dropzone-active: #172554;
+
+  --text-primary: #f8fafc;
+  --text-secondary: #e2e8f0;
+  --text-muted: #94a3b8;
+  --text-placeholder: #64748b;
+  --text-inverse: #0f172a;
+
+  --border-default: #1f2937;
+  --border-strong: #334155;
+  --border-hover: #64748b;
+  --border-focus: #60a5fa;
+
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.35);
+  --focus-ring: 0 0 0 3px rgba(96, 165, 250, 0.25);
+
+  --btn-bg: #e2e8f0;
+  --btn-bg-hover: #f8fafc;
+  --btn-bg-disabled: #334155;
+  --btn-text: #0f172a;
+
+  --status-error-bg: #3f1d1d;
+  --status-error-text: #fecaca;
+  --status-success-bg: #14532d;
+  --status-success-text: #bbf7d0;
+
+  --overlay-bg: rgba(11, 18, 32, 0.78);
+  --spinner-color: #e2e8f0;
+  --theme-toggle-bg: #1f2937;
+  --theme-toggle-border: #334155;
+  --theme-toggle-hover: #273449;
+}
+
+/* Global styles */
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background-color: #f8fafc;
-  color: #1e293b;
+  min-height: 100vh;
+  font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+  background:
+    radial-gradient(circle at top left, var(--bg-page-accent), transparent 42%),
+    var(--bg-page);
+  color: var(--text-primary);
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
 *, *::before, *::after {
@@ -24,5 +111,6 @@ body {
 @media print {
   body {
     background: white;
+    color: black;
   }
 }

@@ -2,6 +2,9 @@ import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
 import { LoadingOverlayDirective } from './directives';
+type ThemeMode = 'light' | 'dark';
+
+const THEME_STORAGE_KEY = 'migration-studio-theme';
 
 @Component({
   selector: 'app-root',
@@ -28,6 +31,7 @@ export class App {
   isLoading = signal<boolean>(false);
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
+  theme = signal<ThemeMode>('light');
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -45,7 +49,44 @@ export class App {
     return `e.g., Convert ${from} components to ${to} functional components with hooks, ensuring all lifecycle methods are replaced appropriately...`;
   }
 
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient) {
+    this.applyTheme(this.resolveInitialTheme());
+  }
+
+  toggleTheme() {
+    this.applyTheme(this.theme() === 'light' ? 'dark' : 'light');
+  }
+
+  private resolveInitialTheme(): ThemeMode {
+    try {
+      const saved = localStorage.getItem(THEME_STORAGE_KEY);
+      if (saved === 'light' || saved === 'dark') {
+        return saved;
+      }
+    } catch {
+      // Ignore storage access issues and fall back to preference / light.
+    }
+
+    if (
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches
+    ) {
+      return 'dark';
+    }
+
+    return 'light';
+  }
+
+  private applyTheme(mode: ThemeMode) {
+    this.theme.set(mode);
+    document.documentElement.setAttribute('data-theme', mode);
+
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, mode);
+    } catch {
+      // Persistence is optional.
+    }
+  }
 
   onFromChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
@@ -96,6 +137,7 @@ export class App {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
       this.selectedFile.set(null);
+      this.clearMessage();
     }
   }
 
@@ -115,10 +157,7 @@ export class App {
       input.value = '';
     }
 
-    // Clear the status message after 3 seconds
-    setTimeout(() => {
-      this.statusMessage.set('');
-    }, 3000);
+    this.clearMessage();
   }
 
   uploadProject() {
@@ -132,16 +171,13 @@ export class App {
     if (!from || !to) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please select both source and target frameworks.');
-      return;
-    }
-    if (from === to) {
-      this.isSuccess.set(false);
-      this.statusMessage.set('❌ Source and target frameworks must be different.');
+      this.clearMessage();
       return;
     }
     if (!promptText) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please enter a migration prompt.');
+      this.clearMessage();
       return;
     }
 
@@ -195,5 +231,12 @@ export class App {
           console.error(err);
         },
       });
+  }
+
+  clearMessage() {
+    // Clear the status message after 3 seconds
+    setTimeout(() => {
+      this.statusMessage.set('');
+    }, 3000);
   }
 }

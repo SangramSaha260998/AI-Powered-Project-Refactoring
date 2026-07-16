@@ -36,7 +36,9 @@ export class LoadingOverlayDirective implements OnChanges {
     this.renderer.setStyle(this.overlayElement, 'left', '0');
     this.renderer.setStyle(this.overlayElement, 'width', '100%');
     this.renderer.setStyle(this.overlayElement, 'height', '100%');
-    this.renderer.setStyle(this.overlayElement, 'background', 'rgba(255,255,255,0.7)');
+    this.renderer.setStyle(this.overlayElement, 'background', 'var(--overlay-bg)');
+    this.renderer.setStyle(this.overlayElement, 'color', 'var(--text-primary)');
+    this.renderer.setStyle(this.overlayElement, 'backdropFilter', 'blur(2px)');
     this.renderer.setStyle(this.overlayElement, 'display', 'flex');
     this.renderer.setStyle(this.overlayElement, 'alignItems', 'center');
     this.renderer.setStyle(this.overlayElement, 'justifyContent', 'center');
@@ -104,7 +106,7 @@ export class LoadingOverlayDirective implements OnChanges {
 .lds-roller div:after {
   position: absolute;
   display: block;
-  background: #0e4351;
+  background: var(--spinner-color);
   border-radius: 50%;
   content: " ";
   margin: -3px 0 0 -3px;

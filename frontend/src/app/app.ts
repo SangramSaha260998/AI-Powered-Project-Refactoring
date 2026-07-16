@@ -1,11 +1,12 @@
 import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
+import { LoadingOverlayDirective } from './directives';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [DecimalPipe],
+  imports: [DecimalPipe, LoadingOverlayDirective],
   templateUrl: './app.html',
   styleUrl: './app.css',
 })
@@ -113,6 +114,11 @@ export class App {
     if (input) {
       input.value = '';
     }
+
+    // Clear the status message after 3 seconds
+    setTimeout(() => {
+      this.statusMessage.set('');
+    }, 3000);
   }
 
   uploadProject() {
@@ -141,7 +147,6 @@ export class App {
 
     this.isLoading.set(true);
     this.isSuccess.set(false);
-    this.statusMessage.set('Running AI migration pipeline...');
 
     const formData = new FormData();
     formData.append('zipFile', file);

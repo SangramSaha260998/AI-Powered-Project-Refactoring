@@ -19,9 +19,30 @@ export class App {
     { id: 2, technology: 'React' },
   ];
 
+  // AI providers configuration
+  aiProviders = [
+    { id: 'stepfun', label: 'Stepfun' },
+    { id: 'genai', label: 'Google Gemini' },
+    { id: 'ollama', label: 'Ollama (Local)' },
+  ];
+
+  // Models per provider
+  providerModels: Record<string, string[]> = {
+    stepfun: ['step-3.7-flash', 'step-3.5-flash', 'step-1-flash'],
+    genai: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+    ollama: [
+      'llama3.1', 'llama3', 'mistral', 'codellama',
+      'deepseek-coder', 'mixtral', 'phi3', 'gemma2',
+      'qwen2', 'qwen2.5-coder:7b', 'qwen2.5-coder:3b',
+      'qwen2.5-coder:1.5b', 'deepseek-r1'
+    ],
+  };
+
   // Modern Angular Signals replacing classic variables
   fromTech = signal<string>('');
   toTech = signal<string>('');
+  aiProvider = signal<string>('stepfun');
+  aiModel = signal<string>('');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
   prompt = signal<string>('');
@@ -47,14 +68,64 @@ export class App {
 
   constructor(private http: HttpClient) {}
 
+  /** Default prompt for same-framework (strip-down) mode */
+  private readonly defaultStripDownPrompt = `STRIP DOWN PROJECT — KEEP ONLY AUTH + DASHBOARD
+
+DELETE all components/files EXCEPT:
+- Auth module (login, register, forgot password, OTP, password reset)
+- Dashboard page and its sub-components
+- Core app shell (App component, routing, main layout)
+- Shared services (auth service, guards, HTTP interceptors)
+
+REMOVE entirely:
+- Profile/settings/user-management pages
+- Listing/table/CRUD pages for any entities
+- Blog, about, contact, landing pages
+- Demo/placeholder/skeleton components
+
+UPDATE routing: login as default route, dashboard post-login, auth guard on protected routes.
+
+Final app must compile and run: npm install → ng serve`;
+
   onFromChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
     this.fromTech.set(value);
+    this.autoFillPromptIfSameFramework();
   }
 
   onToChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
     this.toTech.set(value);
+    this.autoFillPromptIfSameFramework();
+  }
+
+  /** Pre-fill the default strip-down prompt when source === target framework */
+  private autoFillPromptIfSameFramework() {
+    const from = this.fromTech();
+    const to = this.toTech();
+    if (from && to && from.toLowerCase() === to.toLowerCase()) {
+      // Only auto-fill if the user hasn't typed their own custom prompt
+      if (!this.prompt() || this.prompt() === this.defaultStripDownPrompt) {
+        this.prompt.set(this.defaultStripDownPrompt);
+      }
+    }
+  }
+
+  onProviderChange(event: Event) {
+    const value = (event.target as HTMLSelectElement).value;
+    this.aiProvider.set(value);
+    // Reset model selection when provider changes
+    this.aiModel.set('');
+  }
+
+  onModelChange(event: Event) {
+    const value = (event.target as HTMLSelectElement).value;
+    this.aiModel.set(value);
+  }
+
+  /** Returns models for the currently selected provider. */
+  get currentModels(): string[] {
+    return this.providerModels[this.aiProvider()] || [];
   }
 
   onDragOver(event: DragEvent) {
@@ -134,11 +205,11 @@ export class App {
       this.statusMessage.set('❌ Please select both source and target frameworks.');
       return;
     }
-    if (from === to) {
-      this.isSuccess.set(false);
-      this.statusMessage.set('❌ Source and target frameworks must be different.');
-      return;
-    }
+    // if (from === to) {
+    //   this.isSuccess.set(false);
+    //   this.statusMessage.set('❌ Source and target frameworks must be different.');
+    //   return;
+    // }
     if (!promptText) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please enter a migration prompt.');
@@ -153,6 +224,10 @@ export class App {
     formData.append('fromTech', from);
     formData.append('toTech', to);
     formData.append('prompt', promptText);
+    formData.append('aiProvider', this.aiProvider());
+    if (this.aiModel()) {
+      formData.append('aiModel', this.aiModel());
+    }
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)
     this.http

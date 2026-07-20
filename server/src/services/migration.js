@@ -6,30 +6,50 @@ import {
   IGNORED_FOLDERS,
   TEXT_EXTENSIONS,
   EXTRACT_DIR,
-  getOpenAIConfig,
+  PROVIDERS,
+  getProviderConfigs,
   RATE_LIMIT_PAUSE_MS
 } from '../config/index.js';
+import { getDefaultPrompt } from '../config/defaultPrompt.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 
 // ---------------------------------------------------------------------------
-// Lazy OpenAI client — created on first call so dotenv has time to load
+// Multi-key OpenAI client — rotates API keys on quota/rate-limit errors
 // ---------------------------------------------------------------------------
-let _openai = null;
+const RETRYABLE_STATUS_CODES = new Set([401, 402, 429, 403]);
 
-function getClient() {
-  if (!_openai) {
-    const config = getOpenAIConfig();
-    if (!config.apiKey) {
-      throw new Error(
-        'OPENAI_API_KEY is not set. Please configure it in server/.env or as an environment variable.'
+/**
+ * Returns an array of { client, config } pairs, one per configured API key
+ * for the specified provider. Each call re-reads from env so .env changes
+ * take effect on restart.
+ *
+ * @param {string} aiProvider - Provider key (e.g. 'stepfun', 'genai')
+ * @param {string} [aiModel]  - Optional model override
+ */
+function createClients(aiProvider = 'stepfun', aiModel) {
+  const configs = getProviderConfigs(aiProvider, aiModel);
+  if (!configs[0].apiKey) {
+    const provConfig = PROVIDERS[aiProvider];
+    // Some providers (like Ollama) don't need an API key
+    if (provConfig && provConfig.requiresApiKey === false) {
+      console.warn(
+        `${aiProvider.toUpperCase()}_API_KEY is not set. ` +
+        `This is expected for "${provConfig.name}". ` +
+        `Using a placeholder key for client initialization.`
       );
+      return configs.map(cfg => ({
+        client: new OpenAI({ baseURL: cfg.baseURL, apiKey: 'placeholder' }),
+        config: cfg
+      }));
     }
-    _openai = new OpenAI({
-      baseURL: config.baseURL,
-      apiKey: config.apiKey
-    });
+    throw new Error(
+      `${aiProvider.toUpperCase()}_API_KEY is not set. Please configure it in server/.env or as an environment variable.`
+    );
   }
-  return _openai;
+  return configs.map(cfg => ({
+    client: new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey }),
+    config: cfg
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -43,31 +63,76 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Makes a chat completion call with the given messages and optional JSON mode.
+ * Automatically retries with the next configured API key on quota/rate-limit errors.
+ *
+ * @param {string} systemInstruction - System prompt
+ * @param {string} userContent       - User prompt
+ * @param {boolean} [jsonMode=false] - Whether to request JSON output
+ * @param {string} [aiProvider='stepfun'] - AI provider key
+ * @param {string} [aiModel]         - Optional model override
  */
-async function callLLM(systemInstruction, userContent, jsonMode = false) {
-  const client = getClient();
+async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvider = 'stepfun', aiModel) {
+  const entries = createClients(aiProvider, aiModel);
+  const totalKeys = entries.length;
 
   const messages = [
     { role: 'system', content: systemInstruction },
     { role: 'user', content: userContent }
   ];
 
-  const config = getOpenAIConfig();
-  const requestOptions = {
-    model: config.model,
-    messages
-  };
+  let lastError = null;
 
-  if (jsonMode) {
-    requestOptions.response_format = { type: 'json_object' };
+  for (let attempt = 0; attempt < totalKeys; attempt++) {
+    const { client, config } = entries[attempt];
+
+    const requestOptions = {
+      model: config.model,
+      messages
+    };
+
+    if (jsonMode) {
+      requestOptions.response_format = { type: 'json_object' };
+    }
+
+    try {
+      const response = await client.chat.completions.create(requestOptions);
+      const content = response.choices?.[0]?.message?.content;
+      if (content == null || String(content).trim() === '') {
+        throw new Error('AI returned an empty response.');
+      }
+      return content;
+    } catch (err) {
+      lastError = err;
+
+      // Check if this is a retryable quota/permission/rate-limit error
+      const statusCode =
+        err.status ||
+        (err.response && (err.response.status || err.response.statusCode)) ||
+        0;
+
+      if (RETRYABLE_STATUS_CODES.has(statusCode)) {
+        if (attempt < totalKeys - 1) {
+          const maskedKey = config.apiKey.length > 8
+            ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
+            : '****';
+          console.warn(
+            `[Key Rotate] Key ${attempt + 1}/${totalKeys} (${maskedKey}) failed with status ${statusCode}. ` +
+            `Falling back to next key...`
+          );
+          // Brief pause before retry to avoid hammering APIs
+          await pause(2000);
+          continue;
+        }
+        // All keys exhausted
+        console.error(`[Key Rotate] All ${totalKeys} API key(s) exhausted.`);
+      }
+
+      // For non-retryable errors, or if it's the last key, throw immediately
+      throw err;
+    }
   }
 
-  const response = await client.chat.completions.create(requestOptions);
-  const content = response.choices?.[0]?.message?.content;
-  if (content == null || String(content).trim() === '') {
-    throw new Error('AI returned an empty response.');
-  }
-  return content;
+  throw lastError || new Error('All API keys failed.');
 }
 
 /** Config / tooling files that the AI must never overwrite. */
@@ -1239,10 +1304,17 @@ export {
  * @param {object} [options]
  * @param {string} [options.fromTech] - Source framework (Angular / React / etc.)
  * @param {string} [options.toTech]   - Target framework
+ * @param {string} [options.aiProvider] - AI provider (e.g. 'stepfun', 'genai')
+ * @param {string} [options.aiModel]    - AI model override
  * @returns {Promise<string>}         - Path to the final output ZIP
  */
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
-  const { fromTech = 'Unknown', toTech = 'Unknown' } = options;
+  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'stepfun', aiModel } = options;
+  const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
+
+  // Append the default strip-down prompt for same-framework migrations
+  const defaultSuffix = getDefaultPrompt(fromTech, toTech);
+  const enhancedPrompt = userPrompt + '\n\n' + defaultSuffix;
 
   // Use absolute paths based on the already-defined EXTRACT_DIR
   const extractPath = path.join(EXTRACT_DIR, sessionId);
@@ -1292,20 +1364,36 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
-  const blueprintSystemInstruction = `
+  const sameFrameworkInstruction = `
+You are a code architect stripping down an Angular app to ONLY auth + dashboard.
+
+RULES:
+- KEEP ONLY: login, register, forgot-password, dashboard, auth service, guards, interceptors, core app shell.
+- DELETE everything else: profile pages, CRUD tables, blog, about, settings, admin panels, demos.
+- Route login as default, dashboard after login, protect with auth guard.
+- Output ONLY raw JSON (no markdown, no backticks, no explanation).
+- JSON format: { "migrationPlan": [{ "newPath": "src/app/...", "explanationOfSource": "...", "approximateSourceFilesToRead": ["..."] }] }
+- Plan ONLY src/ files (components, services, styles). Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html).
+- For Angular components, use templateUrl + styleUrl (NOT inline templates).
+- The app must compile and run after stripping.
+`;
+
+  const crossFrameworkInstruction = `
 You are a Principal Software Architect. Your task is to analyze an incoming source codebase and plan out a structural framework migration based on the user's demands.
 Analyze the file directory structure. Provide an array mapping of target framework files that must be created from scratch to fully rebuild the app in the new architecture.
-- If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.css, etc.
-- If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
+- If targeting Angular: convert React components into Angular Standalone Components.
+- If targeting React: convert Angular components into React functional components with hooks.
 Your output must strictly be raw valid JSON. No markdown wrappers. The JSON must have a single top-level key "migrationPlan" whose value is an array of objects. Each object must have these keys: "newPath" (string), "explanationOfSource" (string), "approximateSourceFilesToRead" (array of strings).
 
 IMPORTANT RULES FOR FILE GENERATION:
-- For React projects: Only generate src/ files (components, styles, etc.). Do NOT generate config files like package.json, tsconfig.json, vite.config.ts - these are already provided.
-- For Angular projects: Only generate src/ files (components, templates, etc.). Do NOT generate config files like package.json, tsconfig.json, angular.json - these are already provided.
+- For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
+- For Angular projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, angular.json.
 - Focus ONLY on converting the actual application code (components, services, utilities).
-- USER MIGRATION MANDATE IS HIGHEST PRIORITY: when the user specifies titles, colors, themes, branding, or copy changes, every planned UI file must reflect those exact values instead of copying the source project defaults.
-- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.css. Never plan inline templates in the .ts file when an .html sibling exists.
+- USER MIGRATION MANDATE IS HIGHEST PRIORITY.
+- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.css.
 `;
+
+  const blueprintSystemInstruction = isSameFramework ? sameFrameworkInstruction : crossFrameworkInstruction;
 
   const blueprintPrompt = `
 [CURRENT CODEBASE FILE TREE MAP]
@@ -1315,35 +1403,127 @@ ${fileTree}
 ${filesContextSummary}
 
 [MIGRATION CORE MANDATE]
-${userPrompt}
+${enhancedPrompt}
 
 [FROM TECH] ${fromTech}
 [TO TECH] ${toTech}
+${isSameFramework ? 'NOTE: Same framework — strip down, do NOT convert frameworks.' : ''}
 `;
 
   let blueprintText;
-  try {
-    blueprintText = await callLLM(blueprintSystemInstruction, blueprintPrompt, true);
-  } catch (err) {
-    console.error(`[${sessionId}] Blueprint LLM call failed:`, err.message);
-    throw new Error(`AI blueprint generation failed: ${err.message}. Please check your API key and try again.`);
-  }
-
   let parsedPlan;
-  try {
-    // Strip markdown code fences if present
-    const cleaned = blueprintText.replace(/^```(?:json)?\n?/gm, '').replace(/\n?```$/gm, '').trim();
-    parsedPlan = JSON.parse(cleaned);
-  } catch (err) {
-    console.error(`[${sessionId}] Failed to parse blueprint JSON:`, err.message);
-    console.error(`[${sessionId}] Raw blueprint response (first 500 chars):`, blueprintText.substring(0, 500));
-    throw new Error('AI returned invalid migration plan JSON. Please try again with a more specific prompt.');
+  let targetFileList = null;
+
+  // -----------------------------------------------------------------------
+  // Try up to 3 approaches to generate the migration plan:
+  //   Attempt 1: Full JSON mode (cloud models that support response_format)
+  //   Attempt 2: Plain text asking for raw JSON (models that follow instructions)
+  //   Attempt 3: Ultra-simple file list (small local models like 7B)
+  // -----------------------------------------------------------------------
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt === 1) {
+      console.log(`[${sessionId}] JSON mode failed. Retrying without JSON mode...`);
+    } else if (attempt === 2) {
+      console.log(`[${sessionId}] Structured JSON failed. Trying ultra-simple file list approach...`);
+    }
+
+    // For attempt 2 (small models), use a drastically simpler prompt
+    const useJsonMode = attempt === 0;
+    const useSimplePrompt = attempt === 2;
+
+    const attemptInstruction = useSimplePrompt
+      ? `You are analyzing an Angular project file tree.
+
+From the FILE TREE below, list the files that should be KEPT for an app with ONLY:
+- Auth (login, register, forgot-password)
+- Dashboard
+- Core app shell (App component, routing)
+- Shared services (auth service, guards)
+
+List each file on a new line, starting with "src/".
+Example:
+src/app/login/login.component.ts
+src/app/dashboard/dashboard.component.ts
+src/app/auth.service.ts
+
+LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
+Minimum 5 files. Include ALL related files for auth + dashboard.`
+      : blueprintSystemInstruction;
+
+    const attemptUserPrompt = useSimplePrompt
+      ? `FILE TREE:
+${fileTree}
+
+USER REQUEST:
+${enhancedPrompt}`
+      : blueprintPrompt;
+
+    try {
+      blueprintText = await callLLM(attemptInstruction, attemptUserPrompt, useJsonMode, aiProvider, aiModel);
+    } catch (err) {
+      console.error(`[${sessionId}] Blueprint LLM call failed:`, err.message);
+      if (attempt === 2) {
+        throw new Error(`AI blueprint generation failed: ${err.message}.`);
+      }
+      continue;
+    }
+
+    console.log(`[${sessionId}] Raw blueprint response (first 2000 chars):`, blueprintText.substring(0, 2000));
+
+    // Attempt to parse the response
+    let success = false;
+
+    // 1. Try parsing as structured JSON (attempts 0 and 1)
+    if (!useSimplePrompt) {
+      try {
+        const cleaned = blueprintText.replace(/^```(?:json)?\n?/gm, '').replace(/\n?```$/gm, '').trim();
+        parsedPlan = JSON.parse(cleaned);
+        targetFileList = parsedPlan.migrationPlan;
+        if (targetFileList && Array.isArray(targetFileList) && targetFileList.length > 0) {
+          success = true;
+        }
+      } catch (_) {
+        // Not valid JSON — fall through to next attempt
+      }
+    }
+
+    // 2. Extract file paths from text using regex (works with simple list responses)
+    if (!success) {
+      const filePathRegex = /(?:src\/[\w./-]+\.(?:ts|html|css|scss|json))/g;
+      const matches = blueprintText.match(filePathRegex);
+      if (matches && matches.length > 0) {
+        // Deduplicate
+        const uniquePaths = [...new Set(matches)];
+        // Auto-add sibling .html and .css files for Angular component .ts files
+        const withSiblings = new Set(uniquePaths);
+        for (const p of uniquePaths) {
+          if (p.endsWith('.component.ts')) {
+            const base = p.slice(0, -3); // remove '.ts'
+            withSiblings.add(base + '.html');
+            withSiblings.add(base + '.css');
+          }
+        }
+        targetFileList = [...withSiblings].map(p => ({
+          newPath: p,
+          explanationOfSource: 'Kept file for auth+dashboard app',
+          approximateSourceFilesToRead: []
+        }));
+        console.log(`[${sessionId}] Extracted ${targetFileList.length} file paths (${withSiblings.size} after adding component siblings) from AI response.`);
+        success = true;
+      }
+    }
+
+    if (success) break;
   }
 
-  const targetFileList = parsedPlan.migrationPlan;
-
+  // If all attempts failed, throw a clear error
   if (!targetFileList || !Array.isArray(targetFileList) || targetFileList.length === 0) {
-    throw new Error('The AI returned an empty migration plan. Please try again with a more specific prompt.');
+    console.error(`[${sessionId}] All blueprint generation attempts failed.`);
+    console.error(`[${sessionId}] Last raw response:`, (blueprintText || '').substring(0, 1000));
+    throw new Error(
+      'The AI could not generate a migration plan. This usually happens with smaller local models. ' +
+      'Try using a larger model (e.g. qwen2.5-coder:14b or step-3.7-flash) or provide a more specific prompt.'
+    );
   }
 
   // Drop unsafe / protected / framework-mismatched planned files before writing
@@ -1434,7 +1614,7 @@ ${fileTree}
 ${targetSpecificContext || 'Setup/Configuration asset generation task.'}
 
 [MANDATORY USER MIGRATION REQUIREMENTS — highest priority, override source defaults]
-${userPrompt}
+${enhancedPrompt}
 
 [ALREADY GENERATED FILES IN THIS COMPONENT FOLDER]
 ${siblingContext || 'None yet — you are the first file for this component.'}
@@ -1442,18 +1622,18 @@ ${siblingContext || 'None yet — you are the first file for this component.'}
 [ASSIGNMENT DIRECTIONS]
 Create the complete code file content for: "${fileTarget.newPath}"
 Purpose/Details: ${fileTarget.explanationOfSource}
-Migration target framework: ${toTech}
+${isSameFramework ? 'Keep the same framework (Angular). Strip down to essential auth + dashboard code.' : `Migration target framework: ${toTech}`}
 Write ONLY this one file. No sibling file contents. No markdown fences.
 `;
 
     let fileContent;
     try {
-      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false);
+      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
     } catch (err) {
       console.error(`[${sessionId}] LLM call failed for ${fileTarget.newPath}:`, err.message);
       // Retry once
       await pause(10000);
-      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false);
+      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
     }
 
     const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);

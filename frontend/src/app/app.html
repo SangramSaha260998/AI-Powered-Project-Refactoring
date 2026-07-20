@@ -36,8 +36,34 @@
       </div>
     </section>
 
+    <section class="config-card">
+      <h3>2. Select AI Provider</h3>
+      <div class="dropdown-group">
+        <div class="control-field">
+          <label for="aiProvider">AI Provider:</label>
+          <select id="aiProvider" [value]="aiProvider()" (change)="onProviderChange($event)">
+            @for (prov of aiProviders; track prov.id) {
+              <option [value]="prov.id">{{ prov.label }}</option>
+            }
+          </select>
+        </div>
+
+        <div class="migration-arrow">🤖</div>
+
+        <div class="control-field">
+          <label for="aiModel">Model:</label>
+          <select id="aiModel" [value]="aiModel()" (change)="onModelChange($event)">
+            <option value="">-- Default Model --</option>
+            @for (model of currentModels; track model) {
+              <option [value]="model">{{ model }}</option>
+            }
+          </select>
+        </div>
+      </div>
+    </section>
+
     <section class="prompt-card">
-      <h3>2. Describe Your Migration Prompt</h3>
+      <h3>3. Describe Your Migration Prompt</h3>
       <textarea
         class="prompt-textarea"
         [value]="prompt()"
@@ -49,7 +75,7 @@
     </section>
 
     <section class="upload-card">
-      <h3>3. Upload Source Code Bundle</h3>
+      <h3>4. Upload Source Code Bundle</h3>
       <div
         class="dropzone"
         [class.dragover]="isDragging()"

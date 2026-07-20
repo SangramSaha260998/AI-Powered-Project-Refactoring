@@ -84,12 +84,16 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
  *   - prompt (string, required): Migration instructions
  *   - fromTech (string, optional): Source framework (Angular / React / Vue)
  *   - toTech   (string, optional): Target framework
+ *   - aiProvider (string, optional): AI provider (e.g. 'stepfun', 'genai')
+ *   - aiModel   (string, optional): AI model override
  */
 router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   const userPrompt = (req.body.prompt || '').trim();
   const zipFile = req.file;
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
+  const aiProvider = req.body.aiProvider || 'stepfun';
+  const aiModel = req.body.aiModel || '';
 
   if (!zipFile || !userPrompt) {
     return res.status(400).json({ error: 'ZIP file and migration prompt are required.' });
@@ -97,10 +101,6 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   if (!fromTech || fromTech === 'Unknown' || !toTech || toTech === 'Unknown') {
     return res.status(400).json({ error: 'Both source and target frameworks are required.' });
   }
-  if (fromTech === toTech) {
-    return res.status(400).json({ error: 'Source and target frameworks must be different.' });
-  }
-
   const id = Date.now().toString();
   const extractPath = path.join(EXTRACT_DIR, id);
   const convertedPath = path.join(EXTRACT_DIR, `${id}-converted`);
@@ -131,7 +131,7 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
       zipFile.path,
       userPrompt,
       id,
-      { fromTech, toTech }
+      { fromTech, toTech, aiProvider, aiModel: aiModel || undefined }
     );
 
     res.download(resultZipPath, 'migrated_project.zip', (err) => {

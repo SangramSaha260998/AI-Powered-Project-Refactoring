@@ -4,7 +4,7 @@ import path from 'path';
 import { upload } from '../middleware/upload.js';
 import { validateProjectFramework } from '../services/validator.js';
 import { removeDirectoryRecursive, removeFile, ensureDirectoryExists } from '../utils/file.js';
-import { EXTRACT_DIR } from '../config/index.js';
+import { EXTRACT_DIR, getProviderIds, PROVIDERS } from '../config/index.js';
 import { runMigrationPipeline, cleanupSession } from '../services/migration.js';
 
 // Ensure the extract directory exists at startup
@@ -84,7 +84,7 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
  *   - prompt (string, required): Migration instructions
  *   - fromTech (string, optional): Source framework (Angular / React / Vue)
  *   - toTech   (string, optional): Target framework
- *   - aiProvider (string, optional): AI provider (e.g. 'stepfun', 'genai')
+ *   - aiProvider (string, optional): AI provider (e.g. 'openrouter', 'genai')
  *   - aiModel   (string, optional): AI model override
  */
 router.post('/migrate', upload.single('zipFile'), async (req, res) => {
@@ -92,7 +92,7 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   const zipFile = req.file;
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
-  const aiProvider = req.body.aiProvider || 'stepfun';
+  const aiProvider = (req.body.aiProvider || '').trim();
   const aiModel = req.body.aiModel || '';
 
   if (!zipFile || !userPrompt) {
@@ -100,6 +100,14 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   }
   if (!fromTech || fromTech === 'Unknown' || !toTech || toTech === 'Unknown') {
     return res.status(400).json({ error: 'Both source and target frameworks are required.' });
+  }
+  if (!aiProvider) {
+    return res.status(400).json({ error: 'Please select an AI provider.' });
+  }
+  if (!PROVIDERS[aiProvider]) {
+    return res.status(400).json({
+      error: `Unknown AI provider "${aiProvider}". Valid options: ${getProviderIds().join(', ')}.`,
+    });
   }
   const id = Date.now().toString();
   const extractPath = path.join(EXTRACT_DIR, id);

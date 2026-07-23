@@ -92,7 +92,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 │                          │                                       │
 │  ┌──────────────────────┴──────────────────────┐                │
 │  │         OpenAI-Compatible API                 │                │
-│  │        (zenmux.ai / OpenAI / etc.)            │                │
+│  │     (OpenRouter / Gemini / Ollama / etc.)     │                │
 │  └─────────────────────────────────────────────┘                │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -102,7 +102,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 - **Node.js**: v18.0.0 or higher
 - **npm**: v9.0.0 or higher
 - **Angular CLI**: v20.x (for frontend development)
-- **OpenAI API Key**: Or any OpenAI-compatible API endpoint
+- **API Key**: OpenRouter, Google Gemini, or a local Ollama install
 
 ## 🚀 Installation
 
@@ -148,14 +148,14 @@ Edit `server/.env`:
 # Server Configuration
 PORT=5000
 
-# OpenAI API Configuration
-OPENAI_API_KEY=your_api_key_here
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4
+# OpenRouter (default)
+OPENROUTER_API_KEY=your_openrouter_key_here
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
-# Optional: Custom API endpoint (e.g., for free alternatives)
-# OPENAI_BASE_URL=https://zenmux.ai/api/v1
-# OPENAI_MODEL=stepfun/step-3.7-flash-free
+# Optional: Google Gemini fallback
+# GENAI_API_KEY=your_gemini_key_here
+# GENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+# GENAI_MODEL=gemini-2.0-flash
 ```
 
 ### 4. Start the Application
@@ -182,18 +182,23 @@ npm run start:frontend
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `PORT` | Backend server port | `5000` | No |
-| `OPENAI_API_KEY` | API key for OpenAI-compatible service | - | Yes |
-| `OPENAI_BASE_URL` | API endpoint URL | `https://zenmux.ai/api/v1` | No |
-| `OPENAI_MODEL` | Model to use for migration | `stepfun/step-3.7-flash-free` | No |
+| `OPENROUTER_API_KEY` | OpenRouter API key | - | Yes* |
+| `OPENROUTER_BASE_URL` | OpenRouter API endpoint | `https://openrouter.ai/api/v1` | No |
+| `OPENROUTER_MODEL` | Default OpenRouter model | `openrouter/auto` | No |
+| `GENAI_API_KEY` | Google Gemini API key(s) | - | No |
+| `GENAI_BASE_URL` | Gemini OpenAI-compatible endpoint | Gemini default | No |
+| `GENAI_MODEL` | Default Gemini model | `gemini-2.0-flash` | No |
+| `AI_FALLBACK_CHAIN` | Provider fallback order | `openrouter,genai,ollama` | No |
+
+\* At least one configured provider is required (OpenRouter, Gemini, or local Ollama).
 
 ### Supported API Providers
 
-The application uses the OpenAI SDK, so any OpenAI-compatible API works:
+The application uses the OpenAI SDK with these providers:
 
-- **OpenAI**: `https://api.openai.com/v1`
-- **Anthropic**: Via OpenAI-compatible proxy (e.g., LiteLLM)
-- **Local Models**: Ollama, LM Studio, vLLM, etc.
-- **Free Alternatives**: zenmux.ai, groq.com, together.ai, etc.
+- **OpenRouter**: `https://openrouter.ai/api/v1` (default; free models supported)
+- **Google Gemini**: OpenAI-compatible Generative Language API
+- **Local Models**: Ollama (`http://localhost:11434/v1`)
 
 ### File Limits
 
@@ -502,10 +507,10 @@ npm run test:debug          # Run debug utilities
 
 ### Common Issues
 
-#### "OPENAI_API_KEY is not set"
+#### "OPENROUTER_API_KEY is not set"
 ```bash
 # Create or update server/.env
-echo "OPENAI_API_KEY=your_key_here" > server/.env
+echo "OPENROUTER_API_KEY=your_key_here" > server/.env
 ```
 
 #### "Port already in use"

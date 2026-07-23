@@ -52,6 +52,7 @@
         <div class="control-field">
           <label for="aiProvider">AI Provider:</label>
           <select id="aiProvider" [value]="aiProvider()" (change)="onProviderChange($event)">
+            <option value="" disabled>-- Select AI Provider --</option>
             @for (prov of aiProviders; track prov.id) {
               <option [value]="prov.id">{{ prov.label }}</option>
             }
@@ -62,10 +63,23 @@
 
         <div class="control-field">
           <label for="aiModel">Model:</label>
-          <select id="aiModel" [value]="aiModel()" (change)="onModelChange($event)">
-            <option value="">-- Default Model --</option>
-            @for (model of currentModels; track model) {
-              <option [value]="model">{{ model }}</option>
+          <select
+            id="aiModel"
+            [value]="aiModel()"
+            (change)="onModelChange($event)"
+            [disabled]="!aiProvider() || (aiProvider() === 'openrouter' && openrouterModelsLoading())"
+          >
+            <option value="">
+              {{
+                !aiProvider()
+                  ? '-- Select a provider first --'
+                  : aiProvider() === 'openrouter' && openrouterModelsLoading()
+                    ? '-- Loading free models --'
+                    : '-- Select a model --'
+              }}
+            </option>
+            @for (model of currentModels; track model.id) {
+              <option [value]="model.id">{{ model.label }}</option>
             }
           </select>
         </div>
@@ -121,7 +135,7 @@
 
       <button
         class="action-btn"
-        [disabled]="!selectedFile() || !toTech() || !fromTech() || !prompt().trim() || isLoading()"
+        [disabled]="!selectedFile() || !toTech() || !fromTech() || !aiProvider() || (aiProvider() === 'openrouter' && !aiModel()) || !prompt().trim() || isLoading()"
         (click)="uploadProject()"
       >
         @if (isLoading()) {

@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import healthRouter from './routes/health.js';
 import uploadRouter from './routes/upload.js';
+import modelsRouter from './routes/models.js';
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 app.use('/api', healthRouter);
 app.use('/api', uploadRouter);
+app.use('/api', modelsRouter);
 
 // ---------------------------------------------------------------------------
 // Global error handler — ensures all errors are logged and return JSON

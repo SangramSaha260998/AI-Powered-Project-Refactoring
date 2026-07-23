@@ -2,9 +2,12 @@ import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
 import { LoadingOverlayDirective } from './directives';
+
 type ThemeMode = 'light' | 'dark';
+type ModelOption = { id: string; label: string };
 
 const THEME_STORAGE_KEY = 'migration-studio-theme';
+const API_BASE = 'http://localhost:5000/api';
 
 @Component({
   selector: 'app-root',
@@ -24,36 +27,40 @@ export class App {
 
   // AI providers configuration
   aiProviders = [
-    { id: 'stepfun', label: 'Stepfun' },
+    { id: 'openrouter', label: 'OpenRouter' },
     { id: 'genai', label: 'Google Gemini' },
     { id: 'ollama', label: 'Ollama (Local)' },
   ];
 
-  // Models per provider
-  providerModels: Record<string, string[]> = {
-    stepfun: ['step-3.7-flash', 'step-3.5-flash', 'step-1-flash'],
-    genai: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+  // Models per provider (openrouter is loaded dynamically from OpenRouter free models)
+  providerModels: Record<string, ModelOption[]> = {
+    openrouter: [],
+    genai: [
+      { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+      { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+      { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+    ],
     ollama: [
-      'llama3.1',
-      'llama3',
-      'mistral',
-      'codellama',
-      'deepseek-coder',
-      'mixtral',
-      'phi3',
-      'gemma2',
-      'qwen2',
-      'qwen2.5-coder:7b',
-      'qwen2.5-coder:3b',
-      'qwen2.5-coder:1.5b',
-      'deepseek-r1',
+      { id: 'llama3.1', label: 'llama3.1' },
+      { id: 'llama3', label: 'llama3' },
+      { id: 'mistral', label: 'mistral' },
+      { id: 'codellama', label: 'codellama' },
+      { id: 'deepseek-coder', label: 'deepseek-coder' },
+      { id: 'mixtral', label: 'mixtral' },
+      { id: 'phi3', label: 'phi3' },
+      { id: 'gemma2', label: 'gemma2' },
+      { id: 'qwen2', label: 'qwen2' },
+      { id: 'qwen2.5-coder:7b', label: 'qwen2.5-coder:7b' },
+      { id: 'qwen2.5-coder:3b', label: 'qwen2.5-coder:3b' },
+      { id: 'qwen2.5-coder:1.5b', label: 'qwen2.5-coder:1.5b' },
+      { id: 'deepseek-r1', label: 'deepseek-r1' },
     ],
   };
 
   // Modern Angular Signals replacing classic variables
   fromTech = signal<string>('');
   toTech = signal<string>('');
-  aiProvider = signal<string>('stepfun');
+  aiProvider = signal<string>('');
   aiModel = signal<string>('');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
@@ -62,6 +69,9 @@ export class App {
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
   theme = signal<ThemeMode>('light');
+  openrouterModelsLoading = signal<boolean>(false);
+  /** Bumps when openrouter models are refreshed so the model select re-renders. */
+  private openrouterModelsVersion = signal(0);
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -81,6 +91,32 @@ export class App {
 
   constructor(private http: HttpClient) {
     this.applyTheme(this.resolveInitialTheme());
+  }
+
+  /** Fetch free OpenRouter models via the backend proxy. */
+  private loadOpenRouterModels() {
+    this.openrouterModelsLoading.set(true);
+    this.http.get<{ models: ModelOption[] }>(`${API_BASE}/models/openrouter`).subscribe({
+      next: (res) => {
+        this.providerModels['openrouter'] = res.models ?? [];
+        this.openrouterModelsVersion.update((v) => v + 1);
+        this.openrouterModelsLoading.set(false);
+
+        // Keep current selection if still available; otherwise clear it.
+        if (this.aiProvider() === 'openrouter') {
+          const current = this.aiModel();
+          if (current && !this.providerModels['openrouter'].some((m) => m.id === current)) {
+            this.aiModel.set('');
+          }
+        }
+      },
+      error: (err) => {
+        console.error('Failed to load OpenRouter free models:', err);
+        this.providerModels['openrouter'] = [];
+        this.openrouterModelsVersion.update((v) => v + 1);
+        this.openrouterModelsLoading.set(false);
+      },
+    });
   }
 
   toggleTheme() {
@@ -166,6 +202,14 @@ Final app must compile and run: npm install → ng serve`;
     this.aiProvider.set(value);
     // Reset model selection when provider changes
     this.aiModel.set('');
+
+    if (
+      value === 'openrouter' &&
+      this.providerModels['openrouter'].length === 0 &&
+      !this.openrouterModelsLoading()
+    ) {
+      this.loadOpenRouterModels();
+    }
   }
 
   onModelChange(event: Event) {
@@ -174,7 +218,9 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   /** Returns models for the currently selected provider. */
-  get currentModels(): string[] {
+  get currentModels(): ModelOption[] {
+    // Touch version signal so openrouter async updates refresh the template.
+    this.openrouterModelsVersion();
     return this.providerModels[this.aiProvider()] || [];
   }
 
@@ -225,6 +271,8 @@ Final app must compile and run: npm install → ng serve`;
   private clearUiAfterSuccess() {
     this.fromTech.set('');
     this.toTech.set('');
+    this.aiProvider.set('');
+    this.aiModel.set('');
     this.prompt.set('');
     this.selectedFile.set(null);
     this.isDragging.set(false);
@@ -254,6 +302,18 @@ Final app must compile and run: npm install → ng serve`;
       this.clearMessage();
       return;
     }
+    if (!this.aiProvider()) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please select an AI provider.');
+      this.clearMessage();
+      return;
+    }
+    if (this.aiProvider() === 'openrouter' && !this.aiModel()) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please select an OpenRouter model.');
+      this.clearMessage();
+      return;
+    }
     if (!promptText) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please enter a migration prompt.');
@@ -276,7 +336,7 @@ Final app must compile and run: npm install → ng serve`;
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)
     this.http
-      .post('http://localhost:5000/api/migrate', formData, {
+      .post(`${API_BASE}/migrate`, formData, {
         responseType: 'blob',
       })
       .subscribe({

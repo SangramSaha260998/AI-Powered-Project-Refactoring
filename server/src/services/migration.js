@@ -8,6 +8,8 @@ import {
   EXTRACT_DIR,
   PROVIDERS,
   getProviderConfigs,
+  getProviderFallbackChain,
+  isProviderConfigured,
   RATE_LIMIT_PAUSE_MS
 } from '../config/index.js';
 import { getDefaultPrompt } from '../config/defaultPrompt.js';
@@ -15,23 +17,66 @@ import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
-// Multi-key OpenAI client — rotates API keys on quota/rate-limit errors
+// Multi-key / multi-provider OpenAI clients — rotate keys, then providers
 // ---------------------------------------------------------------------------
 const RETRYABLE_STATUS_CODES = new Set([401, 402, 429, 403]);
 
 /**
- * Returns an array of { client, config } pairs, one per configured API key
- * for the specified provider. Each call re-reads from env so .env changes
- * take effect on restart.
- *
- * @param {string} aiProvider - Provider key (e.g. 'stepfun', 'genai')
- * @param {string} [aiModel]  - Optional model override
+ * Errors that should rotate keys and/or move to the next provider.
+ * Includes quota/auth codes, server errors, and network failures.
  */
-function createClients(aiProvider = 'stepfun', aiModel) {
+function isFallbackWorthyError(err) {
+  const statusCode =
+    err?.status ||
+    (err?.response && (err.response.status || err.response.statusCode)) ||
+    0;
+
+  if (RETRYABLE_STATUS_CODES.has(statusCode)) return { worthy: true, statusCode, reason: 'quota/auth' };
+  if (statusCode >= 500 && statusCode < 600) return { worthy: true, statusCode, reason: 'server' };
+
+  // Connection / DNS / timeout style failures (no HTTP status)
+  const code = err?.code || err?.cause?.code || '';
+  const networkCodes = new Set([
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'EPIPE',
+    'UND_ERR_CONNECT_TIMEOUT',
+  ]);
+  if (networkCodes.has(code)) {
+    return { worthy: true, statusCode: statusCode || code, reason: 'network' };
+  }
+
+  const msg = String(err?.message || '').toLowerCase();
+  if (
+    !statusCode &&
+    (msg.includes('fetch failed') ||
+      msg.includes('network') ||
+      msg.includes('socket') ||
+      msg.includes('timeout') ||
+      msg.includes('econnrefused'))
+  ) {
+    return { worthy: true, statusCode: statusCode || 'network', reason: 'network' };
+  }
+
+  return { worthy: false, statusCode, reason: 'fatal' };
+}
+
+/**
+ * Returns an array of { client, config } pairs for a provider, or null if
+ * that provider has no usable credentials.
+ *
+ * @param {string} aiProvider
+ * @param {string} [aiModel]
+ * @returns {Array<{client: OpenAI, config: object}> | null}
+ */
+function createClients(aiProvider = 'openrouter', aiModel) {
   const configs = getProviderConfigs(aiProvider, aiModel);
+  const provConfig = PROVIDERS[aiProvider];
+
   if (!configs[0].apiKey) {
-    const provConfig = PROVIDERS[aiProvider];
-    // Some providers (like Ollama) don't need an API key
     if (provConfig && provConfig.requiresApiKey === false) {
       console.warn(
         `${aiProvider.toUpperCase()}_API_KEY is not set. ` +
@@ -39,16 +84,23 @@ function createClients(aiProvider = 'stepfun', aiModel) {
         `Using a placeholder key for client initialization.`
       );
       return configs.map(cfg => ({
-        client: new OpenAI({ baseURL: cfg.baseURL, apiKey: 'placeholder' }),
+        client: new OpenAI({
+          baseURL: cfg.baseURL,
+          apiKey: 'placeholder',
+          ...(cfg.defaultHeaders ? { defaultHeaders: cfg.defaultHeaders } : {}),
+        }),
         config: cfg
       }));
     }
-    throw new Error(
-      `${aiProvider.toUpperCase()}_API_KEY is not set. Please configure it in server/.env or as an environment variable.`
-    );
+    return null;
   }
+
   return configs.map(cfg => ({
-    client: new OpenAI({ baseURL: cfg.baseURL, apiKey: cfg.apiKey }),
+    client: new OpenAI({
+      baseURL: cfg.baseURL,
+      apiKey: cfg.apiKey,
+      ...(cfg.defaultHeaders ? { defaultHeaders: cfg.defaultHeaders } : {}),
+    }),
     config: cfg
   }));
 }
@@ -64,76 +116,139 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Makes a chat completion call with the given messages and optional JSON mode.
- * Automatically retries with the next configured API key on quota/rate-limit errors.
+ *
+ * Fallback order (always on):
+ * 1. Rotate API keys within the selected provider on quota/auth/rate-limit/5xx/network errors
+ * 2. If that provider is exhausted, try the next configured provider in the chain
+ *    using that provider's own keys and default model (not the UI model id)
  *
  * @param {string} systemInstruction - System prompt
  * @param {string} userContent       - User prompt
  * @param {boolean} [jsonMode=false] - Whether to request JSON output
- * @param {string} [aiProvider='stepfun'] - AI provider key
- * @param {string} [aiModel]         - Optional model override
+ * @param {string} [aiProvider='openrouter'] - AI provider key
+ * @param {string} [aiModel]         - Optional model override (primary provider only)
  */
-async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvider = 'stepfun', aiModel) {
-  const entries = createClients(aiProvider, aiModel);
-  const totalKeys = entries.length;
-
+async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvider = 'openrouter', aiModel) {
+  const chain = getProviderFallbackChain(aiProvider);
   const messages = [
     { role: 'system', content: systemInstruction },
     { role: 'user', content: userContent }
   ];
 
   let lastError = null;
+  let attemptedAnyProvider = false;
 
-  for (let attempt = 0; attempt < totalKeys; attempt++) {
-    const { client, config } = entries[attempt];
+  for (let providerIndex = 0; providerIndex < chain.length; providerIndex++) {
+    const providerId = chain[providerIndex];
+    // Treat remapped/unknown primary as "primary" only when it matches a real chain entry.
+    const isPrimary = providerId === aiProvider || (providerIndex === 0 && !PROVIDERS[aiProvider]);
 
-    const requestOptions = {
-      model: config.model,
-      messages
-    };
-
-    if (jsonMode) {
-      requestOptions.response_format = { type: 'json_object' };
+    const isSelectedPrimary = providerId === aiProvider;
+    // Always attempt the user-selected provider; only auto-fallback entries need to be "configured".
+    if (!isSelectedPrimary && !isProviderConfigured(providerId)) {
+      console.warn(
+        `[Provider Fallback] Skipping "${providerId}" — not configured.`
+      );
+      continue;
     }
 
-    try {
-      const response = await client.chat.completions.create(requestOptions);
-      const content = response.choices?.[0]?.message?.content;
-      if (content == null || String(content).trim() === '') {
-        throw new Error('AI returned an empty response.');
+    // Only the user-selected provider uses the UI model; fallbacks use defaults.
+    const modelOverride = isPrimary && PROVIDERS[aiProvider] ? aiModel : undefined;
+    const entries = createClients(providerId, modelOverride);
+
+    if (!entries || entries.length === 0) {
+      console.warn(
+        `[Provider Fallback] Skipping "${providerId}" — no usable clients.`
+      );
+      continue;
+    }
+
+    attemptedAnyProvider = true;
+
+    if (providerIndex > 0 || (isPrimary && providerId !== aiProvider)) {
+      console.warn(
+        `[Provider Fallback] Switching to ${PROVIDERS[providerId]?.name || providerId} ` +
+        `(${providerId}) with model "${entries[0].config.model}"...`
+      );
+    }
+
+    const totalKeys = entries.length;
+
+    for (let attempt = 0; attempt < totalKeys; attempt++) {
+      const { client, config } = entries[attempt];
+
+      const requestOptions = {
+        model: config.model,
+        messages
+      };
+
+      if (jsonMode) {
+        requestOptions.response_format = { type: 'json_object' };
       }
-      return content;
-    } catch (err) {
-      lastError = err;
 
-      // Check if this is a retryable quota/permission/rate-limit error
-      const statusCode =
-        err.status ||
-        (err.response && (err.response.status || err.response.statusCode)) ||
-        0;
-
-      if (RETRYABLE_STATUS_CODES.has(statusCode)) {
-        if (attempt < totalKeys - 1) {
-          const maskedKey = config.apiKey.length > 8
-            ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
-            : '****';
-          console.warn(
-            `[Key Rotate] Key ${attempt + 1}/${totalKeys} (${maskedKey}) failed with status ${statusCode}. ` +
-            `Falling back to next key...`
-          );
-          // Brief pause before retry to avoid hammering APIs
-          await pause(2000);
-          continue;
+      try {
+        const response = await client.chat.completions.create(requestOptions);
+        const content = response.choices?.[0]?.message?.content;
+        if (content == null || String(content).trim() === '') {
+          throw new Error('AI returned an empty response.');
         }
-        // All keys exhausted
-        console.error(`[Key Rotate] All ${totalKeys} API key(s) exhausted.`);
-      }
+        if (providerIndex > 0) {
+          console.log(
+            `[Provider Fallback] Succeeded with ${providerId} / ${config.model}`
+          );
+        }
+        return content;
+      } catch (err) {
+        lastError = err;
+        const { worthy, statusCode, reason } = isFallbackWorthyError(err);
 
-      // For non-retryable errors, or if it's the last key, throw immediately
-      throw err;
+        if (worthy) {
+          if (attempt < totalKeys - 1) {
+            const maskedKey = config.apiKey.length > 8
+              ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
+              : '****';
+            console.warn(
+              `[Key Rotate] ${providerId} key ${attempt + 1}/${totalKeys} (${maskedKey}) ` +
+              `failed (${reason}: ${statusCode}). Falling back to next key...`
+            );
+            await pause(2000);
+            continue;
+          }
+
+          console.warn(
+            `[Provider Fallback] All ${totalKeys} key(s) for "${providerId}" exhausted ` +
+            `(${reason}: ${statusCode}).`
+          );
+          await pause(2000);
+          break; // next provider
+        }
+
+        // Fatal error (e.g. bad request for this model) — still try next provider
+        // so a bad OpenRouter free model does not kill the whole migration.
+        if (providerIndex < chain.length - 1) {
+          console.warn(
+            `[Provider Fallback] "${providerId}" failed with fatal error ` +
+            `(${err.message || statusCode}). Trying next provider...`
+          );
+          await pause(1000);
+          break;
+        }
+
+        throw err;
+      }
     }
   }
 
-  throw lastError || new Error('All API keys failed.');
+  if (!attemptedAnyProvider) {
+    throw new Error(
+      'No AI providers are configured. Set OPENROUTER_API_KEY and/or GENAI_API_KEY in server/.env ' +
+      '(or enable Ollama with OLLAMA_ENABLED=true).'
+    );
+  }
+
+  throw lastError || new Error(
+    'All AI providers failed. Configure at least one provider API key in server/.env.'
+  );
 }
 
 /** Config / tooling files that the AI must never overwrite. */
@@ -1434,12 +1549,12 @@ export {
  * @param {object} [options]
  * @param {string} [options.fromTech] - Source framework (Angular / React / etc.)
  * @param {string} [options.toTech]   - Target framework
- * @param {string} [options.aiProvider] - AI provider (e.g. 'stepfun', 'genai')
+ * @param {string} [options.aiProvider] - AI provider (e.g. 'openrouter', 'genai')
  * @param {string} [options.aiModel]    - AI model override
  * @returns {Promise<string>}         - Path to the final output ZIP
  */
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
-  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'stepfun', aiModel } = options;
+  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
 
   // Append the default strip-down prompt for same-framework migrations
@@ -1658,7 +1773,7 @@ ${enhancedPrompt}`
     console.error(`[${sessionId}] Last raw response:`, (blueprintText || '').substring(0, 1000));
     throw new Error(
       'The AI could not generate a migration plan. This usually happens with smaller local models. ' +
-      'Try using a larger model (e.g. qwen2.5-coder:14b or step-3.7-flash) or provide a more specific prompt.'
+      'Try using a larger model (e.g. qwen2.5-coder:14b or gemini-2.0-flash) or provide a more specific prompt.'
     );
   }
 

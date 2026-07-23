@@ -4,11 +4,53 @@
   padding: 0 20px;
 }
 
+.theme-toggle {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 100;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--theme-toggle-border);
+  border-radius: 999px;
+  background: var(--theme-toggle-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-card);
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.theme-toggle:hover {
+  background: var(--theme-toggle-hover);
+  border-color: var(--border-hover);
+}
+
+.theme-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.theme-toggle-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
 /* Responsive Breakpoints */
 @media (max-width: 768px) {
   .app-container {
     margin: 20px auto;
     padding: 0 16px;
+  }
+
+  .theme-toggle {
+    top: 12px;
+    right: 12px;
+    padding: 7px 10px;
+    font-size: 12px;
   }
 
   .app-header h1 {
@@ -61,6 +103,10 @@
   .app-container {
     margin: 12px auto;
     padding: 0 12px;
+  }
+
+  .app-header {
+    padding-top: 36px;
   }
 
   .app-header h1 {
@@ -122,26 +168,30 @@
   .prompt-textarea {
     min-height: 100px;
   }
+
+  .theme-toggle {
+    min-height: 40px;
+  }
 }
 
 /* Hover effects for desktop */
 @media (hover: hover) and (pointer: fine) {
   .action-btn:hover:not(:disabled) {
-    background-color: #1e293b;
+    background-color: var(--btn-bg-hover);
   }
 
   .dropzone:hover {
-    border-color: #94a3b8;
-    background: #f1f5f9;
+    border-color: var(--border-hover);
+    background: var(--bg-muted-hover);
   }
 
   .control-field select:hover {
-    border-color: #94a3b8;
+    border-color: var(--border-hover);
   }
 
   .control-field select:focus {
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+    border-color: var(--border-focus);
+    box-shadow: var(--focus-ring);
   }
 }
 
@@ -150,7 +200,8 @@
   .prompt-textarea,
   .action-btn,
   .dropzone,
-  .control-field select {
+  .control-field select,
+  .theme-toggle {
     transition: none;
   }
 }
@@ -160,6 +211,10 @@
   .app-container {
     margin: 0;
     padding: 0;
+  }
+
+  .theme-toggle {
+    display: none;
   }
 
   .dropzone {
@@ -178,12 +233,12 @@
 
 .app-header h1 {
   margin: 0 0 10px 0;
-  color: #0f172a;
+  color: var(--text-primary);
 }
 
 .app-header p {
   margin: 0;
-  color: #64748b;
+  color: var(--text-muted);
 }
 
 .main-dashboard {
@@ -193,48 +248,49 @@
 }
 
 .config-card, .prompt-card, .upload-card {
-  background: white;
-  border: 1px solid #e2e8f0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
   border-radius: 12px;
   padding: 24px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  box-shadow: var(--shadow-card);
+  transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
 }
 
 .config-card h3, .prompt-card h3, .upload-card h3 {
   margin: 0 0 20px 0;
-  color: #334155;
+  color: var(--text-secondary);
 }
 
 .prompt-textarea {
   width: 100%;
   box-sizing: border-box;
   padding: 14px;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
   font-family: inherit;
   font-size: 15px;
   line-height: 1.6;
-  color: #1e293b;
-  background-color: #f8fafc;
+  color: var(--text-primary);
+  background-color: var(--bg-muted);
   resize: vertical;
   outline: none;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
 }
 
 .prompt-textarea:focus {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
-  background-color: #fff;
+  border-color: var(--border-focus);
+  box-shadow: var(--focus-ring);
+  background-color: var(--bg-surface);
 }
 
 .prompt-textarea::placeholder {
-  color: #94a3b8;
+  color: var(--text-placeholder);
 }
 
 .prompt-hint {
   margin: 8px 0 0 0;
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--text-placeholder);
 }
 
 .dropdown-group {
@@ -254,36 +310,45 @@
 .control-field label {
   font-size: 14px;
   font-weight: 500;
-  color: #64748b;
+  color: var(--text-muted);
 }
 
 .control-field select {
   padding: 12px;
   border-radius: 8px;
-  border: 1px solid #cbd5e1;
-  background-color: #fff;
+  border: 1px solid var(--border-strong);
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
   font-size: 16px;
   outline: none;
+  transition: border-color 0.2s ease, background-color 0.2s ease, color 0.2s ease;
+}
+
+.control-field select option {
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
 }
 
 .migration-arrow {
   font-size: 24px;
   padding-top: 20px;
+  color: var(--text-muted);
 }
 
 .dropzone {
-  border: 2px dashed #cbd5e1;
+  border: 2px dashed var(--border-strong);
   border-radius: 12px;
   padding: 40px 20px;
   text-align: center;
   cursor: pointer;
   transition: all 0.2s ease;
-  background: #f8fafc;
+  background: var(--bg-muted);
+  color: var(--text-primary);
 }
 
 .dropzone.dragover {
-  border-color: #3b82f6;
-  background: #eff6ff;
+  border-color: var(--border-focus);
+  background: var(--bg-dropzone-active);
 }
 
 .prompt-info p, .file-info p {
@@ -291,9 +356,18 @@
   font-size: 16px;
 }
 
+.file-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.file-size {
+  color: var(--text-muted);
+}
+
 .prompt-info span {
   font-size: 13px;
-  color: #94a3b8;
+  color: var(--text-placeholder);
 }
 
 .action-btn {
@@ -302,16 +376,17 @@
   padding: 14px;
   border: none;
   border-radius: 8px;
-  background-color: #0f172a;
-  color: white;
+  background-color: var(--btn-bg);
+  color: var(--btn-text);
   font-size: 16px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: background 0.2s, color 0.2s;
 }
 
 .action-btn:disabled {
-  background-color: #cbd5e1;
+  background-color: var(--btn-bg-disabled);
+  color: var(--text-placeholder);
   cursor: not-allowed;
 }
 
@@ -319,13 +394,13 @@
   margin-top: 20px;
   padding: 12px;
   border-radius: 6px;
-  background-color: #fef2f2;
-  color: #991b1b;
+  background-color: var(--status-error-bg);
+  color: var(--status-error-text);
   font-size: 14px;
   text-align: center;
 }
 
 .status-banner.success {
-  background-color: #f0fdf4;
-  color: #166534;
+  background-color: var(--status-success-bg);
+  color: var(--status-success-text);
 }

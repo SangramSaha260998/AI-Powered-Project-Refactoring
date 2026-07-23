@@ -2,6 +2,9 @@ import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
 import { LoadingOverlayDirective } from './directives';
+type ThemeMode = 'light' | 'dark';
+
+const THEME_STORAGE_KEY = 'migration-studio-theme';
 
 @Component({
   selector: 'app-root',
@@ -31,10 +34,19 @@ export class App {
     stepfun: ['step-3.7-flash', 'step-3.5-flash', 'step-1-flash'],
     genai: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
     ollama: [
-      'llama3.1', 'llama3', 'mistral', 'codellama',
-      'deepseek-coder', 'mixtral', 'phi3', 'gemma2',
-      'qwen2', 'qwen2.5-coder:7b', 'qwen2.5-coder:3b',
-      'qwen2.5-coder:1.5b', 'deepseek-r1'
+      'llama3.1',
+      'llama3',
+      'mistral',
+      'codellama',
+      'deepseek-coder',
+      'mixtral',
+      'phi3',
+      'gemma2',
+      'qwen2',
+      'qwen2.5-coder:7b',
+      'qwen2.5-coder:3b',
+      'qwen2.5-coder:1.5b',
+      'deepseek-r1',
     ],
   };
 
@@ -49,6 +61,7 @@ export class App {
   isLoading = signal<boolean>(false);
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
+  theme = signal<ThemeMode>('light');
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -66,7 +79,44 @@ export class App {
     return `e.g., Convert ${from} components to ${to} functional components with hooks, ensuring all lifecycle methods are replaced appropriately...`;
   }
 
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient) {
+    this.applyTheme(this.resolveInitialTheme());
+  }
+
+  toggleTheme() {
+    this.applyTheme(this.theme() === 'light' ? 'dark' : 'light');
+  }
+
+  private resolveInitialTheme(): ThemeMode {
+    try {
+      const saved = localStorage.getItem(THEME_STORAGE_KEY);
+      if (saved === 'light' || saved === 'dark') {
+        return saved;
+      }
+    } catch {
+      // Ignore storage access issues and fall back to preference / light.
+    }
+
+    if (
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches
+    ) {
+      return 'dark';
+    }
+
+    return 'light';
+  }
+
+  private applyTheme(mode: ThemeMode) {
+    this.theme.set(mode);
+    document.documentElement.setAttribute('data-theme', mode);
+
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, mode);
+    } catch {
+      // Persistence is optional.
+    }
+  }
 
   /** Default prompt for same-framework (strip-down) mode */
   private readonly defaultStripDownPrompt = `STRIP DOWN PROJECT — KEEP ONLY AUTH + DASHBOARD
@@ -167,6 +217,7 @@ Final app must compile and run: npm install → ng serve`;
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
       this.selectedFile.set(null);
+      this.clearMessage();
     }
   }
 
@@ -186,10 +237,7 @@ Final app must compile and run: npm install → ng serve`;
       input.value = '';
     }
 
-    // Clear the status message after 3 seconds
-    setTimeout(() => {
-      this.statusMessage.set('');
-    }, 3000);
+    this.clearMessage();
   }
 
   uploadProject() {
@@ -203,16 +251,13 @@ Final app must compile and run: npm install → ng serve`;
     if (!from || !to) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please select both source and target frameworks.');
+      this.clearMessage();
       return;
     }
-    // if (from === to) {
-    //   this.isSuccess.set(false);
-    //   this.statusMessage.set('❌ Source and target frameworks must be different.');
-    //   return;
-    // }
     if (!promptText) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Please enter a migration prompt.');
+      this.clearMessage();
       return;
     }
 
@@ -270,5 +315,12 @@ Final app must compile and run: npm install → ng serve`;
           console.error(err);
         },
       });
+  }
+
+  clearMessage() {
+    // Clear the status message after 3 seconds
+    setTimeout(() => {
+      this.statusMessage.set('');
+    }, 3000);
   }
 }

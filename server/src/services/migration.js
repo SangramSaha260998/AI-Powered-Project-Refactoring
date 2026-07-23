@@ -12,6 +12,7 @@ import {
 } from '../config/index.js';
 import { getDefaultPrompt } from '../config/defaultPrompt.js';
 import { ensureDirectoryExists } from '../utils/file.js';
+import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
 // Multi-key OpenAI client — rotates API keys on quota/rate-limit errors
@@ -341,7 +342,13 @@ function injectAngularWorkspaceTemplates(destPath) {
               browser: 'src/main.ts',
               polyfills: ['zone.js'],
               tsConfig: 'tsconfig.app.json',
-              assets: [],
+              assets: [
+                {
+                  glob: '**/*',
+                  input: 'public',
+                  output: '/'
+                }
+              ],
               styles: ['src/styles.css'],
               scripts: []
             },
@@ -373,7 +380,13 @@ function injectAngularWorkspaceTemplates(destPath) {
             builder: '@angular/build:karma',
             options: {
               tsConfig: 'tsconfig.spec.json',
-              assets: [],
+              assets: [
+                {
+                  glob: '**/*',
+                  input: 'public',
+                  output: '/'
+                }
+              ],
               styles: ['src/styles.css'],
               scripts: []
             }
@@ -406,7 +419,11 @@ function injectAngularWorkspaceTemplates(destPath) {
       target: 'ES2022',
       module: 'ES2022',
       useDefineForClassFields: false,
-      lib: ['ES2022', 'dom']
+      lib: ['ES2022', 'dom'],
+      baseUrl: './',
+      paths: {
+        '@/*': ['src/*']
+      }
     },
     angularCompilerOptions: {
       enableI18nLegacyMessageIdFormat: false,
@@ -425,7 +442,11 @@ function injectAngularWorkspaceTemplates(destPath) {
     extends: './tsconfig.json',
     compilerOptions: {
       outDir: './out-tsc/app',
-      types: []
+      types: [],
+      baseUrl: './',
+      paths: {
+        '@/*': ['src/*']
+      }
     },
     files: ['src/main.ts'],
     include: ['src/**/*.d.ts', 'src/**/*.ts'],
@@ -546,6 +567,7 @@ Thumbs.db
 
   // 11. Ensure app directory exists
   ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+  ensureDirectoryExists(path.join(destPath, 'public'));
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +620,11 @@ function injectReactWorkspaceTemplates(destPath) {
       strict: true,
       noUnusedLocals: true,
       noUnusedParameters: true,
-      noFallthroughCasesInSwitch: true
+      noFallthroughCasesInSwitch: true,
+      baseUrl: '.',
+      paths: {
+        '@/*': ['src/*']
+      }
     },
     include: ['src']
   };
@@ -607,9 +633,18 @@ function injectReactWorkspaceTemplates(destPath) {
   // 3. vite.config.ts
   const viteConfig = `import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src')
+    }
+  },
   server: {
     port: 3000,
     open: true
@@ -1025,6 +1060,9 @@ function findReactComponentEndIndex(source) {
 /**
  * Keeps only valid TypeScript for an Angular component file.
  * AI often concatenates .ts + .html + .css into one response.
+ *
+ * IMPORTANT: Do NOT truncate after the first `export class` — many UI kits
+ * put multiple @Component classes (Carousel + CarouselItem, etc.) in one file.
  */
 function sanitizeAngularComponentTs(rawContent, baseName) {
   let content = stripCodeFences(rawContent);
@@ -1044,32 +1082,80 @@ function sanitizeAngularComponentTs(rawContent, baseName) {
     }
   }
 
+  // Only truncate at first-class-end when the remainder is clearly leaked HTML/CSS,
+  // NOT when more TypeScript classes/directives follow.
   const classEnd = findExportedClassEndIndex(content);
-  if (classEnd !== -1) {
-    cutAt = Math.min(cutAt, classEnd + 1);
+  if (classEnd !== -1 && classEnd + 1 < cutAt) {
+    const remainder = content.slice(classEnd + 1).trim();
+    const hasMoreTs =
+      /(?:^|\n)\s*(?:export\s+)?(?:class|function|const|type|interface|enum|@Component|@Directive|@Pipe|@Injectable)\b/.test(
+        remainder
+      );
+    const looksLikeCssOrHtml =
+      remainder.length > 0 &&
+      !hasMoreTs &&
+      (/(?:^|\n)\s*(?:\.[a-zA-Z_-]|<[a-zA-Z!/]|background-color\s*:|border-radius\s*:)/.test(remainder) ||
+        /^(?:\.[a-zA-Z_-]|<[a-zA-Z!/])/.test(remainder));
+    if (looksLikeCssOrHtml) {
+      cutAt = Math.min(cutAt, classEnd + 1);
+    }
   }
 
   let tsContent = content.slice(0, cutAt).trim();
   tsContent = tsContent.replace(/^\/\/\s*(?:src\/)?(?:app\/)?[\w./-]+\.ts\s*\n+/i, '');
 
+  // Strip only LARGE inline templates/styles (AI HTML/CSS dumps). Keep short legitimate inlines
+  // used by secondary components in the same file (e.g. template: '<ng-content />').
   tsContent = tsContent
-    .replace(/template\s*:\s*`[\s\S]*?`\s*,?\s*/g, '')
-    .replace(/template\s*:\s*'[^']*'\s*,?\s*/g, '')
-    .replace(/template\s*:\s*"[^"]*"\s*,?\s*/g, '')
-    .replace(/styles\s*:\s*\[[\s\S]*?\]\s*,?\s*/g, '');
+    .replace(/template\s*:\s*`([\s\S]*?)`\s*,?/g, (full, body) => (body.length > 400 ? '' : full))
+    .replace(/template\s*:\s*'([^']*)'\s*,?/g, (full, body) => (body.length > 400 ? '' : full))
+    .replace(/template\s*:\s*"([^"]*)"\s*,?/g, (full, body) => (body.length > 400 ? '' : full))
+    .replace(/styles\s*:\s*`([\s\S]*?)`\s*,?/g, (full, body) => (body.length > 200 ? '' : full))
+    .replace(/styles\s*:\s*\[([\s\S]*?)\]\s*,?/g, (full, body) => (body.length > 200 ? '' : full));
+
+  // Drop leaked CSS only when it appears AFTER the last TypeScript construct
+  if (/(?:background-color|border-radius|box-shadow)\s*:/.test(tsContent) && /export\s+class/.test(tsContent)) {
+    const lastClassStart = Math.max(
+      ...[...tsContent.matchAll(/export\s+class\s+\w+/g)].map((m) => m.index ?? -1)
+    );
+    if (lastClassStart >= 0) {
+      const afterLast = findExportedClassEndIndex(tsContent.slice(lastClassStart));
+      if (afterLast !== -1) {
+        const absEnd = lastClassStart + afterLast;
+        const rem = tsContent.slice(absEnd + 1);
+        if (rem && !/(?:export\s+|@Component|@Directive|@Injectable|type\s+|interface\s+)/.test(rem)) {
+          tsContent = tsContent.slice(0, absEnd + 1);
+        }
+      }
+    }
+  }
+
+  const expectedClass =
+    baseName === 'app.component' || baseName === 'app'
+      ? 'AppComponent'
+      : (() => {
+          const stem = baseName.replace(/\.component$/i, '');
+          const pascal = stem
+            .split(/[-_.\s]+/)
+            .filter(Boolean)
+            .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+            .join('');
+          return pascal.endsWith('Component') ? pascal : `${pascal}Component`;
+        })();
 
   if (!/@Component\s*\(/.test(tsContent)) {
     tsContent = `import { Component } from '@angular/core';
 
 @Component({
-  selector: 'app-root',
+  selector: '${baseName === 'app.component' || baseName === 'app' ? 'app-root' : 'app-' + baseName.replace(/\.component$/i, '')}',
   standalone: true,
   templateUrl: './${baseName}.html',
   styleUrl: './${baseName}.css'
 })
-export class AppComponent {}
+export class ${expectedClass} {}
 `;
   } else {
+    // Only inject templateUrl/styleUrl on the FIRST @Component if entirely missing from file
     if (!tsContent.includes('templateUrl')) {
       tsContent = tsContent.replace(
         /(@Component\(\{)/,
@@ -1081,6 +1167,20 @@ export class AppComponent {}
         /(@Component\(\{)/,
         `$1\n  styleUrl: './${baseName}.css',`
       );
+    }
+    if (!/\bstandalone\s*:/.test(tsContent)) {
+      tsContent = tsContent.replace(/(@Component\(\{)/, `$1\n  standalone: true,`);
+    }
+    // Rename only the FIRST exported class (primary) when it's the generic AppComponent mistake
+    const firstClassMatch = tsContent.match(/export\s+class\s+(\w+)/);
+    if (firstClassMatch && (firstClassMatch[1] === 'AppComponent' || firstClassMatch[1] === 'App') && expectedClass !== 'AppComponent') {
+      tsContent = tsContent.replace(/export\s+class\s+\w+/, `export class ${expectedClass}`);
+    } else if (firstClassMatch && firstClassMatch[1] !== expectedClass) {
+      // If the primary class name is clearly wrong vs filename (e.g. Component vs AvatarComponent)
+      const primary = firstClassMatch[1];
+      if (primary === 'Component' || primary === 'App' || primary === 'AppComponent') {
+        tsContent = tsContent.replace(/export\s+class\s+\w+/, `export class ${expectedClass}`);
+      }
     }
   }
 
@@ -1146,6 +1246,7 @@ function sanitizeCssContent(rawContent) {
 
 /**
  * Keep React component TSX free of sibling-file dumps.
+ * Do not truncate after the first component when more exports follow.
  */
 function sanitizeReactComponentContent(rawContent) {
   let content = stripCodeFences(rawContent);
@@ -1165,8 +1266,18 @@ function sanitizeReactComponentContent(rawContent) {
   }
 
   const componentEnd = findReactComponentEndIndex(content);
-  if (componentEnd !== -1) {
-    cutAt = Math.min(cutAt, componentEnd + 1);
+  if (componentEnd !== -1 && componentEnd + 1 < cutAt) {
+    const remainder = content.slice(componentEnd + 1).trim();
+    const hasMoreTs =
+      /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:function|const|class|type|interface)\b/.test(remainder);
+    const looksLikeCssOrHtml =
+      remainder.length > 0 &&
+      !hasMoreTs &&
+      (/(?:^|\n)\s*(?:\.[a-zA-Z_-]|<[a-zA-Z!/]|background-color\s*:)/.test(remainder) ||
+        /^(?:\.[a-zA-Z_-]|<[a-zA-Z!/])/.test(remainder));
+    if (looksLikeCssOrHtml) {
+      cutAt = Math.min(cutAt, componentEnd + 1);
+    }
   }
 
   let result = content.slice(0, cutAt).trim();
@@ -1240,21 +1351,35 @@ function normalizeAngularComponentFiles(destPath) {
     fs.copyFileSync(altCss, componentCss);
   }
 
-  const entries = fs.readdirSync(appDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.component.ts')) continue;
+  /** Recursively find every *.component.ts under src/ */
+  function collectComponentTsFiles(dir, results = []) {
+    if (!fs.existsSync(dir)) return results;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+        collectComponentTsFiles(full, results);
+      } else if (entry.name.endsWith('.component.ts')) {
+        results.push(full);
+      }
+    }
+    return results;
+  }
 
-    const baseName = entry.name.replace(/\.ts$/, '');
-    const tsPath = path.join(appDir, entry.name);
-    const htmlPath = path.join(appDir, `${baseName}.html`);
-    const cssPath = path.join(appDir, `${baseName}.css`);
+  const componentFiles = collectComponentTsFiles(path.join(destPath, 'src'));
+  for (const tsPath of componentFiles) {
+    const entryName = path.basename(tsPath);
+    const baseName = entryName.replace(/\.ts$/, '');
+    const dir = path.dirname(tsPath);
+    const htmlPath = path.join(dir, `${baseName}.html`);
+    const cssPath = path.join(dir, `${baseName}.css`);
 
     const original = fs.readFileSync(tsPath, 'utf-8');
     const sanitized = sanitizeAngularComponentTs(original, baseName);
 
     if (sanitized !== original) {
       fs.writeFileSync(tsPath, sanitized, 'utf-8');
-      console.log(`Sanitized contaminated TypeScript in ${entry.name}`);
+      console.log(`Sanitized contaminated TypeScript in ${path.relative(destPath, tsPath)}`);
     }
 
     if (fs.existsSync(htmlPath)) {
@@ -1266,7 +1391,7 @@ function normalizeAngularComponentFiles(destPath) {
     } else {
       fs.writeFileSync(
         htmlPath,
-        `<main class="app-shell">\n  <h1>Migration Complete</h1>\n</main>\n`,
+        `<div class="${baseName}"></div>\n`,
         'utf-8'
       );
     }
@@ -1277,8 +1402,13 @@ function normalizeAngularComponentFiles(destPath) {
       if (cssSanitized !== cssOriginal) {
         fs.writeFileSync(cssPath, cssSanitized, 'utf-8');
       }
+      // Empty / selector-only CSS breaks Angular's CSS parser
+      const trimmed = fs.readFileSync(cssPath, 'utf-8').trim();
+      if (!trimmed || (/^[^{]+$/.test(trimmed) && !trimmed.startsWith('/*'))) {
+        fs.writeFileSync(cssPath, `/* ${baseName} */\n`, 'utf-8');
+      }
     } else {
-      fs.writeFileSync(cssPath, `.app-shell { padding: 2rem; }\n`, 'utf-8');
+      fs.writeFileSync(cssPath, `/* ${baseName} */\n`, 'utf-8');
     }
   }
 }
@@ -1381,16 +1511,22 @@ RULES:
   const crossFrameworkInstruction = `
 You are a Principal Software Architect. Your task is to analyze an incoming source codebase and plan out a structural framework migration based on the user's demands.
 Analyze the file directory structure. Provide an array mapping of target framework files that must be created from scratch to fully rebuild the app in the new architecture.
-- If targeting Angular: convert React components into Angular Standalone Components.
-- If targeting React: convert Angular components into React functional components with hooks.
+- If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.css, src/app/app.routes.ts, etc.
+- If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 Your output must strictly be raw valid JSON. No markdown wrappers. The JSON must have a single top-level key "migrationPlan" whose value is an array of objects. Each object must have these keys: "newPath" (string), "explanationOfSource" (string), "approximateSourceFilesToRead" (array of strings).
 
 IMPORTANT RULES FOR FILE GENERATION:
 - For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
 - For Angular projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, angular.json.
 - Focus ONLY on converting the actual application code (components, services, utilities).
-- USER MIGRATION MANDATE IS HIGHEST PRIORITY.
-- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.css.
+- USER MIGRATION MANDATE IS HIGHEST PRIORITY: when the user specifies titles, colors, themes, branding, or copy changes, every planned UI file must reflect those exact values instead of copying the source project defaults.
+- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.css. Never plan inline templates in the .ts file when an .html sibling exists.
+- For Angular: EVERY component needs its own .ts + .html + .css triad with matching names (e.g. avatar.component.ts / avatar.component.html / avatar.component.css). Never share one template across components.
+- For Angular: plan src/lib/* utility ports (utils.ts, format.ts, mock-data.ts) when the React app uses @/lib/*.
+- For React: plan src/lib/* when the Angular app has shared utilities.
+- Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
+- Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
+- Map lucide-react icons to @lucide/angular (Angular target; NOT legacy lucide-angular) or lucide-react (React target).
 `;
 
   const blueprintSystemInstruction = isSameFramework ? sameFrameworkInstruction : crossFrameworkInstruction;
@@ -1561,7 +1697,7 @@ You are an elite Senior Frontend Engineer executing a framework translation.
 You are writing the code for ONE file only in the new framework structure.
 - If writing an Angular Standalone Component TypeScript file: write ONLY TypeScript. Use templateUrl/styleUrl. Do NOT include HTML markup or CSS rules in the .ts file.
 - If writing an Angular .html file: write ONLY HTML markup. No TypeScript, no CSS, no file path comments.
-- If writing an Angular .css file: write ONLY CSS. No HTML, no TypeScript, no file path comments.
+- If writing an Angular .css file: write ONLY valid CSS (complete rules with braces). No HTML, no TypeScript, no file path comments. Empty files must be a comment like /* component */.
 - If writing a React Component: use functional components with hooks and TypeScript.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.
 Respond ONLY with raw code for the single requested file. Do not output markdown code blocks (\`\`\`).
@@ -1573,9 +1709,23 @@ CRITICAL RULES:
 3. For React: Use consistent file extensions - ALL files should be .tsx for TypeScript React projects.
 4. DO NOT create Angular-style directory structures (src/app/ subdirectory) for React projects.
 5. MANDATORY USER REQUIREMENTS override source defaults: if the user specifies titles, colors, theme values, or branding, apply those exact values in this file. Do NOT keep old source titles/colors when the user asked to change them.
-6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file and ALL styles in the .css file. NEVER use an inline template property when an external .html file exists or will exist for the same component.
+6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file and ALL styles in the .css file. NEVER use an inline template or styles property.
 7. When sibling files for the same component were already generated, stay consistent with them (same title text, colors, and layout).
 8. Output MUST contain only the contents of the single target file path you were asked to create.
+9. Angular standalone components MUST set standalone: true. If the template uses *ngIf, *ngFor, ngClass, ngStyle, or async pipe, import CommonModule from '@angular/common' (NOT from '@angular/core') and list it in the @Component imports array. Prefer @if / @for built-in control flow when possible.
+10. Class name MUST match the file: avatar.component.ts → export class AvatarComponent (never AppComponent unless the file is app.component.ts).
+11. Import RxJS symbols (Subject, takeUntil, map, etc.) from 'rxjs' — never from '@angular/core'.
+12. Import Input, Output, inject, Injectable, Component from '@angular/core'. Do not use import type for symbols passed to inject().
+13. Use WritableSignal (from signal()) when calling .set(); plain Signal is read-only.
+14. Getters are NOT callable in templates: use avatarClasses not avatarClasses(). Methods that need () must be real methods, not get accessors.
+15. Do not reference private fields in templates — use protected or public.
+16. Path alias @/ maps to src/ (e.g. import { cn } from '@/lib/utils'). Also emit the actual src/lib/*.ts files in the plan.
+17. Replace lucide-react with @lucide/angular for Angular (NOT the legacy lucide-angular package — it breaks on Angular 20). Do NOT import @radix-ng/* or other invented packages.
+18. app.component.ts must ONLY be the root shell component — never put ErrorHandler, provideHttpClient, or EnvironmentProviders inside a @Component.
+19. app.config.ts / routing providers belong in src/app/app.config.ts and src/app/app.routes.ts only.
+20. Self-closing custom elements are invalid in Angular templates: write proper open/close tags — never <Search /> for a component selector.
+21. For React: do not leave Angular decorators, templateUrl, or @Component in output files.
+22. Services use providedIn: 'root' (never 'server').
 `;
 
   const generatedFiles = {};
@@ -1669,15 +1819,48 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
   
   // For React/Angular, re-inject templates AFTER AI generation to ensure correct config files
   // The AI may have overwritten our templates, so we restore them here
+  const sourcePackageJson = (() => {
+    const candidates = [
+      path.join(baseSearchPath, 'package.json'),
+      ...Object.keys(filesMap)
+        .filter((f) => f.replace(/\\/g, '/').endsWith('package.json'))
+        .map((f) => ({ rel: f, content: filesMap[f] }))
+    ];
+    if (fs.existsSync(candidates[0])) {
+      try {
+        return JSON.parse(fs.readFileSync(candidates[0], 'utf-8'));
+      } catch {
+        /* fall through */
+      }
+    }
+    for (const item of candidates.slice(1)) {
+      if (item && item.content) {
+        try {
+          return JSON.parse(item.content);
+        } catch {
+          /* continue */
+        }
+      }
+    }
+    return null;
+  })();
+
   if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Re-injecting React templates to ensure correct config files...`);
     injectReactWorkspaceTemplates(migrationWorkspacePath);
     ensureReactRuntimeFiles(migrationWorkspacePath);
+    console.log(`[${sessionId}] Running React post-generation repairs...`);
+    repairReactWorkspace(migrationWorkspacePath, { sourcePackageJson });
   } else if (targetLower.includes('angular')) {
     console.log(`[${sessionId}] Re-injecting Angular templates to ensure correct config files...`);
     injectAngularWorkspaceTemplates(migrationWorkspacePath);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
     normalizeAngularComponentFiles(migrationWorkspacePath);
+    console.log(`[${sessionId}] Running Angular post-generation repairs...`);
+    repairAngularWorkspace(migrationWorkspacePath, {
+      sourceFilesMap: filesMap,
+      sourcePackageJson
+    });
   }
 
   const filesToRemove = targetLower.includes('react')

@@ -8,7 +8,7 @@ dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
 import { execSync } from 'child_process';
 import app from './app.js';
-import { PORT, getProviderConfigs, getProviderIds, getProviderFallbackChain, isProviderConfigured, PROVIDERS } from './config/index.js';
+import { PORT, getProviderConfigs, getProviderIds, getProviderFallbackChain, isProviderConfigured, isOllamaCloudMode, PROVIDERS } from './config/index.js';
 
 // ---------------------------------------------------------------------------
 // Validate all configured AI providers on startup
@@ -23,12 +23,23 @@ for (const providerId of providerIds) {
 
   if (providerId === 'ollama') {
     if (isProviderConfigured('ollama')) {
-      console.log(
-        `${provConfig.name} (${providerId}): enabled via OLLAMA_ENABLED=true  [model: ${configs[0]?.model}]`
-      );
+      const mode = isOllamaCloudMode() ? 'cloud' : 'local';
+      const label = `${provConfig.name} (${providerId}/${mode})`;
+      if (validKeys.length > 0) {
+        anyCloudKeyConfigured = true;
+        const masked = validKeys[0].apiKey.length > 8
+          ? validKeys[0].apiKey.slice(0, 4) + '...' + validKeys[0].apiKey.slice(-4)
+          : '****';
+        console.log(`${label}: ${validKeys.length} key(s) — ${masked}  [model: ${configs[0]?.model}]`);
+      } else {
+        console.log(`${label}: enabled (local, no API key)  [model: ${configs[0]?.model}]`);
+      }
+    } else if (isOllamaCloudMode()) {
+      console.warn(`WARNING: OLLAMA_API_KEY is not set.`);
+      console.warn(`  Ollama Cloud will be unavailable until you add a key from https://ollama.com/settings/keys`);
     } else {
       console.log(
-        `${provConfig.name} (${providerId}): disabled for auto-fallback (set OLLAMA_ENABLED=true to include).`
+        `${provConfig.name} (${providerId}/local): disabled for auto-fallback (set OLLAMA_ENABLED=true to include).`
       );
     }
     continue;
@@ -58,7 +69,7 @@ for (const providerId of providerIds) {
 }
 
 console.log(
-  `Provider auto-fallback chain: ${getProviderFallbackChain('openrouter').join(' → ') || '(none configured)'}`
+  `Provider auto-fallback chain: ${getProviderFallbackChain('genai').join(' → ') || '(none configured)'}`
 );
 console.log(
   '  (Selected provider is tried first; then the rest of the chain. Override with AI_FALLBACK_CHAIN.)'
@@ -66,8 +77,7 @@ console.log(
 
 if (!anyCloudKeyConfigured && !isProviderConfigured('ollama')) {
   console.warn('WARNING: No API keys configured for any cloud AI provider.');
-  console.warn('The AI migration pipeline will fail without OpenRouter/Gemini keys (or OLLAMA_ENABLED=true).');
-  console.warn('Set them in the server/.env file or as system environment variables.');
+  console.warn('Set OPENROUTER_API_KEY, GENAI_API_KEY, and/or OLLAMA_API_KEY in server/.env.');
 }
 
 // ---------------------------------------------------------------------------

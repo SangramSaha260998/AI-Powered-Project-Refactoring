@@ -10,6 +10,7 @@ import {
   getProviderConfigs,
   getProviderFallbackChain,
   isProviderConfigured,
+  isOllamaCloudMode,
   RATE_LIMIT_PAUSE_MS
 } from '../config/index.js';
 import { getDefaultPrompt } from '../config/defaultPrompt.js';
@@ -21,6 +22,16 @@ import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
 // ---------------------------------------------------------------------------
 const RETRYABLE_STATUS_CODES = new Set([401, 402, 429, 403]);
 
+/** Thrown when every configured provider/key failed with rate-limit / quota errors. */
+export class AllProvidersRateLimitedError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'AllProvidersRateLimitedError';
+    this.status = 429;
+    this.cause = cause;
+  }
+}
+
 /**
  * Errors that should rotate keys and/or move to the next provider.
  * Includes quota/auth codes, server errors, and network failures.
@@ -31,7 +42,10 @@ function isFallbackWorthyError(err) {
     (err?.response && (err.response.status || err.response.statusCode)) ||
     0;
 
-  if (RETRYABLE_STATUS_CODES.has(statusCode)) return { worthy: true, statusCode, reason: 'quota/auth' };
+  if (RETRYABLE_STATUS_CODES.has(statusCode)) {
+    const reason = statusCode === 429 ? 'rate-limit' : 'quota/auth';
+    return { worthy: true, statusCode, reason };
+  }
   if (statusCode >= 500 && statusCode < 600) return { worthy: true, statusCode, reason: 'server' };
 
   // Connection / DNS / timeout style failures (no HTTP status)
@@ -64,6 +78,21 @@ function isFallbackWorthyError(err) {
   return { worthy: false, statusCode, reason: 'fatal' };
 }
 
+function getRetryAfterMs(err, fallbackMs) {
+  const headers = err?.headers || err?.response?.headers;
+  const raw =
+    (headers && (headers['retry-after'] || headers['Retry-After'])) ||
+    err?.error?.retry_after ||
+    null;
+  if (raw == null) return fallbackMs;
+  const asNum = Number(raw);
+  if (Number.isFinite(asNum) && asNum >= 0) {
+    // OpenAI-style: seconds
+    return Math.min(Math.max(asNum * 1000, fallbackMs), 60000);
+  }
+  return fallbackMs;
+}
+
 /**
  * Returns an array of { client, config } pairs for a provider, or null if
  * that provider has no usable credentials.
@@ -77,10 +106,14 @@ function createClients(aiProvider = 'openrouter', aiModel) {
   const provConfig = PROVIDERS[aiProvider];
 
   if (!configs[0].apiKey) {
+    // Ollama Cloud requires a real API key.
+    if (aiProvider === 'ollama' && isOllamaCloudMode()) {
+      return null;
+    }
     if (provConfig && provConfig.requiresApiKey === false) {
       console.warn(
         `${aiProvider.toUpperCase()}_API_KEY is not set. ` +
-        `This is expected for "${provConfig.name}". ` +
+        `This is expected for "${provConfig.name}" (local). ` +
         `Using a placeholder key for client initialization.`
       );
       return configs.map(cfg => ({
@@ -137,6 +170,8 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
 
   let lastError = null;
   let attemptedAnyProvider = false;
+  let rateLimitedProviders = 0;
+  let providersTried = 0;
 
   for (let providerIndex = 0; providerIndex < chain.length; providerIndex++) {
     const providerId = chain[providerIndex];
@@ -164,6 +199,8 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     }
 
     attemptedAnyProvider = true;
+    providersTried += 1;
+    let providerHitRateLimit = false;
 
     if (providerIndex > 0 || (isPrimary && providerId !== aiProvider)) {
       console.warn(
@@ -203,15 +240,20 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
         const { worthy, statusCode, reason } = isFallbackWorthyError(err);
 
         if (worthy) {
+          if (statusCode === 429) providerHitRateLimit = true;
+
           if (attempt < totalKeys - 1) {
             const maskedKey = config.apiKey.length > 8
               ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
               : '****';
+            const waitMs = statusCode === 429
+              ? getRetryAfterMs(err, 5000)
+              : 2000;
             console.warn(
               `[Key Rotate] ${providerId} key ${attempt + 1}/${totalKeys} (${maskedKey}) ` +
-              `failed (${reason}: ${statusCode}). Falling back to next key...`
+              `failed (${reason}: ${statusCode}). Falling back to next key in ${Math.round(waitMs / 1000)}s...`
             );
-            await pause(2000);
+            await pause(waitMs);
             continue;
           }
 
@@ -219,7 +261,7 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
             `[Provider Fallback] All ${totalKeys} key(s) for "${providerId}" exhausted ` +
             `(${reason}: ${statusCode}).`
           );
-          await pause(2000);
+          await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 2000);
           break; // next provider
         }
 
@@ -237,12 +279,22 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
         throw err;
       }
     }
+
+    if (providerHitRateLimit) rateLimitedProviders += 1;
   }
 
   if (!attemptedAnyProvider) {
     throw new Error(
       'No AI providers are configured. Set OPENROUTER_API_KEY and/or GENAI_API_KEY in server/.env ' +
       '(or enable Ollama with OLLAMA_ENABLED=true).'
+    );
+  }
+
+  if (providersTried > 0 && rateLimitedProviders === providersTried) {
+    throw new AllProvidersRateLimitedError(
+      'All AI providers are rate-limited (HTTP 429). Wait a few minutes, add more API keys, ' +
+      'or enable a local Ollama fallback (OLLAMA_ENABLED=true).',
+      lastError
     );
   }
 
@@ -1713,6 +1765,13 @@ ${enhancedPrompt}`
       blueprintText = await callLLM(attemptInstruction, attemptUserPrompt, useJsonMode, aiProvider, aiModel);
     } catch (err) {
       console.error(`[${sessionId}] Blueprint LLM call failed:`, err.message);
+      // Don't burn rate-limited keys 3 more times with alternate prompt modes.
+      if (err instanceof AllProvidersRateLimitedError || err?.status === 429) {
+        throw new Error(
+          `AI blueprint generation failed: all providers are rate-limited (429). ` +
+          `Wait a few minutes and retry, add more keys, or set OLLAMA_ENABLED=true for local fallback.`
+        );
+      }
       if (attempt === 2) {
         throw new Error(`AI blueprint generation failed: ${err.message}.`);
       }

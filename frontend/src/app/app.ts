@@ -29,32 +29,14 @@ export class App {
   aiProviders = [
     { id: 'openrouter', label: 'OpenRouter' },
     { id: 'genai', label: 'Google Gemini' },
-    { id: 'ollama', label: 'Ollama (Local)' },
+    { id: 'ollama', label: 'Ollama Cloud' },
   ];
 
-  // Models per provider (openrouter is loaded dynamically from OpenRouter free models)
+  // Models per provider (loaded dynamically when a provider is selected)
   providerModels: Record<string, ModelOption[]> = {
     openrouter: [],
-    genai: [
-      { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-      { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
-      { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
-    ],
-    ollama: [
-      { id: 'llama3.1', label: 'llama3.1' },
-      { id: 'llama3', label: 'llama3' },
-      { id: 'mistral', label: 'mistral' },
-      { id: 'codellama', label: 'codellama' },
-      { id: 'deepseek-coder', label: 'deepseek-coder' },
-      { id: 'mixtral', label: 'mixtral' },
-      { id: 'phi3', label: 'phi3' },
-      { id: 'gemma2', label: 'gemma2' },
-      { id: 'qwen2', label: 'qwen2' },
-      { id: 'qwen2.5-coder:7b', label: 'qwen2.5-coder:7b' },
-      { id: 'qwen2.5-coder:3b', label: 'qwen2.5-coder:3b' },
-      { id: 'qwen2.5-coder:1.5b', label: 'qwen2.5-coder:1.5b' },
-      { id: 'deepseek-r1', label: 'deepseek-r1' },
-    ],
+    genai: [],
+    ollama: [],
   };
 
   // Modern Angular Signals replacing classic variables
@@ -69,9 +51,9 @@ export class App {
   statusMessage = signal<string>('');
   isSuccess = signal<boolean>(false);
   theme = signal<ThemeMode>('light');
-  openrouterModelsLoading = signal<boolean>(false);
-  /** Bumps when openrouter models are refreshed so the model select re-renders. */
-  private openrouterModelsVersion = signal(0);
+  modelsLoading = signal<boolean>(false);
+  /** Bumps when provider models are refreshed so the model select re-renders. */
+  private modelsVersion = signal(0);
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -93,28 +75,37 @@ export class App {
     this.applyTheme(this.resolveInitialTheme());
   }
 
-  /** Fetch free OpenRouter models via the backend proxy. */
-  private loadOpenRouterModels() {
-    this.openrouterModelsLoading.set(true);
-    this.http.get<{ models: ModelOption[] }>(`${API_BASE}/models/openrouter`).subscribe({
-      next: (res) => {
-        this.providerModels['openrouter'] = res.models ?? [];
-        this.openrouterModelsVersion.update((v) => v + 1);
-        this.openrouterModelsLoading.set(false);
+  private isDynamicProvider(provider: string): boolean {
+    return provider === 'openrouter' || provider === 'genai' || provider === 'ollama';
+  }
 
-        // Keep current selection if still available; otherwise clear it.
-        if (this.aiProvider() === 'openrouter') {
+  /** Fetch models for a provider via the backend proxy. */
+  private loadProviderModels(provider: string) {
+    if (!this.isDynamicProvider(provider)) return;
+
+    this.modelsLoading.set(true);
+    this.http.get<{ models: ModelOption[] }>(`${API_BASE}/models/${provider}`).subscribe({
+      next: (res) => {
+        this.providerModels[provider] = res.models ?? [];
+        this.modelsVersion.update((v) => v + 1);
+        this.modelsLoading.set(false);
+
+        if (this.aiProvider() === provider) {
           const current = this.aiModel();
-          if (current && !this.providerModels['openrouter'].some((m) => m.id === current)) {
+          if (current && !this.providerModels[provider].some((m) => m.id === current)) {
             this.aiModel.set('');
           }
         }
       },
       error: (err) => {
-        console.error('Failed to load OpenRouter free models:', err);
-        this.providerModels['openrouter'] = [];
-        this.openrouterModelsVersion.update((v) => v + 1);
-        this.openrouterModelsLoading.set(false);
+        console.error(`Failed to load ${provider} models:`, err);
+        this.providerModels[provider] = [];
+        this.modelsVersion.update((v) => v + 1);
+        this.modelsLoading.set(false);
+        const msg = err?.error?.error || err?.message || `Failed to load ${provider} models.`;
+        this.isSuccess.set(false);
+        this.statusMessage.set(`❌ ${msg}`);
+        this.clearMessage();
       },
     });
   }
@@ -204,11 +195,11 @@ Final app must compile and run: npm install → ng serve`;
     this.aiModel.set('');
 
     if (
-      value === 'openrouter' &&
-      this.providerModels['openrouter'].length === 0 &&
-      !this.openrouterModelsLoading()
+      this.isDynamicProvider(value) &&
+      this.providerModels[value].length === 0 &&
+      !this.modelsLoading()
     ) {
-      this.loadOpenRouterModels();
+      this.loadProviderModels(value);
     }
   }
 
@@ -219,8 +210,8 @@ Final app must compile and run: npm install → ng serve`;
 
   /** Returns models for the currently selected provider. */
   get currentModels(): ModelOption[] {
-    // Touch version signal so openrouter async updates refresh the template.
-    this.openrouterModelsVersion();
+    // Touch version signal so async model updates refresh the template.
+    this.modelsVersion();
     return this.providerModels[this.aiProvider()] || [];
   }
 
@@ -308,9 +299,9 @@ Final app must compile and run: npm install → ng serve`;
       this.clearMessage();
       return;
     }
-    if (this.aiProvider() === 'openrouter' && !this.aiModel()) {
+    if (!this.aiModel()) {
       this.isSuccess.set(false);
-      this.statusMessage.set('❌ Please select an OpenRouter model.');
+      this.statusMessage.set('❌ Please select a model.');
       this.clearMessage();
       return;
     }

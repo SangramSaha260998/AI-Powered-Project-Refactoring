@@ -73,42 +73,51 @@ export const PROVIDERS = {
     envPrefix: 'GENAI',
     defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
     defaultModel: 'gemini-2.0-flash',
-    models: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
+    models: []
   },
   ollama: {
-    name: 'Ollama (Local)',
+    name: 'Ollama Cloud',
     envPrefix: 'OLLAMA',
-    defaultBaseURL: 'http://localhost:11434/v1',
-    defaultModel: 'llama3.1',
+    // Cloud OpenAI-compatible endpoint. For local Ollama use:
+    // OLLAMA_BASE_URL=http://localhost:11434/v1
+    defaultBaseURL: 'https://ollama.com/v1',
+    defaultModel: 'gpt-oss:20b',
+    // Cloud needs an API key; local mode can run without one.
     requiresApiKey: false,
-    // Only used in fallback / selection when explicitly enabled.
-    models: [
-      'llama3.1', 'llama3', 'mistral', 'codellama',
-      'deepseek-coder', 'mixtral', 'phi3', 'gemma2',
-      'qwen2', 'qwen2.5-coder:7b', 'qwen2.5-coder:3b',
-      'qwen2.5-coder:1.5b', 'deepseek-r1'
-    ]
+    models: []
   }
 };
+
+/**
+ * True when Ollama is pointed at ollama.com (cloud), not localhost.
+ */
+export function isOllamaCloudMode() {
+  const base =
+    process.env.OLLAMA_BASE_URL ||
+    PROVIDERS.ollama?.defaultBaseURL ||
+    '';
+  return /ollama\.com/i.test(base);
+}
 
 /**
  * Default order for automatic cross-provider fallback when a provider's
  * keys are exhausted (quota / auth / rate-limit / network / 5xx).
  * Primary (UI-selected) provider is always tried first; then this list minus the primary.
- * Override via AI_FALLBACK_CHAIN=openrouter,genai,ollama
+ * Override via AI_FALLBACK_CHAIN=genai,openrouter,ollama
  *
- * Ollama is only included when OLLAMA_ENABLED=true (avoids hanging on dead local server).
+ * Ollama Cloud is included automatically when OLLAMA_API_KEY is set.
+ * Local Ollama requires OLLAMA_ENABLED=true.
  */
 export const DEFAULT_PROVIDER_FALLBACK_CHAIN = [
-  'openrouter',
   'genai',
+  'openrouter',
   'ollama',
 ];
 
 /**
  * Builds the provider attempt order for a migration request.
  * Always starts with the user-selected provider (even if not "configured"
- * for auto-fallback — e.g. Ollama selected in UI without OLLAMA_ENABLED).
+ * for auto-fallback — e.g. local Ollama selected without OLLAMA_ENABLED).
  * Then appends remaining chain entries that are configured.
  *
  * @param {string} primaryProvider
@@ -134,15 +143,29 @@ export function getProviderFallbackChain(primaryProvider = 'openrouter') {
 
 /**
  * Returns whether a provider can be used in the automatic fallback chain.
- * Ollama is opt-in via OLLAMA_ENABLED=true so a dead local server does not hang migrations.
- * (Selecting Ollama explicitly in the UI still works via getProviderFallbackChain.)
+ * - Ollama Cloud: configured when OLLAMA_API_KEY is set
+ * - Ollama Local: configured when OLLAMA_ENABLED=true
  */
 export function isProviderConfigured(provider) {
   const prov = PROVIDERS[provider];
   if (!prov) return false;
 
   if (provider === 'ollama') {
-    return String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true';
+    const apiKey = process.env.OLLAMA_API_KEY || '';
+    const hasKey = apiKey
+      .split(',')
+      .map((k) => k.trim())
+      .some(Boolean);
+
+    if (isOllamaCloudMode()) {
+      return hasKey;
+    }
+
+    // Local Ollama: opt-in so a dead localhost server does not hang migrations.
+    return (
+      hasKey ||
+      String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true'
+    );
   }
 
   if (prov.requiresApiKey === false) return true;

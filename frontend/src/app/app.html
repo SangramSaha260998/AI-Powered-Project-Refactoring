@@ -67,14 +67,14 @@
             id="aiModel"
             [value]="aiModel()"
             (change)="onModelChange($event)"
-            [disabled]="!aiProvider() || (aiProvider() === 'openrouter' && openrouterModelsLoading())"
+            [disabled]="!aiProvider() || modelsLoading()"
           >
             <option value="">
               {{
                 !aiProvider()
                   ? '-- Select a provider first --'
-                  : aiProvider() === 'openrouter' && openrouterModelsLoading()
-                    ? '-- Loading free models --'
+                  : modelsLoading()
+                    ? '-- Loading models --'
                     : '-- Select a model --'
               }}
             </option>
@@ -135,7 +135,7 @@
 
       <button
         class="action-btn"
-        [disabled]="!selectedFile() || !toTech() || !fromTech() || !aiProvider() || (aiProvider() === 'openrouter' && !aiModel()) || !prompt().trim() || isLoading()"
+        [disabled]="!selectedFile() || !toTech() || !fromTech() || !aiProvider() || !aiModel() || !prompt().trim() || isLoading() || modelsLoading()"
         (click)="uploadProject()"
       >
         @if (isLoading()) {

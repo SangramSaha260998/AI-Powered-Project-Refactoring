@@ -21,6 +21,69 @@ export const NO_HALLUCINATION_PREAMBLE = `
    target-framework primitives — never fake a package or module name.
 5. Output must compile and run after npm install → ng serve / npm start.
    No dangling imports, placeholders like "// TODO implement", or truncated files.
+
+## TARGET VERSIONS (applied automatically — all conversions)
+
+Version selection rule:
+1. If the USER PROMPT specifies an Angular or React version (e.g. "Angular 20",
+   "React 18.3", "version 20" while Angular is the target) → use THAT version.
+2. Otherwise use the latest stable defaults (currently Angular 22 / React 19).
+
+The concrete pins are in the TARGET VERSION MANDATE block appended after this
+prompt — obey THAT block for package.json and APIs. Do not invent a different major.
+
+- Angular: standalone components + \`@angular/build\` when the target major supports
+  them; prefer signals / \`inject()\` / \`@if\` \`@for\` when available on that major.
+- React: Vite + TypeScript, functional components + hooks only.
+  Automatic JSX runtime (no unused \`import React from 'react'\`).
+
+## FOLDER STRUCTURE & CODE QUALITY (applied automatically)
+
+### Angular best structure
+\`\`\`
+src/
+  main.ts
+  index.html
+  styles.css
+  app/
+    app.component.ts|html|css
+    app.config.ts
+    app.routes.ts
+    core/           # singleton services, guards, interceptors, auth
+    shared/         # reusable UI, pipes, directives, utils
+    pages/          # one folder per feature (auth/, dashboard/, …)
+      common/       # for all common pages
+        not-found/
+        forbidden/
+      auth/         # for all auth pages means before login
+        login/
+      admin/        # for all other pages means after login
+        dashboard/
+\`\`\`
+- One feature per folder. Matching \`.ts\` + \`.html\` + \`.css\` triad per component.
+- \`standalone: true\` everywhere. \`providedIn: 'root'\` for app-wide services.
+- Clear names, small focused components, no dead code, no unused imports.
+- Strict typing; no \`any\` unless unavoidable. Public template API only
+  (public/protected — never private in templates).
+
+### React best structure
+\`\`\`
+src/
+  main.tsx
+  App.tsx
+  App.css
+  components/     # shared presentational UI
+  features/       # feature modules (auth/, dashboard/, …)
+  pages/          # route-level screens (optional if features own routes)
+  hooks/          # shared custom hooks
+  lib/            # utils (cn, formatters)
+  services/       # API clients
+  styles/         # global CSS (optional)
+\`\`\`
+- Entry is \`src/main.tsx\` → \`src/App.tsx\` (never Angular-style \`src/app/\`).
+- Feature-first folders; co-locate feature components with the feature.
+- Typed props, pure presentational components where possible, hooks for state/
+  side effects. No unused vars/imports. Prefer composition over giant files.
 `;
 
 /**
@@ -64,8 +127,9 @@ STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
 - Working dashboard after login
 - No dangling imports, missing modules, or broken routing
 - Delete unused component files — do not leave orphans
-- Stay on real Angular APIs only (standalone components, CommonModule from
-  @angular/common, Router from @angular/router). Do not invent packages.
+- Stay on real **Angular 22** APIs only (standalone components, CommonModule from
+  @angular/common, Router from @angular/router, signals/inject where appropriate).
+  Use feature folders under src/app (core / shared / features). Do not invent packages.
 `;
 
 /** @deprecated Use ANGULAR_TO_ANGULAR_PROMPT — kept for older imports. */
@@ -108,9 +172,10 @@ STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
 ### Final app MUST be immediately runnable:
 - npm install → npm start / vite
 - Working login/register + dashboard
-- Functional React only: function components + hooks. No Angular leftovers
+- **React 19** functional components + hooks only. No Angular leftovers
   (@Component, templateUrl, NgModule). No invented packages.
-- Main entry: src/App.tsx (not src/app/app.tsx). Delete unused files.
+- Main entry: src/main.tsx → src/App.tsx (not src/app/app.tsx).
+- Use components/, features/, hooks/, lib/, services/ layout. Delete unused files.
 `;
 
 /**
@@ -139,11 +204,13 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - DI inject() → props, context, or custom hooks. RxJS streams → hooks + fetch/promises
   (or keep rxjs only if already a real dependency and needed).
 
-### Structure (Vite + React + TypeScript)
+### Structure (Vite + React 19 + TypeScript)
 - App entry: src/main.tsx boots src/App.tsx (NOT src/app/app.tsx).
-- Use .tsx for components. Functional components + hooks only.
-- Routing: react-router-dom (BrowserRouter, Routes, Route, Navigate, Link).
+- Use .tsx for components. Functional components + hooks only (React 19).
+- Prefer folders: components/, features/, hooks/, lib/, services/, pages/.
+- Routing: react-router-dom (BrowserRouter or createBrowserRouter).
 - Do NOT generate angular.json, tsconfig.app.json, or Angular workspace files.
+- High code quality: typed props, no unused imports, small focused modules.
 
 ### Icons & UI
 - lucide-angular / @lucide/angular → lucide-react (real named exports: Home, Search).
@@ -170,14 +237,33 @@ export const REACT_TO_ANGULAR_PROMPT = `
 - If a Radix/shadcn primitive has no Angular equivalent, rewrite it as a plain
   standalone Angular component with @Input/@Output — do not fake a module.
 
-### @lucide/angular (Angular 20) — REQUIRED pattern
+### @lucide/angular (Angular 22) — REQUIRED: ALL ICONS → SVG
+- EVERY lucide-react icon MUST become an SVG icon in Angular. No exceptions.
 - Package is \`@lucide/angular\` (NOT legacy \`lucide-angular\`, NOT \`lucide-react\`).
-- FORBIDDEN: LucideIconModule, LucideAngularModule, LucideAngularComponent (legacy).
-- CORRECT static: import \`LucideHome\`, \`LucideSearch\`, etc., list in \`imports\`,
-  render \`<svg lucideHome></svg>\`.
-- CORRECT dynamic: \`LucideIcon\` + \`provideLucideIcons(LucideHome, …)\` and
-  \`<svg [lucideIcon]="'home'"></svg>\`.
-- Map lucide-react names: Home → LucideHome.
+- FORBIDDEN exports: LucideIconModule, LucideAngularModule, LucideAngularComponent (legacy).
+- FORBIDDEN template tags: \`<lucide-home>\`, \`<lucide-logout>\`, \`<Home />\`, \`<LogOut />\` —
+  never keep React lucide components or legacy element selectors.
+- REQUIRED conversion for every icon:
+  React \`import { Home, LogOut } from 'lucide-react'\` + \`<Home className="..." />\`
+  → Angular \`import { LucideHome, LucideLogOut } from '@lucide/angular'\`
+  → list in \`imports: [LucideHome, LucideLogOut]\`
+  → render ONLY as SVG: \`<svg lucideHome class="..."></svg>\` /
+  \`<svg lucideLogOut class="..."></svg>\`
+  (directive attribute = \`lucide\` + PascalCase icon name).
+- Prefer static SVG icons over dynamic \`[lucideIcon]\`. Use dynamic only when the
+  icon name is truly runtime-variable: \`<svg [lucideIcon]="'home'"></svg>\` with
+  \`provideLucideIcons(...)\`.
+- Map names: Home → LucideHome / lucideHome, LogOut → LucideLogOut / lucideLogOut,
+  Search → LucideSearch / lucideSearch.
+
+### Angular 22 quality
+- Target Angular 22 APIs only (signals, inject(), standalone, @if/@for).
+- Follow page-folder structure under src/app/pages (common|auth|admin) plus core|shared.
+- Strong typing; matching .ts/.html/.css; no hallucinated modules.
+- Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
+- Always \`export const routes\` from app.routes.ts (never unexported \`const routes\`).
+- Every template member (methods/fields) MUST exist on the class; keep .ts and .html in sync.
+- Child selectors like \`<app-admin-shell>\` MUST be listed in the parent's \`imports\` array.
 
 ### Templates vs TypeScript consistency
 - EVERY name in .html MUST exist on the class (public/protected field, @Input,

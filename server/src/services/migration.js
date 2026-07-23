@@ -14,6 +14,7 @@ import {
   RATE_LIMIT_PAUSE_MS
 } from '../config/index.js';
 import { getDefaultPrompt } from '../config/defaultPrompt.js';
+import { resolveTargetVersions, formatVersionMandate } from '../config/targetVersions.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
 
@@ -448,12 +449,80 @@ function findBaseSearchPath(extractPath) {
 // Angular workspace template injection
 // ---------------------------------------------------------------------------
 
-function injectAngularWorkspaceTemplates(destPath) {
-  // Keep all @angular/* packages on the same minor line to avoid npm ERESOLVE conflicts.
-  const angularVersion = '20.3.0';
-  const angularToolingVersion = '20.3.16';
+/**
+ * Final lock so package.json cannot drift to a different Angular major after AI/postprocess.
+ */
+function enforceAngularPackageVersions(destPath, stack) {
+  if (!stack?.core) return;
+  const pkgPath = path.join(destPath, 'package.json');
+  if (!fs.existsSync(pkgPath)) return;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  } catch {
+    return;
+  }
+  pkg.dependencies = pkg.dependencies || {};
+  pkg.devDependencies = pkg.devDependencies || {};
+  const corePkgs = [
+    '@angular/animations',
+    '@angular/common',
+    '@angular/compiler',
+    '@angular/core',
+    '@angular/forms',
+    '@angular/platform-browser',
+    '@angular/router'
+  ];
+  for (const name of corePkgs) {
+    if (pkg.dependencies[name] || name === '@angular/core') {
+      pkg.dependencies[name] = `^${stack.core}`;
+    }
+  }
+  pkg.devDependencies['@angular/compiler-cli'] = `^${stack.core}`;
+  pkg.devDependencies['@angular/build'] = `^${stack.tooling}`;
+  pkg.devDependencies['@angular/cli'] = `^${stack.tooling}`;
+  if (stack.typescript) pkg.devDependencies.typescript = stack.typescript;
+  if (stack.zone) pkg.dependencies['zone.js'] = stack.zone;
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
+  console.log(`[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source})`);
+}
 
-  // 1. package.json - Angular 20 with @angular/build (standalone bootstrap; no platform-browser-dynamic)
+function enforceReactPackageVersions(destPath, stack) {
+  if (!stack?.react) return;
+  const pkgPath = path.join(destPath, 'package.json');
+  if (!fs.existsSync(pkgPath)) return;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  } catch {
+    return;
+  }
+  pkg.dependencies = pkg.dependencies || {};
+  pkg.devDependencies = pkg.devDependencies || {};
+  pkg.dependencies.react = `^${stack.react}`;
+  pkg.dependencies['react-dom'] = `^${stack.react}`;
+  pkg.devDependencies['@types/react'] = `^${stack.typesReact}`;
+  pkg.devDependencies['@types/react-dom'] = `^${stack.typesReactDom}`;
+  if (stack.vite) pkg.devDependencies.vite = `^${stack.vite}`;
+  if (stack.pluginReact) pkg.devDependencies['@vitejs/plugin-react'] = `^${stack.pluginReact}`;
+  if (stack.typescript) pkg.devDependencies.typescript = stack.typescript;
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
+  console.log(`[versions] Locked React package.json to ^${stack.react} (source=${stack.source})`);
+}
+
+function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
+  // Keep all @angular/* packages on the same major line to avoid npm ERESOLVE conflicts.
+  // Default = latest stable; override when user prompt names a version.
+  const stack = versionStack || {
+    core: '22.0.8',
+    tooling: '22.0.7',
+    typescript: '~6.0.3',
+    zone: '~0.16.0'
+  };
+  const angularVersion = stack.core;
+  const angularToolingVersion = stack.tooling;
+
+  // 1. package.json - standalone bootstrap via @angular/build
   const packageJson = {
     name: 'migrated-angular-project',
     version: '0.0.0',
@@ -474,13 +543,13 @@ function injectAngularWorkspaceTemplates(destPath) {
       '@angular/router': `^${angularVersion}`,
       'rxjs': '~7.8.0',
       'tslib': '^2.3.0',
-      'zone.js': '~0.15.0'
+      'zone.js': stack.zone || '~0.16.0'
     },
     devDependencies: {
       '@angular/build': `^${angularToolingVersion}`,
       '@angular/cli': `^${angularToolingVersion}`,
       '@angular/compiler-cli': `^${angularVersion}`,
-      'typescript': '~5.9.2'
+      'typescript': stack.typescript || '~6.0.3'
     }
   };
   fs.writeFileSync(
@@ -741,8 +810,16 @@ Thumbs.db
 // React workspace template injection
 // ---------------------------------------------------------------------------
 
-function injectReactWorkspaceTemplates(destPath) {
-  // 1. package.json
+function injectReactWorkspaceTemplates(destPath, versionStack = null) {
+  // Default = latest stable React; override when user prompt names a version.
+  const stack = versionStack || {
+    react: '19.2.8',
+    typesReact: '19.2.17',
+    typesReactDom: '19.2.3',
+    vite: '8.1.5',
+    pluginReact: '6.0.4',
+    typescript: '~5.9.2'
+  };
   const packageJson = {
     name: 'migrated-react-project',
     version: '1.0.0',
@@ -750,19 +827,20 @@ function injectReactWorkspaceTemplates(destPath) {
     type: 'module',
     scripts: {
       dev: 'vite',
-      build: 'vite build',
+      start: 'vite',
+      build: 'tsc -b && vite build',
       preview: 'vite preview'
     },
     dependencies: {
-      'react': '^18.3.1',
-      'react-dom': '^18.3.1'
+      'react': `^${stack.react}`,
+      'react-dom': `^${stack.react}`
     },
     devDependencies: {
-      '@types/react': '^18.3.0',
-      '@types/react-dom': '^18.3.0',
-      '@vitejs/plugin-react': '^4.3.0',
-      'typescript': '~5.6.0',
-      'vite': '^6.0.0'
+      '@types/react': `^${stack.typesReact}`,
+      '@types/react-dom': `^${stack.typesReactDom}`,
+      '@vitejs/plugin-react': `^${stack.pluginReact}`,
+      'typescript': stack.typescript || '~5.9.2',
+      'vite': `^${stack.vite}`
     }
   };
   fs.writeFileSync(
@@ -1609,9 +1687,13 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
 
-  // Append the default strip-down prompt for same-framework migrations
+  // User-prompt version wins; otherwise latest stable (all conversion directions)
+  const targetVersions = resolveTargetVersions(userPrompt, toTech);
+  const versionMandate = formatVersionMandate(targetVersions);
+
+  // Append the default strip-down / cross-framework prompt + version mandate
   const defaultSuffix = getDefaultPrompt(fromTech, toTech);
-  const enhancedPrompt = userPrompt + '\n\n' + defaultSuffix;
+  const enhancedPrompt = `${userPrompt}\n\n${defaultSuffix}\n\n${versionMandate}`;
 
   // Use absolute paths based on the already-defined EXTRACT_DIR
   const extractPath = path.join(EXTRACT_DIR, sessionId);
@@ -1643,17 +1725,26 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   const filesContextSummary = buildFilesContext(filesMap);
 
   console.log(`[${sessionId}] Read ${Object.keys(filesMap).length} source files.`);
+  const targetLower = (toTech || '').toLowerCase();
+  if (targetLower.includes('angular')) {
+    console.log(
+      `[${sessionId}] Angular target version: ${targetVersions.angular.core} (${targetVersions.angular.source})`
+    );
+  } else if (targetLower.includes('react')) {
+    console.log(
+      `[${sessionId}] React target version: ${targetVersions.react.react} (${targetVersions.react.source})`
+    );
+  }
 
   // -----------------------------------------------------------------------
   // 2b. Inject workspace templates for known target frameworks
   // -----------------------------------------------------------------------
-  const targetLower = (toTech || '').toLowerCase();
   if (targetLower.includes('angular')) {
     console.log(`[${sessionId}] Injecting Angular workspace templates...`);
-    injectAngularWorkspaceTemplates(migrationWorkspacePath);
+    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
   } else if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Injecting React workspace templates...`);
-    injectReactWorkspaceTemplates(migrationWorkspacePath);
+    injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
   }
 
   // -----------------------------------------------------------------------
@@ -1693,8 +1784,8 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
-- Map lucide-react icons to @lucide/angular (Angular target; NOT legacy lucide-angular) or lucide-react (React target).
-- For Angular: NEVER plan LucideIconModule / LucideAngularModule — those exports do not exist on @lucide/angular. Plan per-icon Lucide* imports or LucideIcon + provideLucideIcons.
+- Map lucide-react icons to @lucide/angular SVG icons (Angular target; NOT legacy lucide-angular). Every icon must render as \`<svg lucideXxx></svg>\`. For React target keep lucide-react.
+- For Angular: NEVER plan LucideIconModule / LucideAngularModule or \`<lucide-*>\` tags. Plan per-icon Lucide* imports + SVG markup only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
 - For Angular: routes import page components from their own files — never from app.component.ts.
 `;
@@ -1898,21 +1989,23 @@ CRITICAL RULES:
 14. Getters are NOT callable in templates: use avatarClasses not avatarClasses(). Methods that need () must be real methods, not get accessors.
 15. Do not reference private fields in templates — use protected or public.
 16. Path alias @/ maps to src/ (e.g. import { cn } from '@/lib/utils'). Also emit the actual src/lib/*.ts files in the plan.
-17. Replace lucide-react with @lucide/angular for Angular (NOT the legacy lucide-angular package — it breaks on Angular 20). Do NOT import @radix-ng/* or other invented packages.
+17. Replace lucide-react with @lucide/angular for Angular (NOT legacy lucide-angular). EVERY icon must be an SVG: import LucideHome and render <svg lucideHome></svg> — never <Home />, never <lucide-home>. Do NOT import @radix-ng/* or other invented packages.
 18. app.component.ts must ONLY be the root shell component — never put ErrorHandler, provideHttpClient, or EnvironmentProviders inside a @Component.
 19. app.config.ts / routing providers belong in src/app/app.config.ts and src/app/app.routes.ts only.
 20. Self-closing custom elements are invalid in Angular templates: write proper open/close tags — never <Search /> for a component selector.
 21. For React: do not leave Angular decorators, templateUrl, or @Component in output files.
 22. Services use providedIn: 'root' (never 'server').
-23. ANTI-HALLUCINATION: Never invent exports. For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule. REQUIRED: import LucideHome / LucideSearch / etc. into the standalone imports array, or use LucideIcon + provideLucideIcons(...).
+23. ALL LUCIDE ICONS → SVG: For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule, <lucide-home>, <lucide-logout>, React <Home />. REQUIRED: import LucideHome / LucideLogOut into standalone imports and render ONLY <svg lucideHome></svg> / <svg lucideLogOut></svg>.
 24. Angular templates must not contain React leftovers: no bare cn(...) unless the class has \`protected readonly cn = cn\`, no empty (click)="", no \`return\` / multi-statement JS in bindings — call one class method.
 25. Every template binding target (property/method) MUST be declared on the class as public or protected. Promote private members used by templates.
 26. Do not declare a field and a getter with the same name (e.g. canScrollPrev).
 27. Import HostListener from '@angular/core' when using @HostListener. Never import node:process in browser components.
 28. embla-carousel: \`import EmblaCarousel, { EmblaOptionsType, EmblaCarouselType } from 'embla-carousel'\` — never named Embla / EmblaOptions / EmblaApi.
-29. app.routes.ts must import AdminShellComponent (and other pages) from their real files, never from './app.component'.
+29. app.routes.ts must import AdminShellComponent (and other pages) from their real files, never from './app.component'. Always \`export const routes\`.
 30. Form error checks: use errors?.['required'] / errors?.['minlength'] bracket access.
 31. HTML must be balanced and complete — no truncated templates (Unexpected EOF).
+32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow best folder structure (Angular: app/core|shared|pages/{common,auth,admin}; React: components|features|hooks|lib|services) and high code quality.
+33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 `;
 
   const generatedFiles = {};
@@ -2034,13 +2127,14 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
 
   if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Re-injecting React templates to ensure correct config files...`);
-    injectReactWorkspaceTemplates(migrationWorkspacePath);
+    injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
     ensureReactRuntimeFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running React post-generation repairs...`);
     repairReactWorkspace(migrationWorkspacePath, { sourcePackageJson });
+    enforceReactPackageVersions(migrationWorkspacePath, targetVersions.react);
   } else if (targetLower.includes('angular')) {
     console.log(`[${sessionId}] Re-injecting Angular templates to ensure correct config files...`);
-    injectAngularWorkspaceTemplates(migrationWorkspacePath);
+    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
     normalizeAngularComponentFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running Angular post-generation repairs...`);
@@ -2048,6 +2142,8 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
       sourceFilesMap: filesMap,
       sourcePackageJson
     });
+    // Final lock: AI / postprocess must not drift away from resolved version
+    enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
   }
 
   const filesToRemove = targetLower.includes('react')

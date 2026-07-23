@@ -177,19 +177,211 @@ function classHasMember(source, name) {
 }
 
 /**
+ * Map legacy/AI lucide tag slugs to real Lucide icon slugs (kebab-case).
+ * AI often emits <lucide-logout> instead of log-out.
+ */
+const LUCIDE_SLUG_ALIASES = {
+  logout: 'log-out',
+  login: 'log-in',
+  signin: 'log-in',
+  signout: 'log-out',
+  edit3: 'edit-3',
+  edit2: 'edit-2',
+  trash2: 'trash-2',
+  checkcircle: 'check-circle',
+  checkcircle2: 'check-circle-2',
+  alertcircle: 'alert-circle',
+  helpcircle: 'help-circle',
+  xcircle: 'x-circle',
+  usercog: 'user-cog',
+  usercheck: 'user-check',
+  userplus: 'user-plus',
+  userminus: 'user-minus',
+  shieldcheck: 'shield-check',
+  shieldalert: 'shield-alert',
+  eyeoff: 'eye-off',
+  chevrondown: 'chevron-down',
+  chevronup: 'chevron-up',
+  chevronleft: 'chevron-left',
+  chevronright: 'chevron-right',
+  arrowleft: 'arrow-left',
+  arrowright: 'arrow-right',
+  morehorizontal: 'more-horizontal',
+  morevertical: 'more-vertical'
+};
+
+function normalizeLucideSlug(rawSlug) {
+  let slug = String(rawSlug || '')
+    .replace(/^lucide-?/i, '')
+    .replace(/_/g, '-')
+    .trim()
+    .toLowerCase();
+  if (!slug) return 'circle';
+  if (LUCIDE_SLUG_ALIASES[slug]) return LUCIDE_SLUG_ALIASES[slug];
+  // logout already handled; also collapse accidental camelCase leftovers
+  const compact = slug.replace(/-/g, '');
+  if (LUCIDE_SLUG_ALIASES[compact]) return LUCIDE_SLUG_ALIASES[compact];
+  return slug;
+}
+
+function lucideSlugToSymbolAndAttr(rawSlug) {
+  const slug = normalizeLucideSlug(rawSlug);
+  const pascal = slug
+    .split('-')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('');
+  return {
+    slug,
+    symbol: `Lucide${pascal}`,
+    attr: `lucide${pascal}`
+  };
+}
+
+/**
+ * Rewrite forbidden legacy / React lucide usages into @lucide/angular SVG form:
+ *   <lucide-logout class="x"></lucide-logout>
+ *   <LucideLogOut class="x" />
+ * into:
+ *   <svg lucideLogOut class="x"></svg>
+ */
+function rewriteLegacyLucideHtmlTags(html) {
+  if (!html || !/lucide/i.test(html)) return html;
+
+  let updated = html;
+
+  // Legacy element tags: <lucide-foo ...>…</lucide-foo> or <lucide-foo .../>
+  updated = updated.replace(
+    /<lucide-([a-z0-9-]+)([^>]*?)(?:\/>|>([\s\S]*?)<\/lucide-\1>)/gi,
+    (_full, slug, attrs) => {
+      const { attr } = lucideSlugToSymbolAndAttr(slug);
+      const cleanAttrs = normalizeLucideSvgAttrs(attrs);
+      return `<svg ${attr}${cleanAttrs ? ` ${cleanAttrs}` : ''}></svg>`;
+    }
+  );
+  updated = updated.replace(/<\/lucide-[a-z0-9-]+>/gi, '');
+
+  // PascalCase component tags AI sometimes emits: <LucideHome ...></LucideHome> / />
+  updated = updated.replace(
+    /<(Lucide[A-Z][A-Za-z0-9]*)([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g,
+    (_full, symbol, attrs) => {
+      if (symbol === 'LucideIcon' || symbol === 'LucideIconNode') return _full;
+      const attr = `lucide${symbol.slice('Lucide'.length)}`;
+      const cleanAttrs = normalizeLucideSvgAttrs(attrs);
+      return `<svg ${attr}${cleanAttrs ? ` ${cleanAttrs}` : ''}></svg>`;
+    }
+  );
+
+  // React leftover self-closing icons that kept lucide-react names as elements when
+  // the file already imports Lucide* — e.g. <Home class="x" /> is too ambiguous;
+  // only rewrite when written as lucide-prefixed or Lucide-prefixed (handled above).
+
+  return updated;
+}
+
+function normalizeLucideSvgAttrs(attrs) {
+  return String(attrs || '')
+    .replace(/\/\s*$/, '')
+    .trim()
+    .replace(/\bclassName\s*=/g, 'class=')
+    .replace(/\b\[className\]\s*=/g, '[class]=');
+}
+
+/**
+ * lucide-react exports Home/Search; @lucide/angular exports LucideHome/LucideSearch.
+ * Rename named imports and matching @Component imports entries.
+ */
+function renameLucideReactSymbolsToAngular(source) {
+  if (!/from\s*['"]@lucide\/angular['"]/.test(source)) return source;
+
+  const renamed = new Map(); // Home → LucideHome
+
+  let updated = source.replace(
+    /import\s*\{([^}]*)\}\s*from\s*['"]@lucide\/angular['"]\s*;?/g,
+    (full, names) => {
+      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
+      const mapped = parts.map((p) => {
+        const isType = /^type\s+/.test(p);
+        const bare = p.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+        const alias = p.includes(' as ') ? p.split(/\s+as\s+/)[1].trim() : null;
+        if (
+          bare.startsWith('Lucide') ||
+          bare === 'provideLucideIcons' ||
+          bare === 'provideLucideConfig' ||
+          bare === 'LucideIcon' ||
+          bare === 'LucideIconNode'
+        ) {
+          return p;
+        }
+        const angularName = `Lucide${bare}`;
+        renamed.set(bare, angularName);
+        if (alias) {
+          renamed.set(alias, angularName);
+          return `${isType ? 'type ' : ''}${angularName}`;
+        }
+        return `${isType ? 'type ' : ''}${angularName}`;
+      });
+      return `import { ${[...new Set(mapped)].join(', ')} } from '@lucide/angular';`;
+    }
+  );
+
+  if (renamed.size === 0) return updated;
+
+  // Update @Component({ imports: [Home, ...] }) → [LucideHome, ...]
+  updated = updated.replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    (full, start, mid, end) => {
+      const items = mid.split(',').map((s) => s.trim()).filter(Boolean).map((item) => {
+        return renamed.get(item) || item;
+      });
+      return `${start}${items.join(', ')}${end}`;
+    }
+  );
+
+  return updated;
+}
+
+/**
+ * Ensure every lucideXxx attribute / LucideXxx usage has a matching import + decorator import.
+ */
+function syncLucideImportsFromTemplate(source, html) {
+  const symbols = new Set();
+
+  for (const m of html.matchAll(/\s(lucide[A-Z][A-Za-z0-9]*)\b/g)) {
+    const attr = m[1];
+    symbols.add(`Lucide${attr.slice('lucide'.length)}`);
+  }
+  for (const m of html.matchAll(/<lucide-([a-z0-9-]+)/gi)) {
+    symbols.add(lucideSlugToSymbolAndAttr(m[1]).symbol);
+  }
+  // Keep already-imported Lucide* that still appear as values
+  for (const m of source.matchAll(/\b(Lucide[A-Z][A-Za-z0-9]*)\b/g)) {
+    if (['LucideIcon', 'LucideIconNode', 'LucideIconData'].includes(m[1])) continue;
+    // Only keep if referenced in template attrs we care about — skip unused later via warnings
+  }
+
+  let updated = source;
+  for (const sym of symbols) {
+    updated = ensureImport(updated, sym, '@lucide/angular');
+    updated = ensureDecoratorImport(updated, sym);
+  }
+  // Drop LucideIconModule-style leftovers again after sync
+  updated = repairLucideAngularImports(updated);
+  return updated;
+}
+
+/**
  * Fix hallucinated @lucide/angular module-style imports.
  * LucideIconModule / LucideAngularModule do not exist on @lucide/angular.
  */
 function repairLucideAngularImports(source) {
   const hallucinated = ['LucideIconModule', 'LucideAngularModule', 'LucideAngularComponent'];
   let updated = source;
-  let touched = false;
 
   for (const sym of hallucinated) {
     if (new RegExp(`\\b${sym}\\b`).test(updated)) {
       updated = removeNamedImport(updated, sym, '@lucide/angular');
       updated = removeNamedImport(updated, sym, 'lucide-angular');
-      // Drop from @Component imports array
       updated = updated.replace(
         /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
         (full, start, mid, end) => {
@@ -201,17 +393,185 @@ function repairLucideAngularImports(source) {
           return `${start}${items.join(', ')}${end}`;
         }
       );
-      touched = true;
     }
   }
 
-  if (!touched) return updated;
-
-  // Prefer LucideIcon as a safe dynamic stand-in when icons were module-based
-  if (!/\bLucideIcon\b/.test(updated) && /lucide|Lucide/.test(source)) {
-    updated = ensureImport(updated, 'LucideIcon', '@lucide/angular');
-    updated = ensureDecoratorImport(updated, 'LucideIcon');
+  // LucideIcon is a directive/component value in @lucide/angular — but AI sometimes
+  // treats it as a type-only import inside NgModules. Strip from NgModule imports.
+  if (/@NgModule\s*\(/.test(updated) && /\bLucideIcon\b/.test(updated)) {
+    updated = updated.replace(
+      /(@NgModule\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+      (full, start, mid, end) => {
+        const items = mid
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .filter((item) => item !== 'LucideIcon');
+        return `${start}${items.join(', ')}${end}`;
+      }
+    );
   }
+
+  return updated;
+}
+
+/**
+ * Collect template identifiers that must exist on the component class.
+ * Conservative: only root member accesses / calls, not loop vars or nested props.
+ */
+function collectTemplateMemberNames(html) {
+  const names = new Set();
+  const skip = new Set([
+    'true', 'false', 'null', 'undefined', 'this', 'as', 'let', 'of', 'if', 'else',
+    'then', 'track', 'when', 'case', 'default', 'void', 'typeof', 'instanceof',
+    'new', 'await', 'async', 'class', 'style', 'ngClass', 'ngStyle', 'ngIf', 'ngFor',
+    'ngModel', 'ngSwitch', 'index', 'first', 'last', 'even', 'odd', 'count',
+    '$event', '$implicit', 'item', 'event'
+  ]);
+
+  const add = (id) => {
+    if (!id || skip.has(id)) return;
+    if (/^[A-Z]/.test(id)) return;
+    if (id.startsWith('ng') || id.startsWith('lucide') || id.startsWith('app')) return;
+    names.add(id);
+  };
+
+  for (const m of html.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)/g)) add(m[1]);
+
+  for (const m of html.matchAll(/(?:\[[\w.-]+\]|\([\w.-]+\))="\s*([A-Za-z_][A-Za-z0-9_]*)\s*[.(]/g)) {
+    add(m[1]);
+  }
+
+  for (const m of html.matchAll(/\[\(ngModel\)\]="\s*([A-Za-z_][A-Za-z0-9_]*)/g)) add(m[1]);
+
+  for (const m of html.matchAll(/\*ngIf="([^"]*)"/g)) {
+    for (const id of m[1].matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+      if (!skip.has(id[1])) add(id[1]);
+    }
+  }
+
+  for (const m of html.matchAll(/\*ngFor="\s*let\s+\w+\s+of\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    add(m[1]);
+  }
+
+  for (const m of html.matchAll(/@if\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)/g)) add(m[1]);
+  for (const m of html.matchAll(/@for\s*\(\s*\w+\s+of\s+([A-Za-z_][A-Za-z0-9_]*)/g)) add(m[1]);
+
+  return names;
+}
+
+/**
+ * Stub missing template members so the app compiles after inconsistent AI sibling generation.
+ */
+function stubMissingTemplateMembers(source, html) {
+  const needed = collectTemplateMemberNames(html);
+  const snippets = [];
+
+  for (const name of needed) {
+    if (classHasMember(source, name)) continue;
+    // Heuristic stubs
+    if (/^(is|has|show|hide|can|should|creating|editing|loading|open|disabled)/i.test(name) ||
+        name.endsWith('Count') ||
+        name === 'q') {
+      snippets.push(`  ${name}: any = ${name === 'q' ? "''" : 'false'};`);
+    } else if (/s$/.test(name) || /List|Items|Users|Options|Rows/i.test(name) || name === 'filteredUsers') {
+      snippets.push(`  ${name}: any[] = [];`);
+    } else if (/^(on|handle|toggle|create|edit|save|cancel|submit|delete|remove|add|close|open|select|scroll)/i.test(name) ||
+               /For$|Date$|Of$/.test(name) ||
+               name === 'initials' ||
+               name === 'gradientFor' ||
+               name === 'shortDate') {
+      snippets.push(`  ${name}(..._args: any[]) { return _args[0] ?? null; }`);
+    } else {
+      snippets.push(`  ${name}: any = null;`);
+    }
+  }
+
+  if (!snippets.length) return source;
+  return insertIntoClassBody(source, snippets.join('\n'));
+}
+
+/**
+ * Import standalone child components referenced as <app-...> in the template.
+ */
+function syncAppChildComponentImports(source, html, tsPath, srcRoot) {
+  const selectors = [...html.matchAll(/<(app-[a-z0-9-]+)\b/gi)].map((m) => m[1].toLowerCase());
+  if (!selectors.length) return source;
+
+  const bySelector = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    if (path.resolve(file) === path.resolve(tsPath)) continue;
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+      const cls = content.match(/export\s+class\s+(\w+)/);
+      if (sel && cls) bySelector.set(sel[1].toLowerCase(), { file, className: cls[1] });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  let updated = source;
+  for (const sel of new Set(selectors)) {
+    const hit = bySelector.get(sel);
+    if (!hit) continue;
+    if (new RegExp(`\\b${hit.className}\\b`).test(updated) &&
+        new RegExp(`imports\\s*:\\s*\\[[^\\]]*\\b${hit.className}\\b`).test(updated)) {
+      continue;
+    }
+    let rel = path.relative(path.dirname(tsPath), hit.file).replace(/\\/g, '/');
+    if (!rel.startsWith('.')) rel = `./${rel}`;
+    rel = rel.replace(/\.ts$/, '');
+    updated = ensureImport(updated, hit.className, rel);
+    updated = ensureDecoratorImport(updated, hit.className);
+  }
+  return updated;
+}
+
+/**
+ * Fix FormBuilder / FormGroup definite-assignment and init-order mistakes.
+ */
+function repairFormBuilderInit(source) {
+  let updated = source;
+
+  // form: FormGroup; without initializer → form!: FormGroup;
+  updated = updated.replace(
+    /(^\s*)(form\s*:\s*FormGroup\s*;)/m,
+    '$1form!: FormGroup;'
+  );
+
+  // form: FormGroup = this.fb.group before fb is declared → use inject(FormBuilder)
+  if (/form\s*:\s*FormGroup\s*=\s*this\.fb\b/.test(updated)) {
+    updated = ensureImport(updated, 'inject', '@angular/core');
+    updated = ensureImport(updated, 'FormBuilder', '@angular/forms');
+    if (!/fb\s*=\s*inject\(\s*FormBuilder\s*\)/.test(updated)) {
+      updated = insertIntoClassBody(
+        updated,
+        '  private readonly fb = inject(FormBuilder);'
+      );
+    }
+    // Remove broken duplicate fb declarations that reference themselves
+    updated = updated.replace(
+      /^\s*private\s+readonly\s+fb\s*:\s*FormBuilder\s*=\s*this\.fbInstance\s*;\s*$/gm,
+      ''
+    );
+    updated = updated.replace(
+      /^\s*(?:private|protected|public)?\s*readonly\s+fbInstance\b.*$/gm,
+      ''
+    );
+  }
+
+  // changes.initial → changes['initial']
+  updated = updated.replace(/\bchanges\.(\w+)\b/g, "changes['$1']");
+
+  // EventEmitter typed as void wrongly: onSave(user) when Output is EventEmitter<void>
+  // Soft-fix common pattern: this.onSave(user) → this.onSave.emit(user) if onSave is Output
+  updated = updated.replace(/\bthis\.(\w+)\(([^)]*)\)\s*;/g, (full, name, args) => {
+    if (new RegExp(`@Output\\(\\)\\s*${name}\\s*=`).test(updated)) {
+      return `this.${name}.emit(${args});`;
+    }
+    return full;
+  });
 
   return updated;
 }
@@ -574,9 +934,10 @@ function repairAngularComponentFile(tsPath) {
     }
   }
 
-  // lucide-react / legacy lucide-angular → @lucide/angular (Angular 20 compatible)
+  // lucide-react / legacy lucide-angular → @lucide/angular (Angular 22 compatible)
   source = rewriteImportModule(source, 'lucide-react', '@lucide/angular');
   source = rewriteImportModule(source, 'lucide-angular', '@lucide/angular');
+  source = renameLucideReactSymbolsToAngular(source);
   source = repairLucideAngularImports(source);
   source = repairEmblaImports(source);
 
@@ -742,8 +1103,8 @@ function repairAngularComponentFile(tsPath) {
     let html = fs.readFileSync(targetHtml, 'utf-8');
     // Self-closing capitalized / unknown components
     html = html.replace(/<([A-Z][\w.-]*)([^>]*?)\/>/g, '<$1$2></$1>');
-    // lucide-style lowercase self-closing custom tags that aren't void HTML
-    html = html.replace(/<(search|lucide-[a-z0-9-]+)([^>]*?)\/>/gi, '<$1$2></$1>');
+    // Legacy lucide-angular element tags → @lucide/angular <svg lucideXxx>
+    html = rewriteLegacyLucideHtmlTags(html);
     // React leftover event / form patterns
     html = repairAngularTemplateHtml(html, source);
     // Getters are not callable
@@ -780,6 +1141,20 @@ function repairAngularComponentFile(tsPath) {
     }
     // Expose cn / className / HostListener / isOpen bridges
     source = ensureTemplateMembers(source, html);
+    // Sync Lucide icon imports from rewritten template
+    source = syncLucideImportsFromTemplate(source, html);
+    // Import <app-*> children used in template
+    const srcRoot = (() => {
+      let dir = path.dirname(tsPath);
+      while (dir && path.basename(dir) !== 'src' && dir !== path.dirname(dir)) {
+        dir = path.dirname(dir);
+      }
+      return dir && path.basename(dir) === 'src' ? dir : path.join(path.dirname(tsPath), '..', '..');
+    })();
+    source = syncAppChildComponentImports(source, html, tsPath, srcRoot);
+    // Stub missing template members (AI sibling mismatch)
+    source = stubMissingTemplateMembers(source, html);
+    source = repairFormBuilderInit(source);
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
 
@@ -910,6 +1285,14 @@ function repairAngularRoutes(destPath) {
 
   let source = fs.readFileSync(routesPath, 'utf-8');
   const srcRoot = path.join(destPath, 'src');
+
+  // Ensure routes is exported (app.config imports { routes })
+  if (/^(?:export\s+)?const\s+routes\s*:/m.test(source) && !/export\s+const\s+routes\s*:/.test(source)) {
+    source = source.replace(/^(const\s+routes\s*:)/m, 'export $1');
+  }
+  if (/export\s+default\s+routes/.test(source) && !/export\s+const\s+routes/.test(source)) {
+    source = source.replace(/^(const\s+routes\s*:)/m, 'export $1');
+  }
 
   // Index components by export class name
   const byClass = new Map();
@@ -1052,7 +1435,7 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     '@angular/platform-browser-dynamic', '@angular/router', '@angular/forms',
     '@angular/animations', '@angular/cli', '@angular/compiler-cli', '@angular/build',
     'zone.js', 'rxjs', 'tslib',
-    // Legacy lucide-angular only peers Angular ≤19 — never carry it into Angular 20 workspaces
+    // Legacy lucide-angular only peers Angular ≤19 — never carry it into Angular 22 workspaces
     'lucide-angular',
     'lucide-react',
     '@lucide/angular'
@@ -1087,11 +1470,11 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
   if (targetFramework === 'angular') {
     // Ensure animations package present (templates often need it)
     if (!pkg.dependencies['@angular/animations']) {
-      const coreVer = pkg.dependencies['@angular/core'] || '^20.3.0';
+      const coreVer = pkg.dependencies['@angular/core'] || '^22.0.8';
       pkg.dependencies['@angular/animations'] = coreVer;
     }
 
-    // Remove legacy lucide-angular (peers only up to Angular 19 → ERESOLVE on Angular 20)
+    // Remove legacy lucide-angular (peers only up to Angular 19 → ERESOLVE on Angular 22)
     delete pkg.dependencies['lucide-angular'];
     delete pkg.devDependencies['lucide-angular'];
 
@@ -1104,7 +1487,7 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
       );
 
     if (usesLucide) {
-      // @lucide/angular peers Angular 17.x–21.x (compatible with Angular 20 workspaces)
+      // @lucide/angular peers Angular 17+ (compatible with Angular 22 workspaces)
       // Legacy lucide-angular@0.x only peers up to Angular 19 and causes ERESOLVE.
       pkg.dependencies['@lucide/angular'] = '^1.23.0';
     }
@@ -1112,7 +1495,7 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
 
   if (targetFramework === 'react') {
     if (srcDeps['react-router-dom'] || walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx') || n.endsWith('.jsx')).some((f) => /react-router-dom/.test(fs.readFileSync(f, 'utf-8')))) {
-      pkg.dependencies['react-router-dom'] = srcDeps['react-router-dom'] || '^6.28.0';
+      pkg.dependencies['react-router-dom'] = srcDeps['react-router-dom'] || '^7.18.1';
     }
     delete pkg.dependencies['lucide-angular'];
     delete pkg.dependencies['@lucide/angular'];
@@ -1194,6 +1577,7 @@ function rewriteAtAliasImportsInTree(destPath) {
 
     content = content.replace(/from\s*['"]lucide-react['"]/g, "from '@lucide/angular'");
     content = content.replace(/from\s*['"]lucide-angular['"]/g, "from '@lucide/angular'");
+    content = renameLucideReactSymbolsToAngular(content);
     content = content.replace(
       /import\s*\{[^}]+\}\s*from\s*['"]@radix-ng\/[^'"]+['"]\s*;?/g,
       (m) => `// Removed unsupported package import: ${m.replace(/\n/g, ' ')}`
@@ -1340,12 +1724,99 @@ export function repairAngularWorkspace(destPath, options = {}) {
 
   repairAngularAppBootstrap(destPath);
   repairAngularRoutes(destPath);
+  removeHallucinatedNgModules(destPath);
+  fixBrokenRelativeComponentImports(destPath);
   rewriteAtAliasImportsInTree(destPath);
+
+  // Second pass: child imports + lucide sync after path fixes
+  for (const file of walkFiles(path.join(destPath, 'src'), (name) => name.endsWith('.component.ts'))) {
+    try {
+      repairAngularComponentFile(file);
+    } catch (err) {
+      console.warn(`[postprocess] Second-pass repair failed for ${file}: ${err.message}`);
+    }
+  }
 
   // Ensure styles.css exists
   const stylesPath = path.join(destPath, 'src', 'styles.css');
   if (!fs.existsSync(stylesPath)) {
     fs.writeFileSync(stylesPath, '/* Global styles */\n', 'utf-8');
+  }
+}
+
+/**
+ * Standalone Angular 22 apps must not ship a broken AppModule with fake Lucide imports.
+ */
+function removeHallucinatedNgModules(destPath) {
+  const appModulePath = path.join(destPath, 'src', 'app', 'app.module.ts');
+  if (fs.existsSync(appModulePath)) {
+    fs.unlinkSync(appModulePath);
+    console.warn('[postprocess] Removed hallucinated app.module.ts (standalone bootstrap is used).');
+  }
+  // Also drop any NgModule files that only wrap LucideIcon
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.module.ts'))) {
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      if (/@NgModule/.test(content) && /LucideIcon/.test(content) && !/bootstrap\s*:/.test(content)) {
+        fs.unlinkSync(file);
+        console.warn(`[postprocess] Removed hallucinated module: ${path.relative(destPath, file)}`);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Rewrite relative imports that point at missing paths by resolving the symbol to a real component file.
+ */
+function fixBrokenRelativeComponentImports(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const byClass = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.ts'))) {
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const m of content.matchAll(/export\s+class\s+(\w+)/g)) {
+        byClass.set(m[1], file);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts'))) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+
+    content = content.replace(
+      /import\s*\{([^}]+)\}\s*from\s*['"](\.[^'"]+)['"]\s*;?/g,
+      (full, names, fromPath) => {
+        const resolved = path.resolve(path.dirname(file), fromPath);
+        const candidates = [`${resolved}.ts`, `${resolved}.tsx`, path.join(resolved, 'index.ts'), resolved];
+        if (candidates.some((c) => fs.existsSync(c))) return full;
+
+        const symbols = names.split(',').map((s) => s.trim()).filter(Boolean);
+        const lines = [];
+        for (const sym of symbols) {
+          const bare = sym.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+          const target = byClass.get(bare);
+          if (!target) {
+            lines.push(`import { ${sym} } from '${fromPath}';`);
+            continue;
+          }
+          let rel = path.relative(path.dirname(file), target).replace(/\\/g, '/');
+          if (!rel.startsWith('.')) rel = `./${rel}`;
+          rel = rel.replace(/\.ts$/, '');
+          lines.push(`import { ${bare} } from '${rel}';`);
+        }
+        return lines.join('\n');
+      }
+    );
+
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      console.warn(`[postprocess] Rewrote broken relative imports in ${path.relative(destPath, file)}`);
+    }
   }
 }
 

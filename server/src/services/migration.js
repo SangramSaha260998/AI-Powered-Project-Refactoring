@@ -1694,6 +1694,9 @@ IMPORTANT RULES FOR FILE GENERATION:
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
 - Map lucide-react icons to @lucide/angular (Angular target; NOT legacy lucide-angular) or lucide-react (React target).
+- For Angular: NEVER plan LucideIconModule / LucideAngularModule — those exports do not exist on @lucide/angular. Plan per-icon Lucide* imports or LucideIcon + provideLucideIcons.
+- For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
+- For Angular: routes import page components from their own files — never from app.component.ts.
 `;
 
   const blueprintSystemInstruction = isSameFramework ? sameFrameworkInstruction : crossFrameworkInstruction;
@@ -1878,6 +1881,7 @@ Respond ONLY with raw code for the single requested file. Do not output markdown
 Do NOT concatenate multiple files. Do NOT add comments like "// src/app/app.component.html" or dump sibling file contents.
 
 CRITICAL RULES:
+0. USER PROMPT FIRST: obey the user's migration mandate exactly (titles, colors, themes, branding, scope). Do NOT hallucinate packages, exports, APIs, files, or features that are not real / not requested / not required by the source conversion.
 1. You are ONLY generating source code files (components, styles, utilities). Configuration files like package.json, tsconfig.json, vite.config.ts, angular.json are ALREADY provided and should NOT be generated.
 2. For React: The main App component MUST be at src/App.tsx (NOT src/app/app.tsx). Import it as 'import App from "./App"' (NOT './app/app').
 3. For React: Use consistent file extensions - ALL files should be .tsx for TypeScript React projects.
@@ -1900,6 +1904,15 @@ CRITICAL RULES:
 20. Self-closing custom elements are invalid in Angular templates: write proper open/close tags — never <Search /> for a component selector.
 21. For React: do not leave Angular decorators, templateUrl, or @Component in output files.
 22. Services use providedIn: 'root' (never 'server').
+23. ANTI-HALLUCINATION: Never invent exports. For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule. REQUIRED: import LucideHome / LucideSearch / etc. into the standalone imports array, or use LucideIcon + provideLucideIcons(...).
+24. Angular templates must not contain React leftovers: no bare cn(...) unless the class has \`protected readonly cn = cn\`, no empty (click)="", no \`return\` / multi-statement JS in bindings — call one class method.
+25. Every template binding target (property/method) MUST be declared on the class as public or protected. Promote private members used by templates.
+26. Do not declare a field and a getter with the same name (e.g. canScrollPrev).
+27. Import HostListener from '@angular/core' when using @HostListener. Never import node:process in browser components.
+28. embla-carousel: \`import EmblaCarousel, { EmblaOptionsType, EmblaCarouselType } from 'embla-carousel'\` — never named Embla / EmblaOptions / EmblaApi.
+29. app.routes.ts must import AdminShellComponent (and other pages) from their real files, never from './app.component'.
+30. Form error checks: use errors?.['required'] / errors?.['minlength'] bracket access.
+31. HTML must be balanced and complete — no truncated templates (Unexpected EOF).
 `;
 
   const generatedFiles = {};

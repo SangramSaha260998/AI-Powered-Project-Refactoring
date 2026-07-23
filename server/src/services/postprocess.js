@@ -161,6 +161,181 @@ function ensureStandaloneTrue(source) {
   return source.replace(/(@Component\s*\(\s*\{)/, `$1\n  standalone: true,`);
 }
 
+/**
+ * Insert members just inside the first exported class body.
+ */
+function insertIntoClassBody(source, snippet) {
+  if (!snippet || !snippet.trim()) return source;
+  return source.replace(/(export\s+class\s+\w+[^{]*\{)/, `$1\n${snippet}\n`);
+}
+
+function classHasMember(source, name) {
+  const re = new RegExp(
+    `\\b(?:(?:public|protected|private|readonly)\\s+)*${name}\\s*[=:(]|\\bget\\s+${name}\\s*\\(|\\b${name}\\s*\\(`
+  );
+  return re.test(source);
+}
+
+/**
+ * Fix hallucinated @lucide/angular module-style imports.
+ * LucideIconModule / LucideAngularModule do not exist on @lucide/angular.
+ */
+function repairLucideAngularImports(source) {
+  const hallucinated = ['LucideIconModule', 'LucideAngularModule', 'LucideAngularComponent'];
+  let updated = source;
+  let touched = false;
+
+  for (const sym of hallucinated) {
+    if (new RegExp(`\\b${sym}\\b`).test(updated)) {
+      updated = removeNamedImport(updated, sym, '@lucide/angular');
+      updated = removeNamedImport(updated, sym, 'lucide-angular');
+      // Drop from @Component imports array
+      updated = updated.replace(
+        /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+        (full, start, mid, end) => {
+          const items = mid
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .filter((item) => item !== sym && !item.startsWith(`${sym} `));
+          return `${start}${items.join(', ')}${end}`;
+        }
+      );
+      touched = true;
+    }
+  }
+
+  if (!touched) return updated;
+
+  // Prefer LucideIcon as a safe dynamic stand-in when icons were module-based
+  if (!/\bLucideIcon\b/.test(updated) && /lucide|Lucide/.test(source)) {
+    updated = ensureImport(updated, 'LucideIcon', '@lucide/angular');
+    updated = ensureDecoratorImport(updated, 'LucideIcon');
+  }
+
+  return updated;
+}
+
+/**
+ * Normalize common embla-carousel import hallucinations.
+ */
+function repairEmblaImports(source) {
+  if (!/from\s*['"]embla-carousel['"]/.test(source)) return source;
+
+  let updated = source;
+  updated = updated.replace(
+    /import\s*\{([^}]*)\}\s*from\s*['"]embla-carousel['"]\s*;?/,
+    (full, names) => {
+      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
+      const needsDefault = parts.some(
+        (p) => p.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim() === 'Embla'
+      );
+      const typeImports = [];
+      for (const p of parts) {
+        const bare = p.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+        if (bare === 'Embla') continue;
+        if (bare === 'EmblaOptions') typeImports.push('EmblaOptionsType');
+        else if (bare === 'EmblaApi' || bare === 'EmblaCarouselApi') typeImports.push('EmblaCarouselType');
+        else typeImports.push(bare);
+      }
+      const unique = [...new Set(typeImports)];
+      if (needsDefault && unique.length) {
+        return `import EmblaCarousel, { ${unique.join(', ')} } from 'embla-carousel';`;
+      }
+      if (needsDefault) return `import EmblaCarousel from 'embla-carousel';`;
+      if (unique.length) return `import { ${unique.join(', ')} } from 'embla-carousel';`;
+      return `import EmblaCarousel from 'embla-carousel';`;
+    }
+  );
+
+  // Only rewrite type/value usages when we introduced EmblaCarousel default import
+  if (/\bimport\s+EmblaCarousel\b/.test(updated)) {
+    updated = updated.replace(
+      /(?<![\w.])Embla(?!Carousel|Options|Api)(?=\s*[\(<])/g,
+      'EmblaCarousel'
+    );
+  }
+  updated = updated.replace(/\bEmblaOptions\b/g, 'EmblaOptionsType');
+  updated = updated.replace(/\bEmblaApi\b/g, 'EmblaCarouselType');
+
+  return updated;
+}
+
+/**
+ * Repair Angular HTML leftovers that commonly break ng serve after React conversions.
+ */
+function repairAngularTemplateHtml(html, source) {
+  let updated = html;
+
+  // Empty event bindings are invalid
+  updated = updated.replace(/\s*\((click|input|change|submit|blur|focus|keydown|keyup)\)\s*=\s*(["'])\s*\2/g, '');
+
+  // Strip illegal `return ...` from event bindings; keep preceding statements
+  updated = updated.replace(
+    /\((click|input|change|submit)\)="([^"]*)"/g,
+    (full, evt, expr) => {
+      let fixed = expr
+        .replace(/;?\s*return\s+[^;]*;?\s*$/g, '')
+        .replace(/;?\s*return\s+[^;]*;?/g, '')
+        .trim()
+        .replace(/;\s*$/, '');
+      if (!fixed) return '';
+      // If still multi-statement with return leftovers cleaned, leave as statement list
+      return `(${evt})="${fixed}"`;
+    }
+  );
+
+  // Form validator index-signature access
+  updated = updated.replace(
+    /\.errors\?\.(required|minlength|maxlength|pattern|email|min|max)\b/g,
+    ".errors?.['$1']"
+  );
+  updated = updated.replace(
+    /\.errors\.(required|minlength|maxlength|pattern|email|min|max)\b/g,
+    ".errors['$1']"
+  );
+
+  return updated;
+}
+
+/**
+ * Ensure template-referenced helpers/inputs exist on the component class.
+ */
+function ensureTemplateMembers(source, html) {
+  let updated = source;
+  const snippets = [];
+
+  if (/\bcn\s*\(/.test(html) && !classHasMember(updated, 'cn')) {
+    updated = ensureImport(updated, 'cn', '@/lib/utils');
+    snippets.push('  protected readonly cn = cn;');
+  }
+
+  if (/\bclassName\b/.test(html) && !classHasMember(updated, 'className')) {
+    updated = ensureImport(updated, 'Input', '@angular/core');
+    snippets.push("  @Input() className = '';");
+  }
+
+  // Common React→Angular open-state mismatch: template uses isOpen, class has open
+  if (/\bisOpen\b/.test(html) && !classHasMember(updated, 'isOpen') && classHasMember(updated, 'open')) {
+    snippets.push('  get isOpen() { return this.open; }');
+  }
+
+  if (/@HostListener\b/.test(updated)) {
+    updated = ensureImport(updated, 'HostListener', '@angular/core');
+  }
+
+  // Drop node:process / process imports from browser components
+  updated = updated.replace(/import\s+process\s+from\s*['"]node:process['"]\s*;?\s*\n?/g, '');
+  updated = updated.replace(/import\s+\*\s+as\s+process\s+from\s*['"](?:node:)?process['"]\s*;?\s*\n?/g, '');
+  updated = updated.replace(/import\s+process\s+from\s*['"]process['"]\s*;?\s*\n?/g, '');
+
+  if (snippets.length) {
+    updated = insertIntoClassBody(updated, snippets.join('\n'));
+  }
+
+  return updated;
+}
+
 function stripCssLeakedIntoTs(source) {
   // Remove broken/unterminated styles/template blocks first
   let cleaned = source
@@ -402,6 +577,8 @@ function repairAngularComponentFile(tsPath) {
   // lucide-react / legacy lucide-angular → @lucide/angular (Angular 20 compatible)
   source = rewriteImportModule(source, 'lucide-react', '@lucide/angular');
   source = rewriteImportModule(source, 'lucide-angular', '@lucide/angular');
+  source = repairLucideAngularImports(source);
+  source = repairEmblaImports(source);
 
   // import type { X } used as value — promote common Angular DI tokens
   const typeOnlyValueSymbols = ['DestroyRef', 'Injector', 'ElementRef', 'Renderer2', 'ChangeDetectorRef', 'NgZone', 'ViewContainerRef', 'TemplateRef'];
@@ -567,17 +744,24 @@ function repairAngularComponentFile(tsPath) {
     html = html.replace(/<([A-Z][\w.-]*)([^>]*?)\/>/g, '<$1$2></$1>');
     // lucide-style lowercase self-closing custom tags that aren't void HTML
     html = html.replace(/<(search|lucide-[a-z0-9-]+)([^>]*?)\/>/gi, '<$1$2></$1>');
+    // React leftover event / form patterns
+    html = repairAngularTemplateHtml(html, source);
     // Getters are not callable
     const getterNames = [...source.matchAll(/\bget\s+([A-Za-z_]\w*)\s*\(/g)].map((m) => m[1]);
     for (const name of getterNames) {
       html = html.replace(new RegExp(`\\b${name}\\(\\)`, 'g'), name);
     }
-    // Private fields → protected when used in templates
-    const privateInTemplate = [...source.matchAll(/\bprivate\s+(_?[A-Za-z]\w*)\s*[:=]/g)]
-      .map((m) => m[1])
-      .filter((name) => new RegExp(`\\b${name}\\b`).test(html));
-    for (const name of privateInTemplate) {
-      source = source.replace(new RegExp(`\\bprivate\\s+${name}\\b`, 'g'), `protected ${name}`);
+    // Private fields AND methods → protected when used in templates
+    const privateMembers = [
+      ...source.matchAll(/\bprivate\s+(?:readonly\s+)?(_?[A-Za-z]\w*)\s*[:=(]/g)
+    ].map((m) => m[1]);
+    for (const name of [...new Set(privateMembers)]) {
+      if (new RegExp(`\\b${name}\\b`).test(html)) {
+        source = source.replace(
+          new RegExp(`\\bprivate\\s+(readonly\\s+)?${name}\\b`, 'g'),
+          (_, readonlyPrefix) => `protected ${readonlyPrefix || ''}${name}`
+        );
+      }
     }
     // Native attribute bindings
     html = html.replace(/\[minlength\]=/g, '[attr.minlength]=');
@@ -594,6 +778,8 @@ function repairAngularComponentFile(tsPath) {
         '$1\n  readonly Array = Array;\n'
       );
     }
+    // Expose cn / className / HostListener / isOpen bridges
+    source = ensureTemplateMembers(source, html);
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
 
@@ -723,6 +909,50 @@ function repairAngularRoutes(destPath) {
   if (!fs.existsSync(routesPath)) return;
 
   let source = fs.readFileSync(routesPath, 'utf-8');
+  const srcRoot = path.join(destPath, 'src');
+
+  // Index components by export class name
+  const byClass = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      const m = content.match(/export\s+class\s+(\w+)/);
+      if (m) byClass.set(m[1], file);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Rewrite imports that pull page/shell components from app.component (common AI mistake)
+  source = source.replace(
+    /import\s*\{([^}]+)\}\s*from\s*['"](\.\/app\.component)['"]\s*;?/g,
+    (full, names) => {
+      const symbols = names.split(',').map((s) => s.trim()).filter(Boolean);
+      const lines = [];
+      const leftover = [];
+      for (const sym of symbols) {
+        const bare = sym.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+        if (bare === 'AppComponent') {
+          leftover.push(sym);
+          continue;
+        }
+        const file = byClass.get(bare);
+        if (!file) {
+          leftover.push(sym);
+          continue;
+        }
+        let rel = path.relative(path.dirname(routesPath), file).replace(/\\/g, '/');
+        if (!rel.startsWith('.')) rel = `./${rel}`;
+        rel = rel.replace(/\.ts$/, '');
+        lines.push(`import { ${bare} } from '${rel}';`);
+      }
+      if (leftover.length) {
+        lines.push(`import { ${leftover.join(', ')} } from './app.component';`);
+      }
+      return lines.join('\n');
+    }
+  );
+
   const importRe = /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g;
   const missing = [];
   let match;
@@ -978,6 +1208,7 @@ function rewriteAtAliasImportsInTree(destPath) {
         const candidates = [
           base,
           base.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase(),
+          base.replace(/\.component$/i, ''),
           `admin-${base.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()}`,
           `${base}Component`,
           toPascalCase(base)
@@ -987,7 +1218,40 @@ function rewriteAtAliasImportsInTree(destPath) {
           resolved = componentIndex.get(String(c).toLowerCase());
           if (resolved) break;
         }
-        if (!resolved) return full;
+        if (!resolved) {
+          // Stub a missing component so the import can resolve after rewrite
+          const stem = base
+            .replace(/\.component$/i, '')
+            .replace(/([a-z])([A-Z])/g, '$1-$2')
+            .toLowerCase();
+          const className = toPascalCase(stem).endsWith('Component')
+            ? toPascalCase(stem)
+            : `${toPascalCase(stem)}Component`;
+          const stubDir = path.join(srcRoot, 'app', 'components', stem);
+          const stubTs = path.join(stubDir, `${stem}.component.ts`);
+          if (!fs.existsSync(stubTs)) {
+            ensureDirectoryExists(stubDir);
+            fs.writeFileSync(
+              stubTs,
+              `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${stem}',\n  standalone: true,\n  templateUrl: './${stem}.component.html',\n  styleUrl: './${stem}.component.css'\n})\nexport class ${className} {}\n`,
+              'utf-8'
+            );
+            fs.writeFileSync(
+              path.join(stubDir, `${stem}.component.html`),
+              `<p>${className} placeholder</p>\n`,
+              'utf-8'
+            );
+            fs.writeFileSync(
+              path.join(stubDir, `${stem}.component.css`),
+              `/* ${stem} */\n`,
+              'utf-8'
+            );
+            console.warn(`[postprocess] Stubbed missing @/components import: ${rest} → ${stem}.component`);
+          }
+          resolved = stubTs;
+          componentIndex.set(stem.toLowerCase(), stubTs);
+          componentIndex.set(className.toLowerCase(), stubTs);
+        }
         let rel = path.relative(path.dirname(file), resolved).replace(/\\/g, '/');
         if (!rel.startsWith('.')) rel = `./${rel}`;
         rel = rel.replace(/\.ts$/, '');
@@ -1019,6 +1283,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
 
   addAngularPathAliases(destPath);
   copySourceLibs(destPath, sourceFilesMap);
+  ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
 
   const componentFiles = walkFiles(path.join(destPath, 'src'), (name) =>
@@ -1049,6 +1314,30 @@ export function repairAngularWorkspace(destPath, options = {}) {
     }
   }
 
+  // Strip Node-only imports from any remaining src files (browser build)
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts'))) {
+    try {
+      let content = fs.readFileSync(file, 'utf-8');
+      const original = content;
+      content = content.replace(/import\s+process\s+from\s*['"]node:process['"]\s*;?\s*\n?/g, '');
+      content = content.replace(/import\s+process\s+from\s*['"]process['"]\s*;?\s*\n?/g, '');
+      content = content.replace(/import\s+\*\s+as\s+process\s+from\s*['"](?:node:)?process['"]\s*;?\s*\n?/g, '');
+      // config.server.ts style files don't belong in Angular browser apps
+      if (/config\.server\.ts$/.test(file.replace(/\\/g, '/')) || /from\s*['"]node:/.test(content)) {
+        if (/config\.server\.ts$/.test(file.replace(/\\/g, '/'))) {
+          fs.unlinkSync(file);
+          console.warn(`[postprocess] Removed Node-only file: ${path.relative(destPath, file)}`);
+          continue;
+        }
+      }
+      if (content !== original) {
+        fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      }
+    } catch (err) {
+      console.warn(`[postprocess] Failed scrubbing ${file}: ${err.message}`);
+    }
+  }
+
   repairAngularAppBootstrap(destPath);
   repairAngularRoutes(destPath);
   rewriteAtAliasImportsInTree(destPath);
@@ -1058,6 +1347,23 @@ export function repairAngularWorkspace(destPath, options = {}) {
   if (!fs.existsSync(stylesPath)) {
     fs.writeFileSync(stylesPath, '/* Global styles */\n', 'utf-8');
   }
+}
+
+function ensureCnUtil(destPath) {
+  const utilsPath = path.join(destPath, 'src', 'lib', 'utils.ts');
+  if (fs.existsSync(utilsPath)) return;
+  ensureDirectoryExists(path.dirname(utilsPath));
+  fs.writeFileSync(
+    utilsPath,
+    `import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+`,
+    'utf-8'
+  );
 }
 
 // ---------------------------------------------------------------------------

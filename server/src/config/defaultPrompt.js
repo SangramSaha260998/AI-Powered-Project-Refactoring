@@ -279,14 +279,25 @@ export const REACT_TO_ANGULAR_PROMPT = `
   @Output, or method). Generate matching .ts + .html + .scss triads (Tailwind in HTML).
 - Do not put bare \`className\` / \`cn(...)\` in templates unless the class defines them.
   Prefer a \`mergedClass\` getter in .ts; or expose \`protected readonly cn = cn\`.
+  NEVER put \`cn\` (or any plain function) in the \`@Component({ imports: [...] })\` array.
 - NEVER leave \`(click)=""\`. NEVER use \`return\` / multi-statement JS in bindings —
   call one class method.
+- NEVER use arrow functions (\`=>\`) or TypeScript casts (\`as Foo\`) in templates.
+  Move filtering/mapping into class methods. For DOM values use \`$any($event.target).value\`.
+- NEVER invent Angular APIs: no \`RenderFragment\`, no \`IconDefinition\`, no \`Input<T>\` as a
+  property type (use \`@Input() name\` or \`input()\`), no \`Location.pathname\` (use
+  \`Location.path()\` or \`Router.url\`).
+- NEVER \`@import "tw-animate-css"\` (or other Tailwind v4-only CSS) into \`.scss\` —
+  Angular Sass cannot parse \`@theme\` / \`@utility\` / \`@property\`. Use Tailwind utilities only.
+- Lucide: only \`<svg lucideHome></svg>\` (or \`[lucideIcon]\` when truly dynamic). Never
+  \`[lucide]\`, never stick \`lucideXxx\` inside a \`[class]\` string.
+- Child tags MUST match the child's \`selector\` (prefer \`app-*\`) and be listed in \`imports\`.
 - No \`private\` members in templates. No field + getter with the same name.
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.
 - Well-formed HTML; no self-closing custom elements (\`<app-x></app-x>\`).
-
+- Merge duplicate \`@lucide/angular\` import lines into one.
 ### Imports & routing
 - \`@/\` → \`src/\`. Prefer relative imports under src/app/.
 - Routes import each page from ITS OWN file — NEVER from './app.component'.

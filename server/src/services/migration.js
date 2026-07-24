@@ -2047,8 +2047,8 @@ CRITICAL RULES:
 20. Self-closing custom elements are invalid in Angular templates: write proper open/close tags — never <Search /> for a component selector.
 21. For React: do not leave Angular decorators, templateUrl, or @Component in output files.
 22. Services use providedIn: 'root' (never 'server').
-23. ALL LUCIDE ICONS → SVG: For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule, <lucide-home>, <lucide-logout>, React <Home />. REQUIRED: import LucideHome / LucideLogOut into standalone imports and render ONLY <svg lucideHome></svg> / <svg lucideLogOut></svg>.
-24. Angular templates must not contain React leftovers: no bare cn(...) unless the class has \`protected readonly cn = cn\`, no empty (click)="", no \`return\` / multi-statement JS in bindings — call one class method.
+23. ALL LUCIDE ICONS → SVG: For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule, <lucide-home>, <lucide-logout>, React <Home />, [lucide]="...", lucideXxx inside [class] strings. REQUIRED: import LucideHome / LucideLogOut into standalone imports and render ONLY <svg lucideHome></svg> / <svg lucideLogOut></svg>. Merge duplicate @lucide/angular imports. NEVER put cn() in imports[].
+24. Angular templates: no React leftovers, no arrow functions (=>), no TypeScript casts (as Foo) — use class methods and $any($event.target).value. No bare cn(...) unless the class has \`protected readonly cn = cn\`. No empty (click)="", no \`return\` / multi-statement JS in bindings — call one class method. No RenderFragment / IconDefinition / Input<T> property types. No Location.pathname (use Location.path()). No @import "tw-animate-css" in .scss. Child tags must match selector (app-*) and be in imports[].
 25. Every template binding target (property/method) MUST be declared on the class as public or protected. Promote private members used by templates.
 26. Do not declare a field and a getter with the same name (e.g. canScrollPrev).
 27. Import HostListener from '@angular/core' when using @HostListener. Never import node:process in browser components.

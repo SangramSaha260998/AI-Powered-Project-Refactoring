@@ -109,16 +109,46 @@ function removeNamedImport(source, symbol, fromModule) {
   });
 }
 
-/** Collapse duplicate identical import lines. */
+/** Collapse duplicate import lines and merge named imports from the same module. */
 function dedupeImports(source) {
-  const seen = new Set();
-  return source
-    .split('\n')
-    .filter((line) => {
+  const lines = source.split('\n');
+  const namedByModule = new Map(); // module → { indices: number[], symbols: string[] }
+  const keep = lines.map(() => true);
+
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^import\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]\s*;?\s*$/);
+    if (!m) continue;
+    const mod = m[2];
+    const symbols = m[1]
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!namedByModule.has(mod)) namedByModule.set(mod, { indices: [], symbols: [] });
+    const entry = namedByModule.get(mod);
+    entry.indices.push(i);
+    for (const sym of symbols) {
+      const bare = sym.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+      if (!entry.symbols.some((s) => s.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim() === bare)) {
+        entry.symbols.push(sym);
+      }
+    }
+  }
+
+  for (const [mod, entry] of namedByModule) {
+    if (entry.indices.length === 0) continue;
+    const [first, ...rest] = entry.indices;
+    lines[first] = `import { ${entry.symbols.join(', ')} } from '${mod}';`;
+    for (const idx of rest) keep[idx] = false;
+  }
+
+  const seenExact = new Set();
+  return lines
+    .filter((line, i) => {
+      if (!keep[i]) return false;
       const trimmed = line.trim();
       if (!trimmed.startsWith('import ')) return true;
-      if (seen.has(trimmed)) return false;
-      seen.add(trimmed);
+      if (seenExact.has(trimmed)) return false;
+      seenExact.add(trimmed);
       return true;
     })
     .join('\n');
@@ -469,19 +499,22 @@ function stubMissingTemplateMembers(source, html) {
 
   for (const name of needed) {
     if (classHasMember(source, name)) continue;
-    // Heuristic stubs
+    // Heuristic stubs — methods/helpers BEFORE plural-array heuristic (initials ends with s)
     if (/^(is|has|show|hide|can|should|creating|editing|loading|open|disabled)/i.test(name) ||
         name.endsWith('Count') ||
         name === 'q') {
       snippets.push(`  ${name}: any = ${name === 'q' ? "''" : 'false'};`);
-    } else if (/s$/.test(name) || /List|Items|Users|Options|Rows/i.test(name) || name === 'filteredUsers') {
-      snippets.push(`  ${name}: any[] = [];`);
-    } else if (/^(on|handle|toggle|create|edit|save|cancel|submit|delete|remove|add|close|open|select|scroll)/i.test(name) ||
+    } else if (/^(on|handle|toggle|create|edit|save|cancel|submit|delete|remove|add|close|open|select|scroll|set|count)/i.test(name) ||
                /For$|Date$|Of$/.test(name) ||
                name === 'initials' ||
                name === 'gradientFor' ||
-               name === 'shortDate') {
+               name === 'shortDate' ||
+               name === 'countWhere' ||
+               name === 'isActive') {
       snippets.push(`  ${name}(..._args: any[]) { return _args[0] ?? null; }`);
+    } else if (/List|Items|Users|Options|Rows/i.test(name) || name === 'filteredUsers' ||
+               (/s$/.test(name) && !/ss$|us$|is$|status$/i.test(name))) {
+      snippets.push(`  ${name}: any[] = [];`);
     } else {
       snippets.push(`  ${name}: any = null;`);
     }
@@ -492,31 +525,62 @@ function stubMissingTemplateMembers(source, html) {
 }
 
 /**
- * Import standalone child components referenced as <app-...> in the template.
+ * Import standalone child components referenced as custom elements in the template.
+ * Also rewrites mismatched tags (admin-shell → app-admin-shell) to the real selector.
+ * @returns {{ source: string, html: string }}
  */
 function syncAppChildComponentImports(source, html, tsPath, srcRoot) {
-  const selectors = [...html.matchAll(/<(app-[a-z0-9-]+)\b/gi)].map((m) => m[1].toLowerCase());
-  if (!selectors.length) return source;
+  const VOID_OR_BUILTIN = new Set([
+    'ng-container', 'ng-content', 'ng-template', 'router-outlet', 'router-link'
+  ]);
+  const tags = [...html.matchAll(/<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b/gi)]
+    .map((m) => m[1].toLowerCase())
+    .filter((t) => !VOID_OR_BUILTIN.has(t) && !t.startsWith('svg:'));
+
+  if (!tags.length) return { source, html };
 
   const bySelector = new Map();
-  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'))) {
     if (path.resolve(file) === path.resolve(tsPath)) continue;
     try {
       const content = fs.readFileSync(file, 'utf-8');
+      if (!/@Component\s*\(/.test(content)) continue;
       const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
       const cls = content.match(/export\s+class\s+(\w+)/);
-      if (sel && cls) bySelector.set(sel[1].toLowerCase(), { file, className: cls[1] });
+      if (sel && cls) bySelector.set(sel[1].toLowerCase(), { file, className: cls[1], selector: sel[1] });
     } catch {
       /* ignore */
     }
   }
 
   let updated = source;
-  for (const sel of new Set(selectors)) {
-    const hit = bySelector.get(sel);
+  let updatedHtml = html;
+
+  const resolveHit = (tag) => {
+    if (bySelector.has(tag)) return bySelector.get(tag);
+    if (bySelector.has(`app-${tag}`)) return bySelector.get(`app-${tag}`);
+    for (const [sel, hit] of bySelector) {
+      if (sel.endsWith(`-${tag}`) || sel === tag || sel.endsWith(tag)) return hit;
+    }
+    return null;
+  };
+
+  for (const tag of new Set(tags)) {
+    const hit = resolveHit(tag);
     if (!hit) continue;
-    if (new RegExp(`\\b${hit.className}\\b`).test(updated) &&
-        new RegExp(`imports\\s*:\\s*\\[[^\\]]*\\b${hit.className}\\b`).test(updated)) {
+
+    // Align template tag with the component's declared selector
+    if (hit.selector.toLowerCase() !== tag) {
+      const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      updatedHtml = updatedHtml
+        .replace(new RegExp(`<${esc}\\b`, 'gi'), `<${hit.selector}`)
+        .replace(new RegExp(`</${esc}>`, 'gi'), `</${hit.selector}>`);
+    }
+
+    if (
+      new RegExp(`\\b${hit.className}\\b`).test(updated) &&
+      new RegExp(`imports\\s*:\\s*\\[[^\\]]*\\b${hit.className}\\b`).test(updated)
+    ) {
       continue;
     }
     let rel = path.relative(path.dirname(tsPath), hit.file).replace(/\\/g, '/');
@@ -525,7 +589,7 @@ function syncAppChildComponentImports(source, html, tsPath, srcRoot) {
     updated = ensureImport(updated, hit.className, rel);
     updated = ensureDecoratorImport(updated, hit.className);
   }
-  return updated;
+  return { source: updated, html: updatedHtml };
 }
 
 /**
@@ -640,7 +704,6 @@ function repairAngularTemplateHtml(html, source) {
         .trim()
         .replace(/;\s*$/, '');
       if (!fixed) return '';
-      // If still multi-statement with return leftovers cleaned, leave as statement list
       return `(${evt})="${fixed}"`;
     }
   );
@@ -655,7 +718,183 @@ function repairAngularTemplateHtml(html, source) {
     ".errors['$1']"
   );
 
+  // TypeScript casts are illegal in Angular templates → $any(...)
+  // Only rewrite parenthesized `as` casts (not microsyntax like `obs as value`)
+  updated = updated.replace(
+    /\(\s*\$event\.target\s+as\s+\w+\s*\)\.(\w+)/g,
+    '$any($event.target).$1'
+  );
+  updated = updated.replace(
+    /\(\s*\$event\.target\s+as\s+\w+\s*\)/g,
+    '$any($event.target)'
+  );
+  updated = updated.replace(
+    /\(\s*(\$event(?:\.\w+)*)\s+as\s+\w+\s*\)/g,
+    '$any($1)'
+  );
+
+  // Lucide attr leaked into [class] string: "...foreground' lucideUserCog"
+  updated = updated.replace(
+    /(\[(?:class|ngClass)\]="[^"]*?)\s+lucide[A-Z][A-Za-z0-9]*(\s*")/g,
+    '$1$2'
+  );
+  updated = updated.replace(
+    /(\[(?:class|ngClass)\]='[^']*?)\s+lucide[A-Z][A-Za-z0-9]*(\s*')/g,
+    '$1$2'
+  );
+
+  // Wrong dynamic binding [lucide]="..." → static attr or [lucideIcon]
+  updated = updated.replace(
+    /<svg([^>]*)\s\[lucide\]="([^"]*)"([^>]*)>/gi,
+    (_full, pre, expr, post) => {
+      const staticOne = expr.match(/^\s*'([A-Za-z0-9-]+)'\s*$/);
+      const ternarySame = expr.match(/^\s*[^?]+\?\s*'([A-Za-z0-9-]+)'\s*:\s*'([A-Za-z0-9-]+)'\s*$/);
+      if (staticOne) {
+        const { attr } = lucideSlugToSymbolAndAttr(staticOne[1]);
+        return `<svg${pre} ${attr}${post}>`;
+      }
+      if (ternarySame && ternarySame[1].toLowerCase() === ternarySame[2].toLowerCase()) {
+        const { attr } = lucideSlugToSymbolAndAttr(ternarySame[1]);
+        return `<svg${pre} ${attr}${post}>`;
+      }
+      // Dynamic: use lucideIcon with kebab/lowercase names
+      const dyn = expr
+        .replace(/'([A-Z][A-Za-z0-9]*)'/g, (_, name) => {
+          const kebab = name
+            .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+            .replace(/_/g, '-')
+            .toLowerCase();
+          return `'${kebab}'`;
+        });
+      return `<svg${pre} [lucideIcon]="${dyn}"${post}>`;
+    }
+  );
+
+  // Arrow functions illegal in templates — common .filter(u => u.prop).length
+  updated = updated.replace(
+    /\{\{\s*([^}]*?)\.filter\s*\(\s*(\w+)\s*=>\s*\!?\s*\2\.(\w+)\s*\)\.length\s*\}\}/g,
+    (_full, arr, _v, prop) => `{{ countWhere(${arr.trim()}, '${prop}') }}`
+  );
+  updated = updated.replace(
+    /\{\{\s*([^}]*?)\.length\s*-\s*([^}]*?)\.filter\s*\(\s*(\w+)\s*=>\s*\!?\s*\3\.(\w+)\s*\)\.length\s*\}\}/g,
+    (_full, left, right, _v, prop) =>
+      `{{ (${left.trim()}.length || 0) - countWhere(${right.trim()}, '${prop}') }}`
+  );
+
+  // Any remaining => in bindings → wrap into a no-op safe form by stripping arrow bodies
+  // (best-effort; complex cases need class methods)
+  updated = updated.replace(
+    /(\[[\w.-]+\]|\([\w.-]+\))="([^"]*=>[^"]*)"/g,
+    (full, bind, expr) => {
+      if (!/=>/.test(expr)) return full;
+      // Drop arrow callbacks inside bindings — leave a stub call if possible
+      const cleaned = expr.replace(/\([^)]*\)\s*=>\s*[^,;)]+/g, 'true').trim();
+      return `${bind}="${cleaned}"`;
+    }
+  );
+
   return updated;
+}
+
+/**
+ * Remove non-declarables (e.g. cn helper) from @Component imports arrays.
+ */
+function sanitizeStandaloneImports(source) {
+  if (!/@Component\s*\(/.test(source)) return source;
+
+  const bannedExact = new Set([
+    'cn', 'clsx', 'twMerge', 'cva', 'classNames', 'classnames', 'React', 'Fragment'
+  ]);
+
+  return source.replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    (full, start, mid, end) => {
+      const items = mid
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((item) => {
+          const bare = item.split(/\s+as\s+/)[0].trim();
+          if (bannedExact.has(bare)) return false;
+          // Lowercase identifiers are almost never Angular declarables
+          if (/^[a-z]/.test(bare) && bare !== 'forwardRef') return false;
+          return true;
+        });
+      // Dedupe
+      const uniq = [...new Set(items)];
+      return `${start}${uniq.join(', ')}${end}`;
+    }
+  );
+}
+
+/**
+ * Strip hallucinated React→Angular leftovers that break the compiler.
+ */
+function repairHallucinatedAngularApis(source) {
+  let updated = source;
+
+  // Fake @angular/core exports
+  for (const sym of ['RenderFragment', 'ReactNode', 'JSX', 'PropsWithChildren', 'FC', 'FunctionComponent']) {
+    updated = removeNamedImport(updated, sym, '@angular/core');
+    updated = removeNamedImport(updated, sym, 'react');
+  }
+
+  // Input used as a generic type (React children leftover): actions: Input<X> = () => null
+  updated = updated.replace(
+    /(^\s*)(?:public\s+|protected\s+|private\s+|readonly\s+)*(\w+)\s*:\s*Input\s*<[^>;]+>\s*=\s*\(\)\s*=>\s*null\s*;/gm,
+    '$1@Input() $2: any = null;'
+  );
+  updated = updated.replace(
+    /(^\s*)(?:public\s+|protected\s+|private\s+|readonly\s+)*(\w+)\s*:\s*Input\s*<[^>;]+>\s*;/gm,
+    '$1@Input() $2: any;'
+  );
+  if (/@Input\s*\(/.test(updated)) {
+    updated = ensureImport(updated, 'Input', '@angular/core');
+  }
+
+  // IconDefinition does not exist — neutralize
+  updated = updated.replace(/new\s+IconDefinition\s*\([^)]*\)/g, 'null as any');
+  updated = updated.replace(/:\s*IconDefinition\b/g, ': any');
+  updated = removeNamedImport(updated, 'IconDefinition', '@lucide/angular');
+  updated = removeNamedImport(updated, 'IconDefinition', 'lucide-react');
+  updated = removeNamedImport(updated, 'IconDefinition', '@angular/core');
+
+  // Fix prior bad stubs: initials: any[] = [] when template calls initials(...)
+  updated = updated.replace(
+    /(^\s*)initials\s*:\s*any\s*\[\s*\]\s*=\s*\[\s*\]\s*;/gm,
+    '$1initials(..._args: any[]) { return String(_args[0] ?? \'\'); }'
+  );
+
+  // Angular Location has path(), not pathname (DOM Location leftover)
+  updated = updated.replace(/this\.location\.pathname\b/g, 'this.location.path()');
+  updated = updated.replace(/(\w+)\.pathname\.startsWith\(/g, '$1.path().startsWith(');
+
+  // Field init order: icon: this.cog before cog is declared → use null then assign in ctor-less style
+  // Soft-fix array literals that reference this.X before X: leave as-is if complex; common nav pattern:
+  updated = updated.replace(
+    /(^\s*(?:readonly\s+)?nav(?:Items|Links)?\s*=\s*\[[\s\S]*?\];)/m,
+    (block) => {
+      if (!/icon:\s*this\.\w+/.test(block)) return block;
+      return block.replace(/icon:\s*this\.(\w+)/g, "icon: '$1'");
+    }
+  );
+
+  return updated;
+}
+
+/**
+ * Ensure countWhere helper exists when templates use it after arrow-fn rewrites.
+ */
+function ensureCountWhereHelper(source, html) {
+  if (!/\bcountWhere\s*\(/.test(html) && !/\bcountWhere\s*\(/.test(source)) return source;
+  if (classHasMember(source, 'countWhere')) return source;
+  return insertIntoClassBody(
+    source,
+    `  countWhere(list: any, prop: string): number {
+    const arr = typeof list === 'function' ? list() : list;
+    return (Array.isArray(arr) ? arr : []).filter((x: any) => !!(x && x[prop])).length;
+  }`
+  );
 }
 
 /**
@@ -941,6 +1180,8 @@ function repairAngularComponentFile(tsPath) {
   source = renameLucideReactSymbolsToAngular(source);
   source = repairLucideAngularImports(source);
   source = repairEmblaImports(source);
+  source = repairHallucinatedAngularApis(source);
+  source = sanitizeStandaloneImports(source);
 
   // import type { X } used as value — promote common Angular DI tokens
   const typeOnlyValueSymbols = ['DestroyRef', 'Injector', 'ElementRef', 'Renderer2', 'ChangeDetectorRef', 'NgZone', 'ViewContainerRef', 'TemplateRef'];
@@ -1136,10 +1377,14 @@ function repairAngularComponentFile(tsPath) {
     // Native attribute bindings
     html = html.replace(/\[minlength\]=/g, '[attr.minlength]=');
     html = html.replace(/\[maxlength\]=/g, '[attr.maxlength]=');
-    // Safer select event typing patterns
+    // Angular templates forbid `as` casts — use $any()
+    html = html.replace(
+      /\(\s*\$event\.target\s+as\s+\w+\s*\)\.(\w+)/g,
+      '$any($event.target).$1'
+    );
     html = html.replace(
       /\$event\.target\.value/g,
-      '($event.target as HTMLSelectElement).value'
+      '$any($event.target).value'
     );
     // Array(...) in templates — expose helper
     if (/\bArray\s*\(/.test(html) && !/\bArray\s*=/.test(source)) {
@@ -1152,7 +1397,7 @@ function repairAngularComponentFile(tsPath) {
     source = ensureTemplateMembers(source, html);
     // Sync Lucide icon imports from rewritten template
     source = syncLucideImportsFromTemplate(source, html);
-    // Import <app-*> children used in template
+    // Import custom-element children used in template (and align selectors)
     const srcRoot = (() => {
       let dir = path.dirname(tsPath);
       while (dir && path.basename(dir) !== 'src' && dir !== path.dirname(dir)) {
@@ -1160,10 +1405,15 @@ function repairAngularComponentFile(tsPath) {
       }
       return dir && path.basename(dir) === 'src' ? dir : path.join(path.dirname(tsPath), '..', '..');
     })();
-    source = syncAppChildComponentImports(source, html, tsPath, srcRoot);
+    const synced = syncAppChildComponentImports(source, html, tsPath, srcRoot);
+    source = synced.source;
+    html = synced.html;
     // Stub missing template members (AI sibling mismatch)
     source = stubMissingTemplateMembers(source, html);
+    source = ensureCountWhereHelper(source, html);
     source = repairFormBuilderInit(source);
+    source = sanitizeStandaloneImports(source);
+    source = dedupeImports(source);
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
 
@@ -1453,7 +1703,10 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     // Legacy lucide-angular only peers Angular ≤19 — never carry it into Angular 22 workspaces
     'lucide-angular',
     'lucide-react',
-    '@lucide/angular'
+    '@lucide/angular',
+    // Tailwind v4-only CSS packages break Angular Sass (@theme / @utility / @property)
+    'tw-animate-css',
+    'tailwindcss-animate'
   ]);
 
   for (const [name, version] of Object.entries(srcDeps)) {
@@ -1837,6 +2090,63 @@ function enforceTailwindScssWorkspace(destPath) {
   const legacyStyles = path.join(destPath, 'src', 'styles.css');
   if (fs.existsSync(legacyStyles)) {
     try { fs.unlinkSync(legacyStyles); } catch { /* ignore */ }
+  }
+
+  // Strip Tailwind-v4 / animate CSS imports that break Dart Sass in Angular
+  stripForbiddenStylePackageImports(destPath);
+
+  // Drop broken packages from package.json if AI/source carried them over
+  const pkgPath = path.join(destPath, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      for (const section of ['dependencies', 'devDependencies']) {
+        if (!pkg[section]) continue;
+        delete pkg[section]['tw-animate-css'];
+        delete pkg[section]['tailwindcss-animate'];
+      }
+      fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Remove @import/@use of packages whose CSS uses Tailwind v4 at-rules
+ * (@theme, @utility, @property) that Dart Sass cannot parse.
+ */
+function stripForbiddenStylePackageImports(destPath) {
+  const forbidden = [
+    'tw-animate-css',
+    'tailwindcss-animate',
+    'tw-animate'
+  ];
+  const importRe = new RegExp(
+    `^\\s*@(?:import|use)\\s+['"](?:~)?(?:${forbidden.join('|')})(?:/[^'"]*)?['"].*;?\\s*$`,
+    'gim'
+  );
+  const cssUrlRe = new RegExp(
+    `^\\s*@(?:import|use)\\s+['"][^'"]*(?:${forbidden.join('|')})[^'"]*['"].*;?\\s*$`,
+    'gim'
+  );
+
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.scss') || n.endsWith('.sass') || n.endsWith('.css')
+  )) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    content = content.replace(importRe, '/* stripped incompatible animate CSS import */');
+    content = content.replace(cssUrlRe, '/* stripped incompatible animate CSS import */');
+    // Also strip inline @theme / @utility blocks that may have been pasted into scss
+    if (/@theme\b|@utility\b/.test(content) && !/@tailwind\b/.test(content)) {
+      content = content
+        .replace(/@theme\b[\s\S]*?(?=@|\Z)/g, '/* stripped @theme (Tailwind v4) */\n')
+        .replace(/@utility\b[\s\S]*?(?=@|\Z)/g, '/* stripped @utility (Tailwind v4) */\n');
+    }
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+    }
   }
 }
 

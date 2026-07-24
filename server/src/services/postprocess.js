@@ -888,7 +888,8 @@ function repairAngularComponentFile(tsPath) {
   const className = componentClassNameFromFile(tsPath);
   const baseName = path.basename(tsPath, '.ts');
   const htmlPath = tsPath.replace(/\.ts$/, '.html');
-  const cssPath = tsPath.replace(/\.ts$/, '.css');
+  const cssPath = tsPath.replace(/\.ts$/, '.scss');
+  const legacyCssPath = tsPath.replace(/\.ts$/, '.css');
 
   // Extract leaked CSS before stripping
   const leakedCss = extractLeakedCss(source);
@@ -1024,7 +1025,15 @@ function repairAngularComponentFile(tsPath) {
     source = source.replace(/(@Component\s*\(\s*\{)/, `$1\n  templateUrl: './${baseName}.html',`);
   }
   if (!/styleUrl\s*:/.test(source) && !/styleUrls\s*:/.test(source) && /@Component\s*\(/.test(source)) {
-    source = source.replace(/(@Component\s*\(\s*\{)/, `$1\n  styleUrl: './${baseName}.css',`);
+    source = source.replace(/(@Component\s*\(\s*\{)/, `$1\n  styleUrl: './${baseName}.scss',`);
+  }
+  // Force any .css styleUrl to .scss
+  source = source
+    .replace(/styleUrl\s*:\s*['"]([^'"]+)\.css['"]/g, "styleUrl: '$1.scss'")
+    .replace(/styleUrls\s*:\s*\[\s*['"]([^'"]+)\.css['"]\s*\]/g, "styleUrls: ['$1.scss']");
+
+  if (fs.existsSync(legacyCssPath) && !fs.existsSync(cssPath)) {
+    try { fs.renameSync(legacyCssPath, cssPath); } catch { /* ignore */ }
   }
 
   const assets = collectReferencedAssetPaths(source, tsPath);
@@ -1248,7 +1257,7 @@ ${hasRouterOutlet ? "import { RouterOutlet } from '@angular/router';\n" : ''}
   selector: 'app-root',
   standalone: true,
 ${hasRouterOutlet ? '  imports: [RouterOutlet],\n' : ''}  templateUrl: './app.component.html',
-  styleUrl: './app.component.css'
+  styleUrl: './app.component.scss'
 })
 export class AppComponent {}
 `;
@@ -1359,10 +1368,10 @@ function repairAngularRoutes(destPath) {
     if (!fs.existsSync(stubTs)) {
       const base = path.basename(stubTs, '.ts');
       const html = stubTs.replace(/\.ts$/, '.html');
-      const css = stubTs.replace(/\.ts$/, '.css');
+      const css = stubTs.replace(/\.ts$/, '.scss');
       fs.writeFileSync(
         stubTs,
-        `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${base.replace(/\.component$/i, '')}',\n  standalone: true,\n  templateUrl: './${base}.html',\n  styleUrl: './${base}.css'\n})\nexport class ${primary} {}\n`,
+        `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${base.replace(/\.component$/i, '')}',\n  standalone: true,\n  templateUrl: './${base}.html',\n  styleUrl: './${base}.scss'\n})\nexport class ${primary} {}\n`,
         'utf-8'
       );
       if (!fs.existsSync(html)) fs.writeFileSync(html, `<p>${primary} placeholder</p>\n`, 'utf-8');
@@ -1425,6 +1434,12 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
   for (const [name, version] of Object.entries(alwaysUseful)) {
     if (!pkg.dependencies[name]) pkg.dependencies[name] = version;
   }
+
+  // Tailwind + SCSS toolchain for every migrated app
+  if (!pkg.devDependencies.tailwindcss) pkg.devDependencies.tailwindcss = '^3.4.17';
+  if (!pkg.devDependencies.postcss) pkg.devDependencies.postcss = '^8.4.49';
+  if (!pkg.devDependencies.autoprefixer) pkg.devDependencies.autoprefixer = '^10.4.20';
+  if (!pkg.devDependencies.sass) pkg.devDependencies.sass = '^1.83.0';
 
   // Carry over non-framework runtime deps that are framework-agnostic
   const skip = new Set([
@@ -1617,7 +1632,7 @@ function rewriteAtAliasImportsInTree(destPath) {
             ensureDirectoryExists(stubDir);
             fs.writeFileSync(
               stubTs,
-              `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${stem}',\n  standalone: true,\n  templateUrl: './${stem}.component.html',\n  styleUrl: './${stem}.component.css'\n})\nexport class ${className} {}\n`,
+              `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${stem}',\n  standalone: true,\n  templateUrl: './${stem}.component.html',\n  styleUrl: './${stem}.component.scss'\n})\nexport class ${className} {}\n`,
               'utf-8'
             );
             fs.writeFileSync(
@@ -1626,7 +1641,7 @@ function rewriteAtAliasImportsInTree(destPath) {
               'utf-8'
             );
             fs.writeFileSync(
-              path.join(stubDir, `${stem}.component.css`),
+              path.join(stubDir, `${stem}.component.scss`),
               `/* ${stem} */\n`,
               'utf-8'
             );
@@ -1727,6 +1742,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   removeHallucinatedNgModules(destPath);
   fixBrokenRelativeComponentImports(destPath);
   rewriteAtAliasImportsInTree(destPath);
+  enforceTailwindScssWorkspace(destPath);
 
   // Second pass: child imports + lucide sync after path fixes
   for (const file of walkFiles(path.join(destPath, 'src'), (name) => name.endsWith('.component.ts'))) {
@@ -1736,11 +1752,91 @@ export function repairAngularWorkspace(destPath, options = {}) {
       console.warn(`[postprocess] Second-pass repair failed for ${file}: ${err.message}`);
     }
   }
+}
 
-  // Ensure styles.css exists
-  const stylesPath = path.join(destPath, 'src', 'styles.css');
+/**
+ * Ensure Tailwind + SCSS conventions across the migrated Angular workspace.
+ */
+function enforceTailwindScssWorkspace(destPath) {
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts'))) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    content = content
+      .replace(/styleUrl\s*:\s*['"]([^'"]+)\.css['"]/g, "styleUrl: '$1.scss'")
+      .replace(/styleUrls\s*:\s*\[\s*['"]([^'"]+)\.css['"]\s*\]/g, "styleUrls: ['$1.scss']");
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+    }
+  }
+
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.css'))) {
+    const scssPath = file.replace(/\.css$/, '.scss');
+    if (!fs.existsSync(scssPath)) {
+      try { fs.renameSync(file, scssPath); } catch { /* ignore */ }
+    } else {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+    }
+  }
+
+  const angularJsonPath = path.join(destPath, 'angular.json');
+  if (fs.existsSync(angularJsonPath)) {
+    try {
+      const aj = JSON.parse(fs.readFileSync(angularJsonPath, 'utf-8'));
+      const project = aj?.projects && Object.values(aj.projects)[0];
+      if (project?.architect?.build?.options) {
+        project.architect.build.options.styles = ['src/styles.scss'];
+        project.architect.build.options.inlineStyleLanguage = 'scss';
+      }
+      if (project?.architect?.test?.options) {
+        project.architect.test.options.styles = ['src/styles.scss'];
+      }
+      project.schematics = project.schematics || {};
+      project.schematics['@schematics/angular:component'] = {
+        ...(project.schematics['@schematics/angular:component'] || {}),
+        style: 'scss',
+        standalone: true
+      };
+      fs.writeFileSync(angularJsonPath, `${JSON.stringify(aj, null, 2)}\n`, 'utf-8');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (!fs.existsSync(path.join(destPath, 'tailwind.config.js'))) {
+    fs.writeFileSync(
+      path.join(destPath, 'tailwind.config.js'),
+      `/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: ['./src/**/*.{html,ts,scss}'],\n  theme: { extend: {} },\n  plugins: [],\n};\n`,
+      'utf-8'
+    );
+  }
+  if (!fs.existsSync(path.join(destPath, 'postcss.config.js'))) {
+    fs.writeFileSync(
+      path.join(destPath, 'postcss.config.js'),
+      `module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`,
+      'utf-8'
+    );
+  }
+
+  const stylesPath = path.join(destPath, 'src', 'styles.scss');
   if (!fs.existsSync(stylesPath)) {
-    fs.writeFileSync(stylesPath, '/* Global styles */\n', 'utf-8');
+    fs.writeFileSync(
+      stylesPath,
+      `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`,
+      'utf-8'
+    );
+  } else {
+    const styles = fs.readFileSync(stylesPath, 'utf-8');
+    if (!/@tailwind\s+base/.test(styles)) {
+      fs.writeFileSync(
+        stylesPath,
+        `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n${styles}`,
+        'utf-8'
+      );
+    }
+  }
+  const legacyStyles = path.join(destPath, 'src', 'styles.css');
+  if (fs.existsSync(legacyStyles)) {
+    try { fs.unlinkSync(legacyStyles); } catch { /* ignore */ }
   }
 }
 
@@ -1913,6 +2009,67 @@ export function repairReactWorkspace(destPath, options = {}) {
   if (!fs.existsSync(appPath)) {
     const alt = walkFiles(path.join(destPath, 'src'), (n) => /^app\.(tsx|jsx)$/i.test(n))[0];
     if (alt) fs.copyFileSync(alt, appPath);
+  }
+
+  enforceReactTailwindScss(destPath);
+}
+
+function enforceReactTailwindScss(destPath) {
+  // Rename .css → .scss under src and rewrite imports
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.css'))) {
+    const scssPath = file.replace(/\.css$/, '.scss');
+    if (!fs.existsSync(scssPath)) {
+      try { fs.renameSync(file, scssPath); } catch { /* ignore */ }
+    } else {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+    }
+  }
+
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.ts') || n.endsWith('.tsx') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    content = content
+      .replace(/(['"])([^'"]+)\.css\1/g, '$1$2.scss$1')
+      .replace(/from\s+['"]\.\/index\.css['"]/g, "from './index.scss'")
+      .replace(/import\s+['"]\.\/index\.css['"]/g, "import './index.scss'");
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+    }
+  }
+
+  const indexScss = path.join(destPath, 'src', 'index.scss');
+  if (!fs.existsSync(indexScss)) {
+    fs.writeFileSync(
+      indexScss,
+      `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`,
+      'utf-8'
+    );
+  } else {
+    const styles = fs.readFileSync(indexScss, 'utf-8');
+    if (!/@tailwind\s+base/.test(styles)) {
+      fs.writeFileSync(
+        indexScss,
+        `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n${styles}`,
+        'utf-8'
+      );
+    }
+  }
+
+  if (!fs.existsSync(path.join(destPath, 'tailwind.config.js'))) {
+    fs.writeFileSync(
+      path.join(destPath, 'tailwind.config.js'),
+      `/** @type {import('tailwindcss').Config} */\nexport default {\n  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx,scss}'],\n  theme: { extend: {} },\n  plugins: [],\n};\n`,
+      'utf-8'
+    );
+  }
+  if (!fs.existsSync(path.join(destPath, 'postcss.config.js'))) {
+    fs.writeFileSync(
+      path.join(destPath, 'postcss.config.js'),
+      `export default {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`,
+      'utf-8'
+    );
   }
 }
 

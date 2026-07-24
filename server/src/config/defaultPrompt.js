@@ -39,14 +39,21 @@ prompt — obey THAT block for package.json and APIs. Do not invent a different 
 
 ## FOLDER STRUCTURE & CODE QUALITY (applied automatically)
 
+### Styling (ALL conversions — mandatory)
+- ALL styling uses **Tailwind CSS** utility classes in templates/JSX (\`class\` / \`className\`).
+- ALL style files use **SCSS** (\`.scss\`) — never \`.css\` for component or global styles.
+- Prefer Tailwind utilities over custom rules. Keep \`.scss\` files minimal (empty comment
+  or a few \`@apply\` / nesting rules only when truly needed).
+- Global entry: Angular \`src/styles.scss\`; React \`src/index.scss\` (with \`@tailwind\` layers).
+
 ### Angular best structure
 \`\`\`
 src/
   main.ts
   index.html
-  styles.css
+  styles.scss
   app/
-    app.component.ts|html|css
+    app.component.ts|html|scss
     app.config.ts
     app.routes.ts
     core/           # singleton services, guards, interceptors, auth
@@ -60,7 +67,8 @@ src/
       admin/        # for all other pages means after login
         dashboard/
 \`\`\`
-- One feature per folder. Matching \`.ts\` + \`.html\` + \`.css\` triad per component.
+- One feature per folder. Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
+- \`styleUrl: './name.component.scss'\` (never \`.css\`).
 - \`standalone: true\` everywhere. \`providedIn: 'root'\` for app-wide services.
 - Clear names, small focused components, no dead code, no unused imports.
 - Strict typing; no \`any\` unless unavoidable. Public template API only
@@ -71,16 +79,17 @@ src/
 src/
   main.tsx
   App.tsx
-  App.css
+  App.scss
+  index.scss
   components/     # shared presentational UI
   features/       # feature modules (auth/, dashboard/, …)
   pages/          # route-level screens (optional if features own routes)
   hooks/          # shared custom hooks
   lib/            # utils (cn, formatters)
   services/       # API clients
-  styles/         # global CSS (optional)
 \`\`\`
 - Entry is \`src/main.tsx\` → \`src/App.tsx\` (never Angular-style \`src/app/\`).
+- Import \`./index.scss\` from main; component styles as \`.scss\` only.
 - Feature-first folders; co-locate feature components with the feature.
 - Typed props, pure presentational components where possible, hooks for state/
   side effects. No unused vars/imports. Prefer composition over giant files.
@@ -100,7 +109,7 @@ STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
 - Core app shell — App component, routing, main layout wrapper
 - Shared services — auth service, HTTP interceptors, route guards, token storage
 - Configuration files — package.json, angular.json, tsconfig.json, tsconfig.app.json, etc.
-- Global styles — src/styles.css or similar
+- Global styles — src/styles.scss (Tailwind entry)
 
 ### REMOVE these pages/components ENTIRELY:
 - Profile/settings/user-management (unless critical for auth flow)
@@ -259,7 +268,7 @@ export const REACT_TO_ANGULAR_PROMPT = `
 ### Angular 22 quality
 - Target Angular 22 APIs only (signals, inject(), standalone, @if/@for).
 - Follow page-folder structure under src/app/pages (common|auth|admin) plus core|shared.
-- Strong typing; matching .ts/.html/.css; no hallucinated modules.
+- Strong typing; matching .ts/.html/.scss; Tailwind in templates; no hallucinated modules.
 - Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
 - Always \`export const routes\` from app.routes.ts (never unexported \`const routes\`).
 - Every template member (methods/fields) MUST exist on the class; keep .ts and .html in sync.
@@ -267,7 +276,7 @@ export const REACT_TO_ANGULAR_PROMPT = `
 
 ### Templates vs TypeScript consistency
 - EVERY name in .html MUST exist on the class (public/protected field, @Input,
-  @Output, or method). Generate matching .ts + .html + .css triads.
+  @Output, or method). Generate matching .ts + .html + .scss triads (Tailwind in HTML).
 - Do not put bare \`className\` / \`cn(...)\` in templates unless the class defines them.
   Prefer a \`mergedClass\` getter in .ts; or expose \`protected readonly cn = cn\`.
 - NEVER leave \`(click)=""\`. NEVER use \`return\` / multi-statement JS in bindings —

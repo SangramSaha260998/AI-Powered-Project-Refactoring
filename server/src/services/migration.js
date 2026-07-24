@@ -549,6 +549,10 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
       '@angular/build': `^${angularToolingVersion}`,
       '@angular/cli': `^${angularToolingVersion}`,
       '@angular/compiler-cli': `^${angularVersion}`,
+      'autoprefixer': '^10.4.20',
+      'postcss': '^8.4.49',
+      'sass': '^1.83.0',
+      'tailwindcss': '^3.4.17',
       'typescript': stack.typescript || '~6.0.3'
     }
   };
@@ -565,7 +569,12 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
     projects: {
       'migrated-angular-project': {
         projectType: 'application',
-        schematics: {},
+        schematics: {
+          '@schematics/angular:component': {
+            style: 'scss',
+            standalone: true
+          }
+        },
         root: '',
         sourceRoot: 'src',
         prefix: 'app',
@@ -578,6 +587,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
               browser: 'src/main.ts',
               polyfills: ['zone.js'],
               tsConfig: 'tsconfig.app.json',
+              inlineStyleLanguage: 'scss',
               assets: [
                 {
                   glob: '**/*',
@@ -585,7 +595,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
                   output: '/'
                 }
               ],
-              styles: ['src/styles.css'],
+              styles: ['src/styles.scss'],
               scripts: []
             },
             configurations: {
@@ -623,7 +633,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
                   output: '/'
                 }
               ],
-              styles: ['src/styles.css'],
+              styles: ['src/styles.scss'],
               scripts: []
             }
           }
@@ -753,8 +763,42 @@ bootstrapApplication(AppComponent, appConfig)
 `;
   fs.writeFileSync(path.join(destPath, 'src', 'main.ts'), mainTs);
 
-  // 9. styles.css scaffold
-  fs.writeFileSync(path.join(destPath, 'src', 'styles.css'), '/* Global styles */\n');
+  // 9. styles.scss + Tailwind / PostCSS configs
+  const stylesScss = `@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global app styles — prefer Tailwind utilities in templates */
+`;
+  fs.writeFileSync(path.join(destPath, 'src', 'styles.scss'), stylesScss);
+
+  const tailwindConfig = `/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    './src/**/*.{html,ts,scss}',
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'tailwind.config.js'), tailwindConfig);
+
+  const postcssConfig = `module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'postcss.config.js'), postcssConfig);
+
+  // Remove legacy styles.css if a previous run left it behind
+  const legacyStylesCss = path.join(destPath, 'src', 'styles.css');
+  if (fs.existsSync(legacyStylesCss)) {
+    try { fs.unlinkSync(legacyStylesCss); } catch { /* ignore */ }
+  }
 
   // 10. .gitignore
   const gitignore = `# Compiled output
@@ -839,6 +883,10 @@ function injectReactWorkspaceTemplates(destPath, versionStack = null) {
       '@types/react': `^${stack.typesReact}`,
       '@types/react-dom': `^${stack.typesReactDom}`,
       '@vitejs/plugin-react': `^${stack.pluginReact}`,
+      'autoprefixer': '^10.4.20',
+      'postcss': '^8.4.49',
+      'sass': '^1.83.0',
+      'tailwindcss': '^3.4.17',
       'typescript': stack.typescript || '~5.9.2',
       'vite': `^${stack.vite}`
     }
@@ -920,7 +968,7 @@ export default defineConfig({
   const mainTsx = `import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import './index.css';
+import './index.scss';
 
 const rootElement = document.getElementById('root');
 if (rootElement) {
@@ -933,38 +981,42 @@ if (rootElement) {
 `;
   fs.writeFileSync(path.join(destPath, 'src', 'main.tsx'), mainTsx);
 
-  // 6. src/index.css - basic global styles
-  const indexCss = `:root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
+  // 6. src/index.scss — Tailwind entry
+  const indexScss = `@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-  margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
-}
-
-#root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
-}
+/* Global app styles — prefer Tailwind utilities in components */
 `;
-  fs.writeFileSync(path.join(destPath, 'src', 'index.css'), indexCss);
+  fs.writeFileSync(path.join(destPath, 'src', 'index.scss'), indexScss);
+
+  const reactTailwindConfig = `/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    './index.html',
+    './src/**/*.{js,ts,jsx,tsx,scss}',
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'tailwind.config.js'), reactTailwindConfig);
+
+  const reactPostcssConfig = `export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'postcss.config.js'), reactPostcssConfig);
+
+  const legacyIndexCss = path.join(destPath, 'src', 'index.css');
+  if (fs.existsSync(legacyIndexCss)) {
+    try { fs.unlinkSync(legacyIndexCss); } catch { /* ignore */ }
+  }
 
   // 7. src/vite-env.d.ts
   const viteEnvDts = `/// <reference types="vite/client" />
@@ -1043,7 +1095,7 @@ function ensureReactRuntimeFiles(destPath) {
   const normalizedMain = `import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import './index.css';
+import './index.scss';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -1053,9 +1105,17 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 `;
   fs.writeFileSync(mainTsxPath, normalizedMain, 'utf-8');
 
-  const indexCssPath = path.join(srcDir, 'index.css');
-  if (!fs.existsSync(indexCssPath)) {
-    fs.writeFileSync(indexCssPath, 'body { margin: 0; font-family: system-ui, sans-serif; }\n', 'utf-8');
+  const indexScssPath = path.join(srcDir, 'index.scss');
+  if (!fs.existsSync(indexScssPath)) {
+    fs.writeFileSync(
+      indexScssPath,
+      `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n`,
+      'utf-8'
+    );
+  }
+  const legacyCss = path.join(srcDir, 'index.css');
+  if (fs.existsSync(legacyCss) && fs.existsSync(indexScssPath)) {
+    try { fs.unlinkSync(legacyCss); } catch { /* ignore */ }
   }
 }
 
@@ -1071,7 +1131,7 @@ function ensureAngularRuntimeFiles(destPath) {
   selector: 'app-root',
   standalone: true,
   templateUrl: './app.component.html',
-  styleUrl: './app.component.css'
+  styleUrl: './app.component.scss'
 })
 export class AppComponent {}
 `;
@@ -1082,14 +1142,18 @@ export class AppComponent {}
   if (!fs.existsSync(componentHtmlPath)) {
     fs.writeFileSync(
       componentHtmlPath,
-      `<main class="app-shell">\n  <h1>Migration Complete</h1>\n  <p>This is a generated Angular workspace. Replace this with migrated templates.</p>\n</main>\n`,
+      `<main class="p-8 font-sans">\n  <h1 class="text-2xl font-semibold">Migration Complete</h1>\n  <p class="mt-2 text-gray-600">This is a generated Angular workspace. Replace this with migrated templates.</p>\n</main>\n`,
       'utf-8'
     );
   }
 
-  const componentCssPath = path.join(srcAppDir, 'app.component.css');
-  if (!fs.existsSync(componentCssPath)) {
-    fs.writeFileSync(componentCssPath, `.app-shell { padding: 2rem; font-family: Arial, sans-serif; }\n`, 'utf-8');
+  const componentScssPath = path.join(srcAppDir, 'app.component.scss');
+  if (!fs.existsSync(componentScssPath)) {
+    fs.writeFileSync(componentScssPath, `/* Prefer Tailwind utilities in the template */\n`, 'utf-8');
+  }
+  const legacyCss = path.join(srcAppDir, 'app.component.css');
+  if (fs.existsSync(legacyCss) && fs.existsSync(componentScssPath)) {
+    try { fs.unlinkSync(legacyCss); } catch { /* ignore */ }
   }
 }
 
@@ -1395,7 +1459,7 @@ function sanitizeAngularComponentTs(rawContent, baseName) {
   selector: '${baseName === 'app.component' || baseName === 'app' ? 'app-root' : 'app-' + baseName.replace(/\.component$/i, '')}',
   standalone: true,
   templateUrl: './${baseName}.html',
-  styleUrl: './${baseName}.css'
+  styleUrl: './${baseName}.scss'
 })
 export class ${expectedClass} {}
 `;
@@ -1410,7 +1474,7 @@ export class ${expectedClass} {}
     if (!tsContent.includes('styleUrl') && !tsContent.includes('styleUrls')) {
       tsContent = tsContent.replace(
         /(@Component\(\{)/,
-        `$1\n  styleUrl: './${baseName}.css',`
+        `$1\n  styleUrl: './${baseName}.scss',`
       );
     }
     if (!/\bstandalone\s*:/.test(tsContent)) {
@@ -1576,24 +1640,26 @@ function normalizeAngularComponentFiles(destPath) {
   const altTs = path.join(appDir, 'app.ts');
   const altHtml = path.join(appDir, 'app.html');
   const altCss = path.join(appDir, 'app.css');
+  const altScss = path.join(appDir, 'app.scss');
   const componentTs = path.join(appDir, 'app.component.ts');
   const componentHtml = path.join(appDir, 'app.component.html');
-  const componentCss = path.join(appDir, 'app.component.css');
+  const componentScss = path.join(appDir, 'app.component.scss');
 
   if (!fs.existsSync(componentTs) && fs.existsSync(altTs)) {
     let altContent = fs.readFileSync(altTs, 'utf-8');
     altContent = altContent
       .replace(/templateUrl:\s*['"]\.\/app\.html['"]/g, "templateUrl: './app.component.html'")
-      .replace(/styleUrl:\s*['"]\.\/app\.css['"]/g, "styleUrl: './app.component.css'")
-      .replace(/styleUrls:\s*\[\s*['"]\.\/app\.css['"]\s*\]/g, "styleUrls: ['./app.component.css']")
+      .replace(/styleUrl:\s*['"]\.\/app\.(css|scss)['"]/g, "styleUrl: './app.component.scss'")
+      .replace(/styleUrls:\s*\[\s*['"]\.\/app\.(css|scss)['"]\s*\]/g, "styleUrls: ['./app.component.scss']")
       .replace(/export\s+class\s+App\b/g, 'export class AppComponent');
     fs.writeFileSync(componentTs, sanitizeAngularComponentTs(altContent, 'app.component'), 'utf-8');
   }
   if (!fs.existsSync(componentHtml) && fs.existsSync(altHtml)) {
     fs.copyFileSync(altHtml, componentHtml);
   }
-  if (!fs.existsSync(componentCss) && fs.existsSync(altCss)) {
-    fs.copyFileSync(altCss, componentCss);
+  if (!fs.existsSync(componentScss)) {
+    if (fs.existsSync(altScss)) fs.copyFileSync(altScss, componentScss);
+    else if (fs.existsSync(altCss)) fs.copyFileSync(altCss, componentScss);
   }
 
   /** Recursively find every *.component.ts under src/ */
@@ -1617,43 +1683,27 @@ function normalizeAngularComponentFiles(destPath) {
     const baseName = entryName.replace(/\.ts$/, '');
     const dir = path.dirname(tsPath);
     const htmlPath = path.join(dir, `${baseName}.html`);
+    const scssPath = path.join(dir, `${baseName}.scss`);
     const cssPath = path.join(dir, `${baseName}.css`);
 
-    const original = fs.readFileSync(tsPath, 'utf-8');
-    const sanitized = sanitizeAngularComponentTs(original, baseName);
+    let tsContent = fs.readFileSync(tsPath, 'utf-8');
+    // Force .scss styleUrl
+    tsContent = tsContent
+      .replace(/styleUrl\s*:\s*['"]([^'"]+)\.css['"]/g, "styleUrl: '$1.scss'")
+      .replace(/styleUrls\s*:\s*\[\s*['"]([^'"]+)\.css['"]\s*\]/g, "styleUrls: ['$1.scss']");
+    fs.writeFileSync(tsPath, sanitizeAngularComponentTs(tsContent, baseName), 'utf-8');
 
-    if (sanitized !== original) {
-      fs.writeFileSync(tsPath, sanitized, 'utf-8');
-      console.log(`Sanitized contaminated TypeScript in ${path.relative(destPath, tsPath)}`);
+    if (!fs.existsSync(htmlPath)) {
+      fs.writeFileSync(htmlPath, `<div class="${baseName}"></div>\n`, 'utf-8');
     }
-
-    if (fs.existsSync(htmlPath)) {
-      const htmlOriginal = fs.readFileSync(htmlPath, 'utf-8');
-      const htmlSanitized = sanitizeHtmlContent(htmlOriginal);
-      if (htmlSanitized !== htmlOriginal) {
-        fs.writeFileSync(htmlPath, htmlSanitized, 'utf-8');
+    if (!fs.existsSync(scssPath)) {
+      if (fs.existsSync(cssPath)) {
+        fs.renameSync(cssPath, scssPath);
+      } else {
+        fs.writeFileSync(scssPath, `/* ${baseName} — prefer Tailwind utilities in the template */\n`, 'utf-8');
       }
-    } else {
-      fs.writeFileSync(
-        htmlPath,
-        `<div class="${baseName}"></div>\n`,
-        'utf-8'
-      );
-    }
-
-    if (fs.existsSync(cssPath)) {
-      const cssOriginal = fs.readFileSync(cssPath, 'utf-8');
-      const cssSanitized = sanitizeCssContent(cssOriginal);
-      if (cssSanitized !== cssOriginal) {
-        fs.writeFileSync(cssPath, cssSanitized, 'utf-8');
-      }
-      // Empty / selector-only CSS breaks Angular's CSS parser
-      const trimmed = fs.readFileSync(cssPath, 'utf-8').trim();
-      if (!trimmed || (/^[^{]+$/.test(trimmed) && !trimmed.startsWith('/*'))) {
-        fs.writeFileSync(cssPath, `/* ${baseName} */\n`, 'utf-8');
-      }
-    } else {
-      fs.writeFileSync(cssPath, `/* ${baseName} */\n`, 'utf-8');
+    } else if (fs.existsSync(cssPath)) {
+      try { fs.unlinkSync(cssPath); } catch { /* ignore */ }
     }
   }
 }
@@ -1769,7 +1819,7 @@ RULES:
   const crossFrameworkInstruction = `
 You are a Principal Software Architect. Your task is to analyze an incoming source codebase and plan out a structural framework migration based on the user's demands.
 Analyze the file directory structure. Provide an array mapping of target framework files that must be created from scratch to fully rebuild the app in the new architecture.
-- If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.css, src/app/app.routes.ts, etc.
+- If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.scss, src/app/app.routes.ts, etc.
 - If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 Your output must strictly be raw valid JSON. No markdown wrappers. The JSON must have a single top-level key "migrationPlan" whose value is an array of objects. Each object must have these keys: "newPath" (string), "explanationOfSource" (string), "approximateSourceFilesToRead" (array of strings).
 
@@ -1778,8 +1828,9 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For Angular projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, angular.json.
 - Focus ONLY on converting the actual application code (components, services, utilities).
 - USER MIGRATION MANDATE IS HIGHEST PRIORITY: when the user specifies titles, colors, themes, branding, or copy changes, every planned UI file must reflect those exact values instead of copying the source project defaults.
-- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.css. Never plan inline templates in the .ts file when an .html sibling exists.
-- For Angular: EVERY component needs its own .ts + .html + .css triad with matching names (e.g. avatar.component.ts / avatar.component.html / avatar.component.css). Never share one template across components.
+- For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.scss. Never plan inline templates in the .ts file when an .html sibling exists.
+- For Angular: EVERY component needs its own .ts + .html + .scss triad with matching names (e.g. avatar.component.ts / avatar.component.html / avatar.component.scss). Never share one template across components. Use Tailwind utility classes in HTML; keep SCSS minimal.
+- Styling for ALL targets: Tailwind CSS in templates + SCSS files only (never .css).
 - For Angular: plan src/lib/* utility ports (utils.ts, format.ts, mock-data.ts) when the React app uses @/lib/*.
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
@@ -1898,13 +1949,13 @@ ${enhancedPrompt}`
       if (matches && matches.length > 0) {
         // Deduplicate
         const uniquePaths = [...new Set(matches)];
-        // Auto-add sibling .html and .css files for Angular component .ts files
+        // Auto-add sibling .html and .scss files for Angular component .ts files
         const withSiblings = new Set(uniquePaths);
         for (const p of uniquePaths) {
           if (p.endsWith('.component.ts')) {
             const base = p.slice(0, -3); // remove '.ts'
             withSiblings.add(base + '.html');
-            withSiblings.add(base + '.css');
+            withSiblings.add(base + '.scss');
           }
         }
         targetFileList = [...withSiblings].map(p => ({
@@ -1964,9 +2015,10 @@ ${enhancedPrompt}`
 You are an elite Senior Frontend Engineer executing a framework translation.
 You are writing the code for ONE file only in the new framework structure.
 - If writing an Angular Standalone Component TypeScript file: write ONLY TypeScript. Use templateUrl/styleUrl. Do NOT include HTML markup or CSS rules in the .ts file.
-- If writing an Angular .html file: write ONLY HTML markup. No TypeScript, no CSS, no file path comments.
-- If writing an Angular .css file: write ONLY valid CSS (complete rules with braces). No HTML, no TypeScript, no file path comments. Empty files must be a comment like /* component */.
-- If writing a React Component: use functional components with hooks and TypeScript.
+- If writing an Angular .html file: write ONLY HTML markup with Tailwind utility classes on elements. No TypeScript, no CSS/SCSS, no file path comments.
+- If writing an Angular .scss (or legacy .css) file: write ONLY SCSS/CSS (complete rules with braces). Prefer empty/minimal SCSS — styling belongs in Tailwind classes in the HTML. No HTML, no TypeScript, no file path comments. Empty files must be a comment like /* component */.
+- If writing a React Component: use functional components with hooks and TypeScript. Style with Tailwind className utilities; companion styles use .scss only.
+- If writing a React .scss file: minimal SCSS only; prefer Tailwind in JSX.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.
 Respond ONLY with raw code for the single requested file. Do not output markdown code blocks (\`\`\`).
 Do NOT concatenate multiple files. Do NOT add comments like "// src/app/app.component.html" or dump sibling file contents.
@@ -1978,7 +2030,7 @@ CRITICAL RULES:
 3. For React: Use consistent file extensions - ALL files should be .tsx for TypeScript React projects.
 4. DO NOT create Angular-style directory structures (src/app/ subdirectory) for React projects.
 5. MANDATORY USER REQUIREMENTS override source defaults: if the user specifies titles, colors, theme values, or branding, apply those exact values in this file. Do NOT keep old source titles/colors when the user asked to change them.
-6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file and ALL styles in the .css file. NEVER use an inline template or styles property.
+6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file (with Tailwind classes) and ALL leftover styles in the .scss file (styleUrl: './name.component.scss'). NEVER use .css, inline template, or styles property.
 7. When sibling files for the same component were already generated, stay consistent with them (same title text, colors, and layout).
 8. Output MUST contain only the contents of the single target file path you were asked to create.
 9. Angular standalone components MUST set standalone: true. If the template uses *ngIf, *ngFor, ngClass, ngStyle, or async pipe, import CommonModule from '@angular/common' (NOT from '@angular/core') and list it in the @Component imports array. Prefer @if / @for built-in control flow when possible.
@@ -2006,6 +2058,7 @@ CRITICAL RULES:
 31. HTML must be balanced and complete — no truncated templates (Unexpected EOF).
 32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow best folder structure (Angular: app/core|shared|pages/{common,auth,admin}; React: components|features|hooks|lib|services) and high code quality.
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
+34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 `;
 
   const generatedFiles = {};

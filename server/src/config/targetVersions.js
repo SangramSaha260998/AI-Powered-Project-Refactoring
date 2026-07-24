@@ -104,7 +104,9 @@ function buildParsed(major, minor, patch) {
 
 /**
  * Parse a version mention from free text for a given framework keyword.
- * Examples: "Angular 19", "angular v20.3", "React 18.3.1", "version 20" (when targeting Angular)
+ * Accepts loose natural language, e.g.:
+ *   "Angular 20", "angular version should be 20", "angular version will be 20",
+ *   "do the angular version 20", "set angular to v20.3", "version 20" (when targeting)
  *
  * @param {string} text
  * @param {'angular'|'react'} framework
@@ -116,40 +118,62 @@ export function parseFrameworkVersionFromPrompt(text, framework, options = {}) {
   const fw = framework.toLowerCase();
   const to = (options.toTech || '').toLowerCase();
   const targetingThis = to.includes(fw);
+  const normalized = text.replace(/\s+/g, ' ').trim();
+
+  // Digits that look like a framework major/minor/patch
+  const verNum = 'v?(\\d{1,2})(?:\\.(\\d{1,3}))?(?:\\.(\\d{1,3}))?';
+  // Soft filler between keywords (will be / should be / to / the / …)
+  const gap = '[\\s\\w\'".,:;/=\\-]{0,48}?';
 
   const patterns = [
-    // angular 19.2.8 / angular - 20 / angular:20 / Angular20 / angular v20
+    // "angular version will be 20" / "do the angular version 20" / "angular ver = 20.3.1"
+    new RegExp(`\\b${fw}\\b${gap}\\b(?:version|ver)\\b${gap}${verNum}\\b`, 'i'),
+    // "version of angular should be 20" / "version for angular is 20"
     new RegExp(
-      `\\b${fw}\\s*[-:]?\\s*(?:version|ver|v)?\\s*[:=]?\\s*v?(\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?\\b`,
+      `\\b(?:version|ver)\\b${gap}\\b(?:of|for|to)?\\s*${fw}\\b${gap}${verNum}\\b`,
+      'i'
+    ),
+    // "version 20 … angular" / "version should be 20 for angular"
+    new RegExp(
+      `\\b(?:version|ver)\\b${gap}${verNum}\\b${gap}\\b(?:of|for|with|on|in|to)?\\s*${fw}\\b`,
+      'i'
+    ),
+    // "angular 20" / "angular - 20" / "angular:20" / "angular v20" / "to angular 20"
+    new RegExp(
+      `\\b${fw}\\s*[-:]?\\s*(?:version|ver|v)?\\s*[:=]?\\s*${verNum}\\b`,
       'i'
     ),
     // glued: angular20 / react18
-    new RegExp(`\\b${fw}(\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?\\b`, 'i'),
+    new RegExp(`\\b${fw}(\\d{1,2})(?:\\.(\\d{1,3}))?(?:\\.(\\d{1,3}))?\\b`, 'i'),
     // @angular/core ^19 / react@18.3.1
+    fw === 'angular'
+      ? new RegExp(`@angular\\/(?:core|cli)\\s*[:=]?\\s*['"]?\\^?${verNum}`, 'i')
+      : new RegExp(`(?:react-dom|react)\\s*@\\s*${verNum}`, 'i'),
+    // "convert/migrate/target/use … angular 20"
     new RegExp(
-      fw === 'angular'
-        ? /@angular\/(?:core|cli)\s*[:=]?\s*['"]?\^?v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/i
-        : /(?:react-dom|react)\s*@\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/i
+      `(?:convert|migrate|upgrade|downgrade|target|use|using|on|with|to|into|in|make|set|keep|do)\\s+(?:to\\s+|into\\s+|in\\s+|the\\s+|it\\s+)?${fw}\\s*[-:]?\\s*(?:version\\s+)?${verNum}\\b`,
+      'i'
     ),
-    // convert/migrate/target/... to|into|in angular 20
+    // "make/set/keep/use angular … 20" with soft gap (no required "version" word)
     new RegExp(
-      `(?:convert|migrate|upgrade|downgrade|target|use|using|on|with|to|into|in)\\s+(?:to\\s+|into\\s+|in\\s+)?${fw}\\s*[-:]?\\s*(?:version\\s+)?v?(\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?\\b`,
+      `(?:make|set|keep|use|using|target|to|into|on|with|do)\\s+(?:the\\s+|it\\s+)?${fw}\\b${gap}${verNum}\\b`,
       'i'
     )
   ];
 
-  // When the UI target is this framework, also accept bare version phrases:
-  // "version 20", "ver 20", "v20", "use 20.3"
+  // When UI target is this framework, also accept bare version phrases
   if (targetingThis) {
     patterns.push(
-      /\b(?:version|ver)\s*[:=]?\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\b/i,
-      /\bv(\d+)(?:\.(\d+))?(?:\.(\d+))?\b/i,
-      /(?:use|using|target|to|into|on)\s+v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\b/i
+      // "version will be 20" / "version should be 20" / "ver is 20"
+      new RegExp(`\\b(?:version|ver)\\b${gap}${verNum}\\b`, 'i'),
+      /\b(?:version|ver)\s*[:=]?\s*v?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?\b/i,
+      /\bv(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?\b/i,
+      /(?:use|using|target|to|into|on|at|as)\s+v?(\d{1,2})(?:\.(\d{1,3}))?(?:\.(\d{1,3}))?\b/i
     );
   }
 
   for (const re of patterns) {
-    const m = text.match(re);
+    const m = normalized.match(re);
     if (!m) continue;
     const major = Number(m[1]);
     if (!isPlausibleMajor(fw, major)) continue;

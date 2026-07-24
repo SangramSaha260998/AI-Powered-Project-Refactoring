@@ -1835,8 +1835,8 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
-- Map lucide-react icons to @lucide/angular SVG icons (Angular target; NOT legacy lucide-angular). Every icon must render as \`<svg lucideXxx></svg>\`. For React target keep lucide-react.
-- For Angular: NEVER plan LucideIconModule / LucideAngularModule or \`<lucide-*>\` tags. Plan per-icon Lucide* imports + SVG markup only.
+- Map lucide-react icons to plain inline SVG markup in Angular (NO @lucide/angular / lucide-angular / lucide-react packages). Every icon must be a real <svg xmlns=...>...</svg> with Lucide paths. For React target keep lucide-react.
+- For Angular: NEVER plan Lucide* imports, LucideIconModule, <lucide-*> tags, or <svg lucideXxx>. Plan inline SVG only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
 - For Angular: routes import page components from their own files — never from app.component.ts.
 `;
@@ -2041,13 +2041,13 @@ CRITICAL RULES:
 14. Getters are NOT callable in templates: use avatarClasses not avatarClasses(). Methods that need () must be real methods, not get accessors.
 15. Do not reference private fields in templates — use protected or public.
 16. Path alias @/ maps to src/ (e.g. import { cn } from '@/lib/utils'). Also emit the actual src/lib/*.ts files in the plan.
-17. Replace lucide-react with @lucide/angular for Angular (NOT legacy lucide-angular). EVERY icon must be an SVG: import LucideHome and render <svg lucideHome></svg> — never <Home />, never <lucide-home>. Do NOT import @radix-ng/* or other invented packages.
+17. Convert lucide-react icons to plain inline <svg>…</svg> in Angular (NO @lucide/angular, lucide-angular, or lucide-react in Angular package.json). NEVER use <Home />, <lucide-home>, or <svg lucideHome>. Do NOT import @radix-ng/* or other invented packages.
 18. app.component.ts must ONLY be the root shell component — never put ErrorHandler, provideHttpClient, or EnvironmentProviders inside a @Component.
 19. app.config.ts / routing providers belong in src/app/app.config.ts and src/app/app.routes.ts only.
 20. Self-closing custom elements are invalid in Angular templates: write proper open/close tags — never <Search /> for a component selector.
 21. For React: do not leave Angular decorators, templateUrl, or @Component in output files.
 22. Services use providedIn: 'root' (never 'server').
-23. ALL LUCIDE ICONS → SVG: For @lucide/angular FORBIDDEN: LucideIconModule, LucideAngularModule, <lucide-home>, <lucide-logout>, React <Home />, [lucide]="...", lucideXxx inside [class] strings. REQUIRED: import LucideHome / LucideLogOut into standalone imports and render ONLY <svg lucideHome></svg> / <svg lucideLogOut></svg>. Merge duplicate @lucide/angular imports. NEVER put cn() in imports[].
+23. ALL LUCIDE ICONS → PLAIN INLINE SVG: FORBIDDEN in Angular: @lucide/angular, lucide-angular, lucide-react, LucideHome imports, <lucide-home>, <svg lucideHome>, [lucide]="...". REQUIRED: real <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ...><path .../></svg> with Lucide paths. NEVER put cn() in imports[].
 24. Angular templates: no React leftovers, no arrow functions (=>), no TypeScript casts (as Foo) — use class methods and $any($event.target).value. No bare cn(...) unless the class has \`protected readonly cn = cn\`. No empty (click)="", no \`return\` / multi-statement JS in bindings — call one class method. No RenderFragment / IconDefinition / Input<T> property types. No Location.pathname (use Location.path()). No @import "tw-animate-css" in .scss. Child tags must match selector (app-*) and be in imports[].
 25. Every template binding target (property/method) MUST be declared on the class as public or protected. Promote private members used by templates.
 26. Do not declare a field and a getter with the same name (e.g. canScrollPrev).

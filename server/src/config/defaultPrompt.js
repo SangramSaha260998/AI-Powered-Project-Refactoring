@@ -246,27 +246,27 @@ export const REACT_TO_ANGULAR_PROMPT = `
 - If a Radix/shadcn primitive has no Angular equivalent, rewrite it as a plain
   standalone Angular component with @Input/@Output — do not fake a module.
 
-### @lucide/angular (Angular 22) — REQUIRED: ALL ICONS → SVG
-- EVERY lucide-react icon MUST become an SVG icon in Angular. No exceptions.
-- Package is \`@lucide/angular\` (NOT legacy \`lucide-angular\`, NOT \`lucide-react\`).
-- FORBIDDEN exports: LucideIconModule, LucideAngularModule, LucideAngularComponent (legacy).
-- FORBIDDEN template tags: \`<lucide-home>\`, \`<lucide-logout>\`, \`<Home />\`, \`<LogOut />\` —
-  never keep React lucide components or legacy element selectors.
-- REQUIRED conversion for every icon:
-  React \`import { Home, LogOut } from 'lucide-react'\` + \`<Home className="..." />\`
-  → Angular \`import { LucideHome, LucideLogOut } from '@lucide/angular'\`
-  → list in \`imports: [LucideHome, LucideLogOut]\`
-  → render ONLY as SVG: \`<svg lucideHome class="..."></svg>\` /
-  \`<svg lucideLogOut class="..."></svg>\`
-  (directive attribute = \`lucide\` + PascalCase icon name).
-- Prefer static SVG icons over dynamic \`[lucideIcon]\`. Use dynamic only when the
-  icon name is truly runtime-variable: \`<svg [lucideIcon]="'home'"></svg>\` with
-  \`provideLucideIcons(...)\`.
-- Map names: Home → LucideHome / lucideHome, LogOut → LucideLogOut / lucideLogOut,
-  Search → LucideSearch / lucideSearch.
+### Lucide icons → plain inline SVG (REQUIRED — no lucide Angular package)
+- EVERY \`lucide-react\` icon MUST become a **real inline \`<svg>\`** in Angular templates.
+- FORBIDDEN packages in Angular output: \`@lucide/angular\`, \`lucide-angular\`, \`lucide-react\`,
+  \`lucide\`. Do NOT add them to package.json. Do NOT import them.
+- FORBIDDEN: \`LucideHome\` imports, \`<svg lucideHome>\` directives, \`[lucideIcon]\`,
+  \`<lucide-home>\`, React \`<Home />\` component tags.
+- REQUIRED conversion:
+  React \`import { Home, LogOut } from 'lucide-react'\` + \`<Home className="w-4 h-4" />\`
+  → Angular (no import) +
+  \`\`\`html
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+       fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+       stroke-linejoin="round" class="w-4 h-4" aria-hidden="true">
+    <!-- Lucide path children for that icon -->
+  </svg>
+  \`\`\`
+- Copy the official Lucide SVG paths for each icon (stroke icons, viewBox 0 0 24 24,
+  stroke="currentColor"). Preserve className → class. No Angular icon library.
 
-### Angular 22 quality
-- Target Angular 22 APIs only (signals, inject(), standalone, @if/@for).
+### Angular quality
+- Target the mandated Angular version APIs only (signals, inject(), standalone, @if/@for).
 - Follow page-folder structure under src/app/pages (common|auth|admin) plus core|shared.
 - Strong typing; matching .ts/.html/.scss; Tailwind in templates; no hallucinated modules.
 - Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
@@ -289,15 +289,13 @@ export const REACT_TO_ANGULAR_PROMPT = `
   \`Location.path()\` or \`Router.url\`).
 - NEVER \`@import "tw-animate-css"\` (or other Tailwind v4-only CSS) into \`.scss\` —
   Angular Sass cannot parse \`@theme\` / \`@utility\` / \`@property\`. Use Tailwind utilities only.
-- Lucide: only \`<svg lucideHome></svg>\` (or \`[lucideIcon]\` when truly dynamic). Never
-  \`[lucide]\`, never stick \`lucideXxx\` inside a \`[class]\` string.
+- Icons: plain inline \`<svg>...</svg>\` only — never lucide packages or lucideXxx attributes.
 - Child tags MUST match the child's \`selector\` (prefer \`app-*\`) and be listed in \`imports\`.
 - No \`private\` members in templates. No field + getter with the same name.
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.
 - Well-formed HTML; no self-closing custom elements (\`<app-x></app-x>\`).
-- Merge duplicate \`@lucide/angular\` import lines into one.
 ### Imports & routing
 - \`@/\` → \`src/\`. Prefer relative imports under src/app/.
 - Routes import each page from ITS OWN file — NEVER from './app.component'.

@@ -1,6 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import { ensureDirectoryExists } from '../utils/file.js';
+import {
+  buildInlineLucideSvg,
+  rewriteHtmlLucideToInlineSvg,
+  stripLucidePackageUsage,
+  normalizeLucideSlug,
+  resolveLucidePascalName
+} from './lucideInlineSvg.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
@@ -210,57 +217,9 @@ function classHasMember(source, name) {
  * Map legacy/AI lucide tag slugs to real Lucide icon slugs (kebab-case).
  * AI often emits <lucide-logout> instead of log-out.
  */
-const LUCIDE_SLUG_ALIASES = {
-  logout: 'log-out',
-  login: 'log-in',
-  signin: 'log-in',
-  signout: 'log-out',
-  edit3: 'edit-3',
-  edit2: 'edit-2',
-  trash2: 'trash-2',
-  checkcircle: 'check-circle',
-  checkcircle2: 'check-circle-2',
-  alertcircle: 'alert-circle',
-  helpcircle: 'help-circle',
-  xcircle: 'x-circle',
-  usercog: 'user-cog',
-  usercheck: 'user-check',
-  userplus: 'user-plus',
-  userminus: 'user-minus',
-  shieldcheck: 'shield-check',
-  shieldalert: 'shield-alert',
-  eyeoff: 'eye-off',
-  chevrondown: 'chevron-down',
-  chevronup: 'chevron-up',
-  chevronleft: 'chevron-left',
-  chevronright: 'chevron-right',
-  arrowleft: 'arrow-left',
-  arrowright: 'arrow-right',
-  morehorizontal: 'more-horizontal',
-  morevertical: 'more-vertical'
-};
-
-function normalizeLucideSlug(rawSlug) {
-  let slug = String(rawSlug || '')
-    .replace(/^lucide-?/i, '')
-    .replace(/_/g, '-')
-    .trim()
-    .toLowerCase();
-  if (!slug) return 'circle';
-  if (LUCIDE_SLUG_ALIASES[slug]) return LUCIDE_SLUG_ALIASES[slug];
-  // logout already handled; also collapse accidental camelCase leftovers
-  const compact = slug.replace(/-/g, '');
-  if (LUCIDE_SLUG_ALIASES[compact]) return LUCIDE_SLUG_ALIASES[compact];
-  return slug;
-}
-
 function lucideSlugToSymbolAndAttr(rawSlug) {
   const slug = normalizeLucideSlug(rawSlug);
-  const pascal = slug
-    .split('-')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join('');
+  const pascal = resolveLucidePascalName(slug);
   return {
     slug,
     symbol: `Lucide${pascal}`,
@@ -269,44 +228,11 @@ function lucideSlugToSymbolAndAttr(rawSlug) {
 }
 
 /**
- * Rewrite forbidden legacy / React lucide usages into @lucide/angular SVG form:
- *   <lucide-logout class="x"></lucide-logout>
- *   <LucideLogOut class="x" />
- * into:
- *   <svg lucideLogOut class="x"></svg>
+ * Rewrite ALL Lucide / React-icon leftovers into plain inline <svg> markup.
+ * Never emit @lucide/angular directives.
  */
-function rewriteLegacyLucideHtmlTags(html) {
-  if (!html || !/lucide/i.test(html)) return html;
-
-  let updated = html;
-
-  // Legacy element tags: <lucide-foo ...>…</lucide-foo> or <lucide-foo .../>
-  updated = updated.replace(
-    /<lucide-([a-z0-9-]+)([^>]*?)(?:\/>|>([\s\S]*?)<\/lucide-\1>)/gi,
-    (_full, slug, attrs) => {
-      const { attr } = lucideSlugToSymbolAndAttr(slug);
-      const cleanAttrs = normalizeLucideSvgAttrs(attrs);
-      return `<svg ${attr}${cleanAttrs ? ` ${cleanAttrs}` : ''}></svg>`;
-    }
-  );
-  updated = updated.replace(/<\/lucide-[a-z0-9-]+>/gi, '');
-
-  // PascalCase component tags AI sometimes emits: <LucideHome ...></LucideHome> / />
-  updated = updated.replace(
-    /<(Lucide[A-Z][A-Za-z0-9]*)([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g,
-    (_full, symbol, attrs) => {
-      if (symbol === 'LucideIcon' || symbol === 'LucideIconNode') return _full;
-      const attr = `lucide${symbol.slice('Lucide'.length)}`;
-      const cleanAttrs = normalizeLucideSvgAttrs(attrs);
-      return `<svg ${attr}${cleanAttrs ? ` ${cleanAttrs}` : ''}></svg>`;
-    }
-  );
-
-  // React leftover self-closing icons that kept lucide-react names as elements when
-  // the file already imports Lucide* — e.g. <Home class="x" /> is too ambiguous;
-  // only rewrite when written as lucide-prefixed or Lucide-prefixed (handled above).
-
-  return updated;
+function rewriteLegacyLucideHtmlTags(html, source = '') {
+  return rewriteHtmlLucideToInlineSvg(html, source);
 }
 
 function normalizeLucideSvgAttrs(attrs) {
@@ -318,131 +244,25 @@ function normalizeLucideSvgAttrs(attrs) {
 }
 
 /**
- * lucide-react exports Home/Search; @lucide/angular exports LucideHome/LucideSearch.
- * Rename named imports and matching @Component imports entries.
+ * @deprecated — Angular output must not use @lucide/angular. Kept as no-op strip.
  */
 function renameLucideReactSymbolsToAngular(source) {
-  if (!/from\s*['"]@lucide\/angular['"]/.test(source)) return source;
-
-  const renamed = new Map(); // Home → LucideHome
-
-  let updated = source.replace(
-    /import\s*\{([^}]*)\}\s*from\s*['"]@lucide\/angular['"]\s*;?/g,
-    (full, names) => {
-      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
-      const mapped = parts.map((p) => {
-        const isType = /^type\s+/.test(p);
-        const bare = p.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
-        const alias = p.includes(' as ') ? p.split(/\s+as\s+/)[1].trim() : null;
-        if (
-          bare.startsWith('Lucide') ||
-          bare === 'provideLucideIcons' ||
-          bare === 'provideLucideConfig' ||
-          bare === 'LucideIcon' ||
-          bare === 'LucideIconNode'
-        ) {
-          return p;
-        }
-        const angularName = `Lucide${bare}`;
-        renamed.set(bare, angularName);
-        if (alias) {
-          renamed.set(alias, angularName);
-          return `${isType ? 'type ' : ''}${angularName}`;
-        }
-        return `${isType ? 'type ' : ''}${angularName}`;
-      });
-      return `import { ${[...new Set(mapped)].join(', ')} } from '@lucide/angular';`;
-    }
-  );
-
-  if (renamed.size === 0) return updated;
-
-  // Update @Component({ imports: [Home, ...] }) → [LucideHome, ...]
-  updated = updated.replace(
-    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
-    (full, start, mid, end) => {
-      const items = mid.split(',').map((s) => s.trim()).filter(Boolean).map((item) => {
-        return renamed.get(item) || item;
-      });
-      return `${start}${items.join(', ')}${end}`;
-    }
-  );
-
-  return updated;
+  return stripLucidePackageUsage(source);
 }
 
 /**
- * Ensure every lucideXxx attribute / LucideXxx usage has a matching import + decorator import.
+ * Strip Lucide package usage; icons are inlined as real SVG in templates.
  */
 function syncLucideImportsFromTemplate(source, html) {
-  const symbols = new Set();
-
-  for (const m of html.matchAll(/\s(lucide[A-Z][A-Za-z0-9]*)\b/g)) {
-    const attr = m[1];
-    symbols.add(`Lucide${attr.slice('lucide'.length)}`);
-  }
-  for (const m of html.matchAll(/<lucide-([a-z0-9-]+)/gi)) {
-    symbols.add(lucideSlugToSymbolAndAttr(m[1]).symbol);
-  }
-  // Keep already-imported Lucide* that still appear as values
-  for (const m of source.matchAll(/\b(Lucide[A-Z][A-Za-z0-9]*)\b/g)) {
-    if (['LucideIcon', 'LucideIconNode', 'LucideIconData'].includes(m[1])) continue;
-    // Only keep if referenced in template attrs we care about — skip unused later via warnings
-  }
-
-  let updated = source;
-  for (const sym of symbols) {
-    updated = ensureImport(updated, sym, '@lucide/angular');
-    updated = ensureDecoratorImport(updated, sym);
-  }
-  // Drop LucideIconModule-style leftovers again after sync
-  updated = repairLucideAngularImports(updated);
-  return updated;
+  void html;
+  return stripLucidePackageUsage(source);
 }
 
 /**
- * Fix hallucinated @lucide/angular module-style imports.
- * LucideIconModule / LucideAngularModule do not exist on @lucide/angular.
+ * Remove any remaining Lucide module / package imports from the component.
  */
 function repairLucideAngularImports(source) {
-  const hallucinated = ['LucideIconModule', 'LucideAngularModule', 'LucideAngularComponent'];
-  let updated = source;
-
-  for (const sym of hallucinated) {
-    if (new RegExp(`\\b${sym}\\b`).test(updated)) {
-      updated = removeNamedImport(updated, sym, '@lucide/angular');
-      updated = removeNamedImport(updated, sym, 'lucide-angular');
-      updated = updated.replace(
-        /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
-        (full, start, mid, end) => {
-          const items = mid
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .filter((item) => item !== sym && !item.startsWith(`${sym} `));
-          return `${start}${items.join(', ')}${end}`;
-        }
-      );
-    }
-  }
-
-  // LucideIcon is a directive/component value in @lucide/angular — but AI sometimes
-  // treats it as a type-only import inside NgModules. Strip from NgModule imports.
-  if (/@NgModule\s*\(/.test(updated) && /\bLucideIcon\b/.test(updated)) {
-    updated = updated.replace(
-      /(@NgModule\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
-      (full, start, mid, end) => {
-        const items = mid
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .filter((item) => item !== 'LucideIcon');
-        return `${start}${items.join(', ')}${end}`;
-      }
-    );
-  }
-
-  return updated;
+  return stripLucidePackageUsage(source);
 }
 
 /**
@@ -743,30 +563,18 @@ function repairAngularTemplateHtml(html, source) {
     '$1$2'
   );
 
-  // Wrong dynamic binding [lucide]="..." → static attr or [lucideIcon]
+  // Wrong dynamic binding [lucide]="..." → real inline SVG when resolvable
   updated = updated.replace(
-    /<svg([^>]*)\s\[lucide\]="([^"]*)"([^>]*)>/gi,
+    /<svg([^>]*)\s\[lucide(?:Icon)?\]="([^"]*)"([^>]*)>([\s\S]*?)<\/svg>/gi,
     (_full, pre, expr, post) => {
       const staticOne = expr.match(/^\s*'([A-Za-z0-9-]+)'\s*$/);
       const ternarySame = expr.match(/^\s*[^?]+\?\s*'([A-Za-z0-9-]+)'\s*:\s*'([A-Za-z0-9-]+)'\s*$/);
-      if (staticOne) {
-        const { attr } = lucideSlugToSymbolAndAttr(staticOne[1]);
-        return `<svg${pre} ${attr}${post}>`;
-      }
+      if (staticOne) return buildInlineLucideSvg(staticOne[1], `${pre} ${post}`);
       if (ternarySame && ternarySame[1].toLowerCase() === ternarySame[2].toLowerCase()) {
-        const { attr } = lucideSlugToSymbolAndAttr(ternarySame[1]);
-        return `<svg${pre} ${attr}${post}>`;
+        return buildInlineLucideSvg(ternarySame[1], `${pre} ${post}`);
       }
-      // Dynamic: use lucideIcon with kebab/lowercase names
-      const dyn = expr
-        .replace(/'([A-Z][A-Za-z0-9]*)'/g, (_, name) => {
-          const kebab = name
-            .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
-            .replace(/_/g, '-')
-            .toLowerCase();
-          return `'${kebab}'`;
-        });
-      return `<svg${pre} [lucideIcon]="${dyn}"${post}>`;
+      // Truly dynamic — fall back to a neutral circle SVG (no lucide package)
+      return buildInlineLucideSvg('circle', `${pre} ${post}`);
     }
   );
 
@@ -1174,11 +982,7 @@ function repairAngularComponentFile(tsPath) {
     }
   }
 
-  // lucide-react / legacy lucide-angular → @lucide/angular (Angular 22 compatible)
-  source = rewriteImportModule(source, 'lucide-react', '@lucide/angular');
-  source = rewriteImportModule(source, 'lucide-angular', '@lucide/angular');
-  source = renameLucideReactSymbolsToAngular(source);
-  source = repairLucideAngularImports(source);
+  // Keep lucide imports until templates are rewritten to inline SVG, then strip packages
   source = repairEmblaImports(source);
   source = repairHallucinatedAngularApis(source);
   source = sanitizeStandaloneImports(source);
@@ -1351,12 +1155,14 @@ function repairAngularComponentFile(tsPath) {
       continue;
     }
     let html = fs.readFileSync(targetHtml, 'utf-8');
-    // Self-closing capitalized / unknown components
-    html = html.replace(/<([A-Z][\w.-]*)([^>]*?)\/>/g, '<$1$2></$1>');
-    // Legacy lucide-angular element tags → @lucide/angular <svg lucideXxx>
-    html = rewriteLegacyLucideHtmlTags(html);
     // React leftover event / form patterns
     html = repairAngularTemplateHtml(html, source);
+    // ALL lucide / React icon tags → plain inline <svg> (while lucide imports still visible)
+    html = rewriteLegacyLucideHtmlTags(html, source);
+    // Then drop every lucide package import — no @lucide/angular in output
+    source = stripLucidePackageUsage(source);
+    // Remaining self-closing capitalized custom elements
+    html = html.replace(/<([A-Z][\w.-]*)([^>]*?)\/>/g, '<$1$2></$1>');
     // Getters are not callable
     const getterNames = [...source.matchAll(/\bget\s+([A-Za-z_]\w*)\s*\(/g)].map((m) => m[1]);
     for (const name of getterNames) {
@@ -1395,8 +1201,8 @@ function repairAngularComponentFile(tsPath) {
     }
     // Expose cn / className / HostListener / isOpen bridges
     source = ensureTemplateMembers(source, html);
-    // Sync Lucide icon imports from rewritten template
-    source = syncLucideImportsFromTemplate(source, html);
+    // Ensure lucide packages stay removed after template sync
+    source = stripLucidePackageUsage(source);
     // Import custom-element children used in template (and align selectors)
     const srcRoot = (() => {
       let dir = path.dirname(tsPath);
@@ -1742,23 +1548,15 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
       pkg.dependencies['@angular/animations'] = coreVer;
     }
 
-    // Remove legacy lucide-angular (peers only up to Angular 19 → ERESOLVE on Angular 22)
+    // Remove ALL lucide packages from Angular output — icons are plain inline SVG
     delete pkg.dependencies['lucide-angular'];
     delete pkg.devDependencies['lucide-angular'];
-
-    const usesLucide =
-      srcDeps['lucide-react'] ||
-      srcDeps['lucide-angular'] ||
-      srcDeps['@lucide/angular'] ||
-      walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts') || n.endsWith('.html')).some((f) =>
-        /lucide-react|lucide-angular|@lucide\/angular/.test(fs.readFileSync(f, 'utf-8'))
-      );
-
-    if (usesLucide) {
-      // @lucide/angular peers Angular 17+ (compatible with Angular 22 workspaces)
-      // Legacy lucide-angular@0.x only peers up to Angular 19 and causes ERESOLVE.
-      pkg.dependencies['@lucide/angular'] = '^1.23.0';
-    }
+    delete pkg.dependencies['@lucide/angular'];
+    delete pkg.devDependencies['@lucide/angular'];
+    delete pkg.dependencies['lucide-react'];
+    delete pkg.devDependencies['lucide-react'];
+    delete pkg.dependencies.lucide;
+    delete pkg.devDependencies.lucide;
   }
 
   if (targetFramework === 'react') {
@@ -1801,10 +1599,16 @@ function copySourceLibs(destPath, sourceFilesMap) {
     }
 
     let adapted = content
-      .replace(/from\s*['"]lucide-react['"]/g, "from '@lucide/angular'")
-      .replace(/from\s*['"]lucide-angular['"]/g, "from '@lucide/angular'")
+      .replace(/from\s*['"]lucide-react['"]/g, "from '__REMOVED_LUCIDE__'")
+      .replace(/from\s*['"]lucide-angular['"]/g, "from '__REMOVED_LUCIDE__'")
+      .replace(/from\s*['"]@lucide\/angular['"]/g, "from '__REMOVED_LUCIDE__'")
       .replace(/from\s*['"]react['"]/g, "from '@angular/core'") // weak; skip if hooks file
       .replace(/import\s+React\s*,?\s*/g, '');
+
+    // Don't copy files that still depend on lucide packages — icons are inlined in templates
+    if (/__REMOVED_LUCIDE__/.test(adapted)) {
+      continue;
+    }
 
     // Don't blindly convert React hooks files into Angular — skip pure React hook modules
     if (/useState|useEffect|useMemo|useCallback|useRef/.test(content) && /from\s*['"]react['"]/.test(content)) {
@@ -1843,9 +1647,7 @@ function rewriteAtAliasImportsInTree(destPath) {
     let content = fs.readFileSync(file, 'utf-8');
     const original = content;
 
-    content = content.replace(/from\s*['"]lucide-react['"]/g, "from '@lucide/angular'");
-    content = content.replace(/from\s*['"]lucide-angular['"]/g, "from '@lucide/angular'");
-    content = renameLucideReactSymbolsToAngular(content);
+    content = stripLucidePackageUsage(content);
     content = content.replace(
       /import\s*\{[^}]+\}\s*from\s*['"]@radix-ng\/[^'"]+['"]\s*;?/g,
       (m) => `// Removed unsupported package import: ${m.replace(/\n/g, ' ')}`

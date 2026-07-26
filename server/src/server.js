@@ -77,7 +77,7 @@ console.log(
 
 if (!anyCloudKeyConfigured && !isProviderConfigured('ollama')) {
   console.warn('WARNING: No API keys configured for any cloud AI provider.');
-  console.warn('Set OPENROUTER_API_KEY, GENAI_API_KEY, and/or OLLAMA_API_KEY in server/.env.');
+  console.warn('Set OPENROUTER_API_KEY, GENAI_API_KEY, GROQ_API_KEY, and/or OLLAMA_API_KEY in server/.env.');
 }
 
 // ---------------------------------------------------------------------------

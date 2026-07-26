@@ -47,6 +47,7 @@ export class App {
   aiProviders = [
     { id: 'openrouter', label: 'OpenRouter' },
     { id: 'genai', label: 'Google Gemini' },
+    { id: 'groq', label: 'Groq' },
     { id: 'ollama', label: 'Ollama Cloud' },
   ];
 
@@ -54,6 +55,7 @@ export class App {
   providerModels: Record<string, ModelOption[]> = {
     openrouter: [],
     genai: [],
+    groq: [],
     ollama: [],
   };
 
@@ -95,7 +97,7 @@ export class App {
   }
 
   private isDynamicProvider(provider: string): boolean {
-    return provider === 'openrouter' || provider === 'genai' || provider === 'ollama';
+    return provider === 'openrouter' || provider === 'genai' || provider === 'groq' || provider === 'ollama';
   }
 
   /** Fetch models for a provider via the backend proxy. */

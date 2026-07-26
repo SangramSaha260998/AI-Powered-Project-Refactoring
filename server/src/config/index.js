@@ -85,6 +85,13 @@ export const PROVIDERS = {
     // Cloud needs an API key; local mode can run without one.
     requiresApiKey: false,
     models: []
+  },
+  groq: {
+    name: 'Groq',
+    envPrefix: 'GROQ',
+    defaultBaseURL: 'https://api.groq.com/openai/v1',
+    defaultModel: 'llama-3.1-8b-instant',
+    models: []
   }
 };
 
@@ -112,6 +119,7 @@ export const DEFAULT_PROVIDER_FALLBACK_CHAIN = [
   'genai',
   'openrouter',
   'ollama',
+  'groq',
 ];
 
 /**
@@ -166,6 +174,15 @@ export function isProviderConfigured(provider) {
       hasKey ||
       String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true'
     );
+  }
+
+  // Groq: not considered configured unless GROQ_API_KEY is set
+  if (provider === 'groq') {
+    const apiKey = process.env.GROQ_API_KEY || '';
+    return apiKey
+      .split(',')
+      .map((k) => k.trim())
+      .some(Boolean);
   }
 
   if (prov.requiresApiKey === false) return true;

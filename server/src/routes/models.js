@@ -5,6 +5,7 @@ const router = Router();
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/frontend/v1/catalog/models';
 const OLLAMA_CLOUD_TAGS_URL = 'https://ollama.com/api/tags';
 const GENAI_MODELS_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
 
 function firstEnvKey(envName) {
   return (process.env[envName] || '')
@@ -202,6 +203,95 @@ router.get('/models/genai', async (req, res) => {
     console.error('Gemini models fetch failed:', err);
     res.status(502).json({
       error: err.message || 'Failed to fetch Gemini models.',
+    });
+  }
+});
+
+/**
+ * Known best/popular Groq free models to sort to the top of the dropdown.
+ * Ordered by quality/speed preference.
+ */
+const TOP_GROQ_MODELS = [
+  'llama-3.3-70b-versatile',
+  'llama-3.3-70b-specdec',
+  'llama-3.1-8b-instant',
+  'mixtral-8x7b-32768',
+  'gemma2-9b-it',
+  'llama-3.2-90b-vision-preview',
+  'llama-3.2-11b-vision-preview',
+  'llama-3.2-3b-preview',
+  'llama-3.2-1b-preview',
+];
+
+/**
+ * Models to exclude (non-chat, embeddings, etc.)
+ */
+const EXCLUDED_GROQ_MODELS = new Set([
+  'whisper-large-v3',
+  'whisper-large-v3-turbo',
+  'distil-whisper-large-v3-en',
+  'llama-guard-3-8b',
+]);
+
+/**
+ * GET /api/models/groq
+ * Fetches all models from Groq API and returns them sorted with best models first.
+ * Groq doesn't expose an is_free flag in their API, but all models are free-tier accessible.
+ */
+router.get('/models/groq', async (req, res) => {
+  try {
+    const apiKey = firstEnvKey('GROQ_API_KEY');
+    if (!apiKey) {
+      return res.status(503).json({
+        error: 'GROQ_API_KEY is not set. Add it in server/.env to load Groq models.',
+      });
+    }
+
+    const response = await fetch(GROQ_MODELS_URL, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: `Failed to fetch Groq models (HTTP ${response.status}).`,
+      });
+    }
+
+    const payload = await response.json();
+    const models = payload?.data;
+
+    if (!Array.isArray(models)) {
+      return res.status(502).json({ error: 'Unexpected Groq models response shape.' });
+    }
+
+    // Filter out non-chat models and sort with best models first
+    const mapped = models
+      .filter((model) => {
+        const id = String(model?.id || '');
+        // Filter out whisper/llama-guard (non-chat) models
+        return !EXCLUDED_GROQ_MODELS.has(id) && !id.includes('whisper');
+      })
+      .map((model) => ({
+        id: model.id,
+        label: model.id,
+      }))
+      .filter((m) => m.id)
+      .sort((a, b) => {
+        const aIdx = TOP_GROQ_MODELS.indexOf(a.id);
+        const bIdx = TOP_GROQ_MODELS.indexOf(b.id);
+        // Known top models first, sorted by their index in TOP_GROQ_MODELS
+        if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+        if (aIdx !== -1) return -1;
+        if (bIdx !== -1) return 1;
+        // Alphabetical for the rest
+        return a.id.localeCompare(b.id);
+      });
+
+    res.json({ models: mapped });
+  } catch (err) {
+    console.error('Groq models fetch failed:', err);
+    res.status(502).json({
+      error: err.message || 'Failed to fetch Groq models.',
     });
   }
 });

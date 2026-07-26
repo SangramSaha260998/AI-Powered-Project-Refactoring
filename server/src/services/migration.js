@@ -1,6 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import AdmZip from 'adm-zip';
 import OpenAI from 'openai';
 import {
@@ -1120,6 +1123,30 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Angular core/shared folder injection (from server/angular_required)
+// ---------------------------------------------------------------------------
+
+/**
+ * Recursively copies all files from the angular_required source directory
+ * into src/core/shared of the generated Angular project.
+ * This ensures the shared utilities, directives, pipes, validators, models,
+ * components, and animations are always available in every generated project.
+ */
+function injectAngularCoreSharedFiles(destPath) {
+  const srcDir = path.resolve(destPath, 'src', 'core', 'shared');
+  const angularRequiredDir = path.resolve(__dirname, '..', '..', 'angular_required');
+
+  if (!fs.existsSync(angularRequiredDir)) {
+    console.warn(`[core/shared] angular_required directory not found at ${angularRequiredDir}. Skipping.`);
+    return;
+  }
+
+  ensureDirectoryExists(srcDir);
+  fs.cpSync(angularRequiredDir, srcDir, { recursive: true });
+  console.log(`[core/shared] Copied angular_required files to ${path.relative(destPath, srcDir)}`);
+}
+
 function ensureAngularRuntimeFiles(destPath) {
   const srcAppDir = path.join(destPath, 'src', 'app');
   ensureDirectoryExists(srcAppDir);
@@ -1964,6 +1991,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   if (targetLower.includes('angular')) {
     console.log(`[${sessionId}] Injecting Angular workspace templates...`);
     injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
+    injectAngularCoreSharedFiles(migrationWorkspacePath);
   } else if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Injecting React workspace templates...`);
     injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
@@ -2361,6 +2389,7 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
     console.log(`[${sessionId}] Re-injecting Angular templates to ensure correct config files...`);
     injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
+    injectAngularCoreSharedFiles(migrationWorkspacePath);
     normalizeAngularComponentFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running Angular post-generation repairs...`);
     repairAngularWorkspace(migrationWorkspacePath, {

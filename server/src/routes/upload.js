@@ -134,6 +134,15 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     return res.status(400).json({ error: 'Could not validate the uploaded ZIP. Ensure it is a valid project archive.' });
   }
 
+  // Track if the client has disconnected so we can abort cleanup later
+  let clientDisconnected = false;
+  req.on('close', () => {
+    if (!res.writableFinished) {
+      clientDisconnected = true;
+      console.warn(`[${id}] Client disconnected during migration/download.`);
+    }
+  });
+
   try {
     const resultZipPath = await runMigrationPipeline(
       zipFile.path,
@@ -142,10 +151,19 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
       { fromTech, toTech, aiProvider, aiModel: aiModel || undefined }
     );
 
+    if (clientDisconnected) {
+      console.warn(`[${id}] Client already disconnected. Skipping download, keeping artifacts for retry.`);
+      return;
+    }
+
     res.download(resultZipPath, 'migrated_project.zip', (err) => {
       if (err) {
-        console.error(`[${id}] Download error:`, err);
-        // Keep artifacts on download failure so the run can be retried/debugged.
+        // ECONNABORTED is expected when the client disconnects or times out
+        if (err.code === 'ECONNABORTED' || err.message?.includes('aborted')) {
+          console.warn(`[${id}] Download aborted (client disconnected). Keeping artifacts for retry.`);
+        } else {
+          console.error(`[${id}] Download error:`, err);
+        }
         return;
       }
 
@@ -155,7 +173,9 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     });
   } catch (error) {
     console.error(`[${id}] Migration pipeline failed:`, error);
-    res.status(500).json({ error: error.message || 'The Agentic processing loop failed.' });
+    if (!clientDisconnected) {
+      res.status(500).json({ error: error.message || 'The Agentic processing loop failed.' });
+    }
     // Still clean up on pipeline failure so disk does not fill with partial runs
     cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
   }

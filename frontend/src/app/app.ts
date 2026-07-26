@@ -1,6 +1,7 @@
 import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
+import { timeout } from 'rxjs/operators';
 import { LoadingOverlayDirective } from './directives';
 
 type ThemeMode = 'light' | 'dark';
@@ -326,10 +327,13 @@ Final app must compile and run: npm install → ng serve`;
     }
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)
+    // Migration can take several minutes (AI processing + build), so allow a 15-minute timeout
     this.http
       .post(`${API_BASE}/migrate`, formData, {
         responseType: 'blob',
+        reportProgress: false,
       })
+      .pipe(timeout(15 * 60 * 1000)) // 15 minutes
       .subscribe({
         next: (blob: Blob) => {
           // Trigger browser download of the returned ZIP

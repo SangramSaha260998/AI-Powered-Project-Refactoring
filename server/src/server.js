@@ -88,6 +88,11 @@ function startServer(port, retries = 1) {
     console.log(`Migration Engine listening on http://localhost:${port}`);
   });
 
+  // Increase server timeout for long-running migrations (default is 120s)
+  server.timeout = 20 * 60 * 1000; // 20 minutes
+  server.keepAliveTimeout = 65 * 1000; // 65 seconds (must be > 60s for keepalive)
+  server.headersTimeout = 66 * 1000; // Must be > keepAliveTimeout
+
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE' && retries > 0) {
       console.warn(`Port ${port} is in use. Attempting to free it...`);

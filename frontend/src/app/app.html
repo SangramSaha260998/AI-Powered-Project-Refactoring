@@ -43,6 +43,18 @@
             }
           </select>
         </div>
+
+        @if (toTech()) {
+          <div class="control-field version-field">
+            <label for="targetVersion">Target Version:</label>
+            <select id="targetVersion" [value]="targetVersion()" (change)="onVersionChange($event)">
+              <option value="">-- Latest Stable --</option>
+              @for (ver of currentVersions; track ver.major) {
+                <option [value]="ver.version">{{ ver.label }}</option>
+              }
+            </select>
+          </div>
+        }
       </div>
     </section>
 

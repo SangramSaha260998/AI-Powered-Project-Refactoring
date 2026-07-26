@@ -6,6 +6,7 @@ import { LoadingOverlayDirective } from './directives';
 
 type ThemeMode = 'light' | 'dark';
 type ModelOption = { id: string; label: string };
+type VersionOption = { major: number; label: string; version: string };
 
 const THEME_STORAGE_KEY = 'migration-studio-theme';
 const API_BASE = 'http://localhost:5000/api';
@@ -26,6 +27,22 @@ export class App {
     { id: 2, technology: 'React' },
   ];
 
+  // Available versions per framework
+  frameworkVersions: Record<string, VersionOption[]> = {
+    Angular: [
+      { major: 22, label: 'Angular 22 (Latest)', version: '22' },
+      { major: 21, label: 'Angular 21', version: '21' },
+      { major: 20, label: 'Angular 20', version: '20' },
+      { major: 19, label: 'Angular 19', version: '19' },
+      { major: 18, label: 'Angular 18', version: '18' },
+    ],
+    React: [
+      { major: 19, label: 'React 19 (Latest)', version: '19' },
+      { major: 18, label: 'React 18', version: '18' },
+      { major: 17, label: 'React 17', version: '17' },
+    ],
+  };
+
   // AI providers configuration
   aiProviders = [
     { id: 'openrouter', label: 'OpenRouter' },
@@ -45,6 +62,7 @@ export class App {
   toTech = signal<string>('');
   aiProvider = signal<string>('');
   aiModel = signal<string>('');
+  targetVersion = signal<string>('');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
   prompt = signal<string>('');
@@ -174,7 +192,19 @@ Final app must compile and run: npm install → ng serve`;
   onToChange(event: Event) {
     const value = (event.target as HTMLSelectElement).value;
     this.toTech.set(value);
+    // Reset version when framework changes
+    this.targetVersion.set('');
     this.autoFillPromptIfSameFramework();
+  }
+
+  onVersionChange(event: Event) {
+    const value = (event.target as HTMLSelectElement).value;
+    this.targetVersion.set(value);
+  }
+
+  /** Returns available versions for the currently selected target framework. */
+  get currentVersions(): VersionOption[] {
+    return this.frameworkVersions[this.toTech()] || [];
   }
 
   /** Pre-fill the default strip-down prompt when source === target framework */
@@ -263,6 +293,7 @@ Final app must compile and run: npm install → ng serve`;
   private clearUiAfterSuccess() {
     this.fromTech.set('');
     this.toTech.set('');
+    this.targetVersion.set('');
     this.aiProvider.set('');
     this.aiModel.set('');
     this.prompt.set('');
@@ -324,6 +355,9 @@ Final app must compile and run: npm install → ng serve`;
     formData.append('aiProvider', this.aiProvider());
     if (this.aiModel()) {
       formData.append('aiModel', this.aiModel());
+    }
+    if (this.targetVersion()) {
+      formData.append('targetVersion', this.targetVersion());
     }
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)

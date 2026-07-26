@@ -86,6 +86,7 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
  *   - toTech   (string, optional): Target framework
  *   - aiProvider (string, optional): AI provider (e.g. 'openrouter', 'genai')
  *   - aiModel   (string, optional): AI model override
+ *   - targetVersion (string, optional): Explicit target major version (e.g. '22', '19')
  */
 router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   const userPrompt = (req.body.prompt || '').trim();
@@ -94,6 +95,7 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
   const toTech = req.body.toTech || 'Unknown';
   const aiProvider = (req.body.aiProvider || '').trim();
   const aiModel = req.body.aiModel || '';
+  const targetVersion = (req.body.targetVersion || '').trim();
 
   if (!zipFile || !userPrompt) {
     return res.status(400).json({ error: 'ZIP file and migration prompt are required.' });
@@ -148,7 +150,7 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
       zipFile.path,
       userPrompt,
       id,
-      { fromTech, toTech, aiProvider, aiModel: aiModel || undefined }
+      { fromTech, toTech, aiProvider, aiModel: aiModel || undefined, targetVersion: targetVersion || undefined }
     );
 
     if (clientDisconnected) {

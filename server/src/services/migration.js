@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
 import AdmZip from 'adm-zip';
 import OpenAI from 'openai';
 import {
@@ -1733,12 +1734,183 @@ export {
  * @param {string} [options.aiModel]    - AI model override
  * @returns {Promise<string>}         - Path to the final output ZIP
  */
+
+// -----------------------------------------------------------------------
+// Build verification — ensures the migrated project compiles before delivery
+// -----------------------------------------------------------------------
+const MAX_BUILD_RETRIES = 2;
+
+/**
+ * Run a shell command and return { stdout, stderr, exitCode }.
+ * Resolves even on non-zero exit so callers can inspect the error output.
+ */
+function runCommand(cmd, args, cwd, timeoutMs = 300000) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { cwd, timeout: timeoutMs, shell: true, windowsHide: true }, (error, stdout, stderr) => {
+      resolve({
+        exitCode: error ? error.code || 1 : 0,
+        stdout: stdout || '',
+        stderr: stderr || '',
+        error
+      });
+    });
+  });
+}
+
+/**
+ * Verify that the migrated project compiles by running npm ci + build.
+ * Returns { success: boolean, errors: string }.
+ */
+async function verifyBuild(workspacePath, targetTech, sessionId) {
+  const isAngular = targetTech.toLowerCase().includes('angular');
+  const isReact = targetTech.toLowerCase().includes('react');
+  const buildCmd = isAngular ? 'npx' : 'npm';
+  const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
+
+  console.log(`[${sessionId}] Build verification: running npm ci...`);
+  const installResult = await runCommand('npm', ['ci', '--prefer-offline'], workspacePath, 300000);
+  if (installResult.exitCode !== 0) {
+    const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
+    console.error(`[${sessionId}] npm ci failed:\n`, errOutput);
+    return { success: false, errors: `npm ci failed:\n${errOutput}` };
+  }
+  console.log(`[${sessionId}] npm ci succeeded. Running build...`);
+
+  const buildResult = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
+  if (buildResult.exitCode === 0) {
+    console.log(`[${sessionId}] ✅ Build succeeded!`);
+    return { success: true, errors: '' };
+  }
+
+  const errOutput = (buildResult.stderr || buildResult.stdout || '').slice(-4000);
+  console.error(`[${sessionId}] Build failed:\n`, errOutput);
+  return { success: false, errors: errOutput };
+}
+
+/**
+ * Ask the AI to fix build errors. Returns an array of { relativePath, content }.
+ */
+async function askAIToFixBuildErrors(sessionId, buildErrors, workspacePath, aiProvider, aiModel, targetTech) {
+  const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
+  const filesContext = buildFilesContext(currentFiles);
+
+  const fixPrompt = `The migrated ${targetTech} project has BUILD ERRORS. Fix ONLY the files causing errors.
+
+BUILD ERROR OUTPUT:
+\n${buildErrors}\n\nCURRENT PROJECT FILES:
+${filesContext}
+
+IMPORTANT RULES:
+- Output a JSON object with key "files" containing an array of objects:
+  [{"path": "src/path/file.ts", "content": "full file content"}]
+- Only include files that need to be changed to fix the build errors.
+- Each file must be complete (not a diff).
+- Do NOT include package.json, angular.json, tsconfig.json, or any config files.
+- Make the minimum changes needed to fix compilation errors.
+- Output ONLY valid JSON, no markdown fences.`;
+
+  const systemInstruction = `You are an expert ${targetTech} developer. Your job is to fix build/compilation errors in a migrated project. Output ONLY a valid JSON object with a "files" array.`;
+
+  try {
+    const response = await callLLM(systemInstruction, fixPrompt, true, aiProvider, aiModel);
+    let parsed;
+    try {
+      let cleaned = response.trim();
+      if (/^```/.test(cleaned)) {
+        cleaned = cleaned.replace(/^```[\w+-]*\s*\n?/, '');
+        cleaned = cleaned.replace(/\n?```\s*$/, '');
+      }
+      parsed = JSON.parse(cleaned);
+    } catch {
+      console.warn(`[${sessionId}] AI fix response was not valid JSON, skipping auto-fix.`);
+      return [];
+    }
+
+    const files = parsed.files || parsed;
+    if (!Array.isArray(files)) return [];
+
+    return files.filter(f => f.path && f.content).map(f => ({
+      relativePath: f.path.replace(/^(?:migrated-(?:angular|react)-project\/)+/i, '').replace(/^\.?\//, ''),
+      content: f.content
+    }));
+  } catch (err) {
+    console.error(`[${sessionId}] AI fix call failed:`, err.message);
+    return [];
+  }
+}
+
+/**
+ * Run build verification with retry loop.
+ * On failure: asks AI to fix errors, retries up to MAX_BUILD_RETRIES times.
+ * Returns { verified: boolean }.
+ */
+async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel) {
+  for (let attempt = 1; attempt <= MAX_BUILD_RETRIES; attempt++) {
+    console.log(`[${sessionId}] Build verification attempt ${attempt}/${MAX_BUILD_RETRIES}...`);
+    const result = await verifyBuild(workspacePath, targetTech, sessionId);
+    if (result.success) {
+      return { verified: true };
+    }
+
+    if (attempt < MAX_BUILD_RETRIES) {
+      console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
+      const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
+      if (fixes.length === 0) {
+        console.warn(`[${sessionId}] AI returned no fixes. Skipping remaining retries.`);
+        break;
+      }
+      for (const fix of fixes) {
+        const safePath = resolveSafeWritePath(workspacePath, fix.relativePath);
+        if (!safePath) {
+          console.warn(`[${sessionId}] Skipping unsafe fix path: ${fix.relativePath}`);
+          continue;
+        }
+        ensureDirectoryExists(path.dirname(safePath.full));
+        fs.writeFileSync(safePath.full, sanitizeGeneratedContent(fix.relativePath, fix.content), 'utf-8');
+        console.log(`[${sessionId}] Fixed: ${fix.relativePath}`);
+      }
+      // Re-run post-process repairs after AI fixes
+      if (targetTech.toLowerCase().includes('angular')) {
+        repairAngularWorkspace(workspacePath, {});
+      } else if (targetTech.toLowerCase().includes('react')) {
+        repairReactWorkspace(workspacePath, {});
+      }
+    }
+  }
+
+  return { verified: false };
+}
+
+/**
+ * Remove node_modules from workspace to keep ZIP small.
+ */
+function removeNodeModules(workspacePath) {
+  const nmPath = path.join(workspacePath, 'node_modules');
+  if (fs.existsSync(nmPath)) {
+    try {
+      fs.rmSync(nmPath, { recursive: true, force: true });
+      console.log(`Removed node_modules from workspace.`);
+    } catch (e) {
+      console.warn(`Failed to remove node_modules:`, e.message);
+    }
+  }
+}
+
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
-  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel } = options;
+  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel, targetVersion } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
 
-  // User-prompt version wins; otherwise latest stable (all conversion directions)
-  const targetVersions = resolveTargetVersions(userPrompt, toTech);
+  // --- Resolve target versions ---
+  // If an explicit targetVersion was provided via UI, inject it into the prompt
+  // so that resolveTargetVersions picks it up. UI selection takes priority.
+  let effectivePrompt = userPrompt;
+  if (targetVersion) {
+    const fwKeyword = toTech.toLowerCase().includes('angular') ? 'angular' : toTech.toLowerCase().includes('react') ? 'react' : '';
+    if (fwKeyword) {
+      effectivePrompt = `${userPrompt}\n[VERSION INSTRUCTION] Use ${fwKeyword} version ${targetVersion}. Set ${fwKeyword}/core to ^${targetVersion}.`;
+    }
+  }
+  const targetVersions = resolveTargetVersions(effectivePrompt, toTech);
   const versionMandate = formatVersionMandate(targetVersions);
 
   // Append the default strip-down / cross-framework prompt + version mandate
@@ -2240,10 +2412,27 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
     }
   }
 
+  // -----------------------------------------------------------------------
+  // 5b. Verify the build compiles before packaging
+  // -----------------------------------------------------------------------
+  const buildCheck = await verifyAndFixBuild(
+    sessionId,
+    migrationWorkspacePath,
+    toTech,
+    aiProvider,
+    aiModel || undefined
+  );
+  if (!buildCheck.verified) {
+    console.warn(`[${sessionId}] Build verification failed after ${MAX_BUILD_RETRIES} attempts. Delivering anyway.`);
+  }
+
+  // Remove node_modules to keep ZIP small (user will run npm ci locally)
+  removeNodeModules(migrationWorkspacePath);
+
   console.log(`[${sessionId}] All target files built. Packaging archive...`);
 
   // -----------------------------------------------------------------------
-  // 5. Package the result into a ZIP
+  // 6. Package the result into a ZIP
   // -----------------------------------------------------------------------
   const finalZip = new AdmZip();
   finalZip.addLocalFolder(migrationWorkspacePath);

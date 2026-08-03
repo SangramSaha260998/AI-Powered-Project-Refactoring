@@ -11,7 +11,7 @@ export const LATEST_ANGULAR = {
   major: 22,
   core: '22.0.8',
   tooling: '22.0.7',
-  typescript: '~6.0.3',
+  typescript: '~5.9.2',
   zone: '~0.16.0'
 };
 
@@ -192,7 +192,7 @@ function resolveAngularStack(parsed) {
     major: parsed.major,
     core: parsed.full || `${parsed.major}.0.0`,
     tooling: parsed.full || `${parsed.major}.0.0`,
-    typescript: parsed.major >= 22 ? '~6.0.3' : parsed.major >= 20 ? '~5.9.2' : '~5.7.2',
+    typescript: parsed.major >= 22 ? '~5.9.2' : parsed.major >= 20 ? '~5.9.2' : '~5.7.2',
     zone: parsed.major >= 22 ? '~0.16.0' : parsed.major >= 19 ? '~0.15.0' : '~0.14.10'
   };
   return {

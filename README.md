@@ -182,15 +182,38 @@ npm run start:frontend
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `PORT` | Backend server port | `5000` | No |
-| `OPENROUTER_API_KEY` | OpenRouter API key | - | Yes* |
+| `OPENROUTER_API_KEY` | OpenRouter API key(s) — comma-separate for key rotation | - | Yes* |
 | `OPENROUTER_BASE_URL` | OpenRouter API endpoint | `https://openrouter.ai/api/v1` | No |
-| `OPENROUTER_MODEL` | Default OpenRouter model | `openrouter/auto` | No |
-| `GENAI_API_KEY` | Google Gemini API key(s) | - | No |
+| `OPENROUTER_MODEL` | Default OpenRouter model | `google/gemma-4-26b-a4b-it:free` | No |
+| `OPENROUTER_MODELS` | OpenRouter model fallback list (comma-separated) | built-in free list | No |
+| `GENAI_API_KEY` | Google Gemini API key(s) — comma-separate for key rotation | - | No |
 | `GENAI_BASE_URL` | Gemini OpenAI-compatible endpoint | Gemini default | No |
 | `GENAI_MODEL` | Default Gemini model | `gemini-2.0-flash` | No |
-| `AI_FALLBACK_CHAIN` | Provider fallback order | `openrouter,genai,ollama` | No |
+| `GENAI_MODELS` | Gemini model fallback list (comma-separated) | built-in free list | No |
+| `GROQ_API_KEY` | Groq API key(s) — comma-separate for key rotation | - | No |
+| `GROQ_MODELS` | Groq model fallback list (comma-separated) | built-in free list | No |
+| `OLLAMA_API_KEY` | Ollama Cloud API key(s) — comma-separate for key rotation | - | No |
+| `OLLAMA_MODELS` | Ollama model fallback list (comma-separated) | built-in list | No |
+| `AI_FALLBACK_CHAIN` | Provider fallback order | `genai,openrouter,ollama,groq` | No |
 
-\* At least one configured provider is required (OpenRouter, Gemini, or local Ollama).
+\* At least one configured provider is required (OpenRouter, Gemini, Groq, or Ollama).
+
+### 🤖 Automatic Fallback (Model → Key → Provider)
+
+Every AI call automatically rotates through **models, API keys, and providers** when a limit is crossed — no manual intervention needed:
+
+1. **Model fallback (same key)** — when a `(API key, model)` pair hits its rate limit / quota, the engine tries the next free model **on the same API key** (e.g. `gemini-2.0-flash` → `gemini-2.0-flash-lite`).
+2. **Key rotation (same provider)** — after all models on a key are exhausted, it moves to the next API key (models restart from #1).
+3. **Provider fallback (next AI)** — after all keys × models of a provider are exhausted, it moves to the next configured provider in the chain using that provider's own keys and models.
+
+```
+Model A + Key 1  ──limit crossed──▶  Model B + Key 1  ──▶  …  ──▶  Model A + Key 2  ──▶  …  ──▶  Next provider  ──▶  …
+```
+
+- Provide multiple API keys as comma-separated values: `OPENROUTER_API_KEY=key1,key2,key3`.
+- Override the model fallback list per provider with `<PREFIX>_MODELS` (e.g. `GENAI_MODELS=gemini-2.0-flash,gemini-1.5-flash`).
+- The UI-selected model is always tried first on the selected provider; the rest of the list is used only when it fails.
+- Auth/quota errors (HTTP 401/402) are key-level and skip model rotation, going straight to the next key.
 
 ### Supported API Providers
 
@@ -419,6 +442,7 @@ To respect API quotas and avoid rate limiting:
 - **5.5 second pause** between each AI file generation
 - **10 second retry** if an API call fails
 - **One retry** per failed file before throwing an error
+- **Automatic model → key → provider rotation** when free-tier limits are crossed (see [Automatic Fallback](#-automatic-fallback-model--key--provider))
 
 **Estimated Migration Times:**
 - Small project (5-10 files): ~1-2 minutes

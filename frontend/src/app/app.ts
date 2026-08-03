@@ -1,7 +1,7 @@
 import { Component, ElementRef, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
-import { timeout } from 'rxjs/operators';
+import { timeout } from 'rxjs';
 import { LoadingOverlayDirective } from './directives';
 
 type ThemeMode = 'light' | 'dark';
@@ -73,8 +73,14 @@ export class App {
   isSuccess = signal<boolean>(false);
   theme = signal<ThemeMode>('light');
   modelsLoading = signal<boolean>(false);
+  /** Tracks pending retry downloads: sessionId -> zipUrl */
+  retrySessions = signal<string | null>(null);
+
   /** Bumps when provider models are refreshed so the model select re-renders. */
   private modelsVersion = signal(0);
+
+  /** The server-generated session ID from the most recent migrate POST. */
+  private lastSessionId: string | null = null;
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -349,8 +355,14 @@ Final app must compile and run: npm install → ng serve`;
     this.isLoading.set(true);
     this.isSuccess.set(false);
 
+    // Generate a client-side session ID so we can retry the download if the
+    // initial request times out. The server will use this ID for its session paths.
+    this.lastSessionId = 'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    this.retrySessions.set(null);
+
     const formData = new FormData();
     formData.append('zipFile', file);
+    formData.append('sessionId', this.lastSessionId);
     formData.append('fromTech', from);
     formData.append('toTech', to);
     formData.append('prompt', promptText);
@@ -363,13 +375,13 @@ Final app must compile and run: npm install → ng serve`;
     }
 
     // Send payload to our Express migration engine (returns a downloadable ZIP blob)
-    // Migration can take several minutes (AI processing + build), so allow a 15-minute timeout
+    // Migration can take 15-30 minutes (AI processing + build), so allow a 30-minute timeout
     this.http
       .post(`${API_BASE}/migrate`, formData, {
         responseType: 'blob',
         reportProgress: false,
       })
-      .pipe(timeout(15 * 60 * 1000)) // 15 minutes
+      .pipe(timeout({ first: 30 * 60 * 1000 })) // 30-minute timeout
       .subscribe({
         next: (blob: Blob) => {
           // Trigger browser download of the returned ZIP
@@ -382,6 +394,10 @@ Final app must compile and run: npm install → ng serve`;
           a.remove();
           window.URL.revokeObjectURL(url);
 
+          // Clear retry state on success
+          this.retrySessions.set(null);
+          this.lastSessionId = null;
+
           // Clear the form only after a successful API response + download trigger
           this.clearUiAfterSuccess();
         },
@@ -390,6 +406,82 @@ Final app must compile and run: npm install → ng serve`;
           this.isSuccess.set(false);
 
           let errorMessage = 'Unknown server error';
+          let isTimeoutError = false;
+
+          // Check for timeout errors
+          if (err?.name === 'TimeoutError' || err?.message?.includes('timed out') || err?.message?.includes('Timeout')) {
+            isTimeoutError = true;
+            errorMessage = 'Migration took too long. The AI processing is still running on the server. You can retry the download.';
+          } else if (err.error instanceof Blob) {
+            try {
+              const text = await err.error.text();
+              const parsed = JSON.parse(text);
+              errorMessage = parsed.error || errorMessage;
+            } catch {
+              errorMessage = err.message || errorMessage;
+            }
+          } else {
+            errorMessage = err?.error?.error || err?.message || errorMessage;
+          }
+
+          // Show retry option if we have a session ID
+          if (isTimeoutError && this.lastSessionId) {
+            this.retrySessions.set(this.lastSessionId);
+            this.statusMessage.set(`⏱️ ${errorMessage}`);
+          } else if (this.lastSessionId) {
+            // For non-timeout errors, show retry link anyway (server may still have artifacts)
+            this.retrySessions.set(this.lastSessionId);
+            this.statusMessage.set(`❌ ${errorMessage}`);
+          } else {
+            this.statusMessage.set(`❌ ${errorMessage}`);
+          }
+
+          console.error(err);
+        },
+      });
+  }
+
+  /**
+   * Retry downloading a completed migration by session ID.
+   * Called when the user clicks the "Retry Download" button.
+   */
+  retryDownload() {
+    const sessionId = this.retrySessions();
+    if (!sessionId) return;
+
+    this.isLoading.set(true);
+    this.statusMessage.set('⏳ Retrying download...');
+
+    this.http
+      .get(`${API_BASE}/download/${sessionId}`, {
+        responseType: 'blob',
+        reportProgress: false,
+      })
+      .pipe(timeout({ first: 5 * 60 * 1000 })) // 5-minute timeout for the download itself
+      .subscribe({
+        next: (blob: Blob) => {
+          // Trigger browser download
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'migrated_project.zip';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+
+          this.retrySessions.set(null);
+          this.lastSessionId = null;
+          this.isLoading.set(false);
+          this.isSuccess.set(true);
+          this.statusMessage.set('🎉 Migration downloaded successfully!');
+          this.clearMessage();
+        },
+        error: async (err) => {
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+
+          let errorMessage = 'Failed to retry download.';
           if (err.error instanceof Blob) {
             try {
               const text = await err.error.text();
@@ -402,13 +494,42 @@ Final app must compile and run: npm install → ng serve`;
             errorMessage = err?.error?.error || err?.message || errorMessage;
           }
 
+          // If the session expired or was cleaned up, clear retry state
+          if (err?.status === 404 || err?.status === 410) {
+            this.retrySessions.set(null);
+            this.lastSessionId = null;
+            errorMessage += ' Please re-upload and start a new migration.';
+          }
+
           this.statusMessage.set(`❌ ${errorMessage}`);
-          console.error(err);
+          console.error('Retry download failed:', err);
         },
       });
   }
 
+  /**
+   * Trigger retry download via retry button.
+   */
+  onRetryDownload() {
+    this.retryDownload();
+  }
+
+  /**
+   * Dismiss the retry prompt and clear the status message.
+   */
+  dismissRetry() {
+    this.retrySessions.set(null);
+    this.lastSessionId = null;
+    this.statusMessage.set('');
+  }
+
+  /**
+   * Clears transient status messages after a short delay.
+   * Does NOT clear retry prompts (those persist until actioned or dismissed).
+   */
   clearMessage() {
+    if (this.retrySessions()) return; // Don't clear retry prompts
+
     // Clear the status message after 3 seconds
     setTimeout(() => {
       this.statusMessage.set('');

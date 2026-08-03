@@ -159,7 +159,26 @@
 
       @if (statusMessage()) {
         <div class="status-banner" [class.success]="isSuccess()">
-          {{ statusMessage() }}
+          <span class="status-text">{{ statusMessage() }}</span>
+          @if (retrySessions()) {
+            <button
+              class="retry-btn"
+              (click)="onRetryDownload()"
+              [disabled]="isLoading()"
+            >
+              @if (isLoading()) {
+                <span class="spinner small"></span>
+              }
+              Retry Download ↩️
+            </button>
+            <button
+              class="retry-btn dismiss-btn"
+              (click)="dismissRetry()"
+              title="Dismiss"
+            >
+              ✕
+            </button>
+          }
         </div>
       }
     </section>

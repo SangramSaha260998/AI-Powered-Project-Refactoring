@@ -8,7 +8,7 @@ dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
 import { execSync } from 'child_process';
 import app from './app.js';
-import { PORT, getProviderConfigs, getProviderIds, getProviderFallbackChain, isProviderConfigured, isOllamaCloudMode, PROVIDERS } from './config/index.js';
+import { PORT, getProviderConfigs, getProviderIds, getProviderFallbackChain, getProviderFallbackModels, isProviderConfigured, isOllamaCloudMode, PROVIDERS } from './config/index.js';
 
 // ---------------------------------------------------------------------------
 // Validate all configured AI providers on startup
@@ -33,6 +33,10 @@ for (const providerId of providerIds) {
         console.log(`${label}: ${validKeys.length} key(s) — ${masked}  [model: ${configs[0]?.model}]`);
       } else {
         console.log(`${label}: enabled (local, no API key)  [model: ${configs[0]?.model}]`);
+      }
+      const ollamaFallbackModels = getProviderFallbackModels(providerId);
+      if (ollamaFallbackModels.length > 1) {
+        console.log(`  Model fallback (same key): ${ollamaFallbackModels.join(' → ')}`);
       }
     } else if (isOllamaCloudMode()) {
       console.warn(`WARNING: OLLAMA_API_KEY is not set.`);
@@ -65,6 +69,11 @@ for (const providerId of providerIds) {
         : '****';
       console.log(`${label}: 1 key configured — ${masked}  [model: ${validKeys[0].model}]`);
     }
+
+    const fallbackModels = getProviderFallbackModels(providerId);
+    if (fallbackModels.length > 1) {
+      console.log(`  Model fallback (same key): ${fallbackModels.join(' → ')}`);
+    }
   }
 }
 
@@ -73,6 +82,9 @@ console.log(
 );
 console.log(
   '  (Selected provider is tried first; then the rest of the chain. Override with AI_FALLBACK_CHAIN.)'
+);
+console.log(
+  'Automatic fallback per call: model → key → provider (override model lists with OPENROUTER_MODELS, GENAI_MODELS, GROQ_MODELS, OLLAMA_MODELS).'
 );
 
 if (!anyCloudKeyConfigured && !isProviderConfigured('ollama')) {
@@ -89,7 +101,7 @@ function startServer(port, retries = 1) {
   });
 
   // Increase server timeout for long-running migrations (default is 120s)
-  server.timeout = 20 * 60 * 1000; // 20 minutes
+  server.timeout = 30 * 60 * 1000; // 30 minutes (up from 20 min)
   server.keepAliveTimeout = 65 * 1000; // 65 seconds (must be > 60s for keepalive)
   server.headersTimeout = 66 * 1000; // Must be > keepAliveTimeout
 

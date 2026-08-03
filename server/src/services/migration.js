@@ -13,6 +13,7 @@ import {
   PROVIDERS,
   getProviderConfigs,
   getProviderFallbackChain,
+  getProviderFallbackModels,
   isProviderConfigured,
   isOllamaCloudMode,
   RATE_LIMIT_PAUSE_MS
@@ -155,10 +156,15 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * Makes a chat completion call with the given messages and optional JSON mode.
  *
- * Fallback order (always on):
- * 1. Rotate API keys within the selected provider on quota/auth/rate-limit/5xx/network errors
- * 2. If that provider is exhausted, try the next configured provider in the chain
- *    using that provider's own keys and default model (not the UI model id)
+ * Fallback order (always on, innermost first):
+ * 1. Model fallback — when a (key, model) pair crosses its limit, try the next
+ *    free model on the SAME API key (e.g. Gemini 2.0 Flash → Flash-Lite).
+ * 2. Key rotation — after all models on a key are exhausted, move to the next
+ *    API key for the same provider (models restart from #1).
+ * 3. Provider fallback — after all keys × models of a provider are exhausted,
+ *    try the next configured provider in the chain using its own keys/models.
+ *
+ * Auth/quota errors (401/402) are key-level and skip model rotation entirely.
  *
  * @param {string} systemInstruction - System prompt
  * @param {string} userContent       - User prompt
@@ -192,9 +198,12 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
       continue;
     }
 
-    // Only the user-selected provider uses the UI model; fallbacks use defaults.
+    // Only the user-selected provider uses the UI model; fallbacks use their own lists.
     const modelOverride = isPrimary && PROVIDERS[aiProvider] ? aiModel : undefined;
-    const entries = createClients(providerId, modelOverride);
+    // Model order: UI-selected model first, then free fallback models on the same key.
+    const models = getProviderFallbackModels(providerId, modelOverride);
+
+    const entries = createClients(providerId);
 
     if (!entries || entries.length === 0) {
       console.warn(
@@ -210,78 +219,100 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     if (providerIndex > 0 || (isPrimary && providerId !== aiProvider)) {
       console.warn(
         `[Provider Fallback] Switching to ${PROVIDERS[providerId]?.name || providerId} ` +
-        `(${providerId}) with model "${entries[0].config.model}"...`
+        `(${providerId}) — models: [${models.join(', ')}]`
       );
     }
 
     const totalKeys = entries.length;
+    const totalModels = models.length;
 
-    for (let attempt = 0; attempt < totalKeys; attempt++) {
-      const { client, config } = entries[attempt];
+    // No models configured (e.g. bad env override) — don't waste a "tried" count.
+    if (totalModels === 0) {
+      console.warn(
+        `[Provider Fallback] Skipping "${providerId}" — no models configured.`
+      );
+      continue;
+    }
 
-      const requestOptions = {
-        model: config.model,
-        messages
-      };
+    for (let keyIndex = 0; keyIndex < totalKeys; keyIndex++) {
+      const { client, config } = entries[keyIndex];
+      const maskedKey = config.apiKey.length > 8
+        ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
+        : '****';
 
-      if (jsonMode) {
-        requestOptions.response_format = { type: 'json_object' };
-      }
+      for (let modelIndex = 0; modelIndex < totalModels; modelIndex++) {
+        const model = models[modelIndex];
 
-      try {
-        const response = await client.chat.completions.create(requestOptions);
-        const content = response.choices?.[0]?.message?.content;
-        if (content == null || String(content).trim() === '') {
-          throw new Error('AI returned an empty response.');
+        const requestOptions = {
+          model,
+          messages
+        };
+
+        if (jsonMode) {
+          requestOptions.response_format = { type: 'json_object' };
         }
-        if (providerIndex > 0) {
-          console.log(
-            `[Provider Fallback] Succeeded with ${providerId} / ${config.model}`
-          );
-        }
-        return content;
-      } catch (err) {
-        lastError = err;
-        const { worthy, statusCode, reason } = isFallbackWorthyError(err);
 
-        if (worthy) {
-          if (statusCode === 429) providerHitRateLimit = true;
-
-          if (attempt < totalKeys - 1) {
-            const maskedKey = config.apiKey.length > 8
-              ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
-              : '****';
-            const waitMs = statusCode === 429
-              ? getRetryAfterMs(err, 5000)
-              : 2000;
-            console.warn(
-              `[Key Rotate] ${providerId} key ${attempt + 1}/${totalKeys} (${maskedKey}) ` +
-              `failed (${reason}: ${statusCode}). Falling back to next key in ${Math.round(waitMs / 1000)}s...`
+        try {
+          const response = await client.chat.completions.create(requestOptions);
+          const content = response.choices?.[0]?.message?.content;
+          if (content == null || String(content).trim() === '') {
+            throw new Error('AI returned an empty response.');
+          }
+          if (providerIndex > 0 || keyIndex > 0 || modelIndex > 0) {
+            console.log(
+              `[Fallback] Succeeded with ${providerId} / ${model} ` +
+              `(key ${keyIndex + 1}/${totalKeys}, model ${modelIndex + 1}/${totalModels})`
             );
-            await pause(waitMs);
-            continue;
+          }
+          return content;
+        } catch (err) {
+          lastError = err;
+          const { statusCode, reason } = isFallbackWorthyError(err);
+
+          // Key-level failures (bad/missing auth, exhausted billing quota) —
+          // no model change can fix these, so skip straight to the next key.
+          if (statusCode === 401 || statusCode === 402) {
+            console.warn(
+              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `failed (${reason}: ${statusCode}). Moving to next key...`
+            );
+            await pause(2000);
+            break; // next key (model rotation restarts from #1)
           }
 
+          if (statusCode === 429) providerHitRateLimit = true;
+
+          // Limit crossed for THIS (key, model) pair → try the next free model
+          // on the same API key before touching other keys/providers.
+          if (modelIndex < totalModels - 1) {
+            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 5000) : 1000;
+            console.warn(
+              `[Model Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `model ${modelIndex + 1}/${totalModels} "${model}" failed (${reason}: ${statusCode}). ` +
+              `Trying next free model in ${Math.round(waitMs / 1000)}s...`
+            );
+            await pause(waitMs);
+            continue; // next model, same key
+          }
+
+          // All models on this key are exhausted → try the next API key.
+          if (keyIndex < totalKeys - 1) {
+            console.warn(
+              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) — ` +
+              `all ${totalModels} model(s) exhausted (${reason}: ${statusCode}). Trying next key...`
+            );
+            await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
+            break; // next key
+          }
+
+          // Every key × model for this provider is exhausted → next provider.
           console.warn(
-            `[Provider Fallback] All ${totalKeys} key(s) for "${providerId}" exhausted ` +
-            `(${reason}: ${statusCode}).`
+            `[Provider Fallback] All ${totalKeys} key(s) × ${totalModels} model(s) for ` +
+            `"${providerId}" exhausted (${reason}: ${statusCode}).`
           );
-          await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 2000);
+          await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
           break; // next provider
         }
-
-        // Fatal error (e.g. bad request for this model) — still try next provider
-        // so a bad OpenRouter free model does not kill the whole migration.
-        if (providerIndex < chain.length - 1) {
-          console.warn(
-            `[Provider Fallback] "${providerId}" failed with fatal error ` +
-            `(${err.message || statusCode}). Trying next provider...`
-          );
-          await pause(1000);
-          break;
-        }
-
-        throw err;
       }
     }
 
@@ -520,22 +551,27 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
   const stack = versionStack || {
     core: '22.0.8',
     tooling: '22.0.7',
-    typescript: '~6.0.3',
+    typescript: '~5.9.2',
     zone: '~0.16.0'
   };
   const angularVersion = stack.core;
   const angularToolingVersion = stack.tooling;
 
-  // 1. package.json - standalone bootstrap via @angular/build
+  // 1. package.json - standalone bootstrap via @angular-devkit/build-angular
   const packageJson = {
     name: 'migrated-angular-project',
     version: '0.0.0',
     scripts: {
       ng: 'ng',
-      start: 'ng serve',
-      build: 'ng build',
+      start: 'ng serve --configuration preDevelopment',
+      build: 'ng build --configuration development',
+      'build:prod': 'ng build --configuration production',
+      'build:staging': 'ng build --configuration staging',
+      'build:uat': 'ng build --configuration uat',
+      'build:dev': 'ng build --configuration development',
       watch: 'ng build --watch --configuration development',
-      test: 'ng test'
+      test: 'ng test',
+      lint: 'ng lint'
     },
     dependencies: {
       '@angular/animations': `^${angularVersion}`,
@@ -545,27 +581,43 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
       '@angular/forms': `^${angularVersion}`,
       '@angular/platform-browser': `^${angularVersion}`,
       '@angular/router': `^${angularVersion}`,
+      'normalize.css': '^8.0.1',
       'rxjs': '~7.8.0',
       'tslib': '^2.3.0',
       'zone.js': stack.zone || '~0.16.0'
     },
     devDependencies: {
-      '@angular/build': `^${angularToolingVersion}`,
+      '@angular-devkit/build-angular': `^${angularToolingVersion}`,
       '@angular/cli': `^${angularToolingVersion}`,
       '@angular/compiler-cli': `^${angularVersion}`,
+      '@angular-eslint/builder': '^18.0.0',
+      '@angular-eslint/eslint-plugin': '^18.0.0',
+      '@angular-eslint/eslint-plugin-template': '^18.0.0',
+      '@angular-eslint/schematics': '^18.0.0',
+      '@angular-eslint/template-parser': '^18.0.0',
+      '@typescript-eslint/eslint-plugin': '^7.0.0',
+      '@typescript-eslint/parser': '^7.0.0',
       'autoprefixer': '^10.4.20',
+      'eslint': '^8.57.0',
       'postcss': '^8.4.49',
       'sass': '^1.83.0',
       'tailwindcss': '^3.4.17',
-      'typescript': stack.typescript || '~6.0.3'
-    }
+      'typescript': stack.typescript || '~5.5.0'
+    },
+    // Optional peer dependencies - uncomment as needed:
+    // "peerDependencies": {
+    //   "ngx-toastr": "^18.0.0",
+    //   "highcharts-angular": "^4.0.0",
+    //   "@ngxs/store": "^3.8.0",
+    //   "@ngxs/logger-plugin": "^3.8.0"
+    // }
   };
   fs.writeFileSync(
     path.join(destPath, 'package.json'),
     JSON.stringify(packageJson, null, 2)
   );
 
-  // 2. angular.json - using @angular/build:application
+  // 2. angular.json - using @angular-devkit/build-angular:application
   const angularJson = {
     $schema: './node_modules/@angular/cli/lib/config/schema.json',
     version: 1,
@@ -576,15 +628,32 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
         schematics: {
           '@schematics/angular:component': {
             style: 'scss',
+            skipTests: true
+          },
+          '@schematics/angular:pipe': {
+            skipTests: true,
             standalone: true
+          },
+          '@schematics/angular:guard': {
+            skipTests: true
+          },
+          '@schematics/angular:service': {
+            skipTests: true
+          },
+          '@schematics/angular:directive': {
+            skipTests: true,
+            standalone: true
+          },
+          '@schematics/angular:interceptor': {
+            skipTests: true
           }
         },
         root: '',
         sourceRoot: 'src',
-        prefix: 'app',
+        prefix: '',
         architect: {
           build: {
-            builder: '@angular/build:application',
+            builder: '@angular-devkit/build-angular:application',
             options: {
               outputPath: 'dist/migrated-angular-project',
               index: 'src/index.html',
@@ -595,54 +664,142 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
               assets: [
                 {
                   glob: '**/*',
-                  input: 'public',
-                  output: '/'
+                  input: 'public'
+                },
+                {
+                  glob: '**/*',
+                  input: 'src/assets/',
+                  output: '/assets/'
                 }
               ],
-              styles: ['src/styles.scss'],
+              styles: [
+                'node_modules/normalize.css/normalize.css',
+                'src/styles.scss'
+              ],
+              stylePreprocessorOptions: {
+                includePaths: ['public/scss', 'public/scss/partials', 'public/scss/custom-styles']
+              },
+              allowedCommonJsDependencies: [
+                'bowser',
+                'moment',
+                'crypto-js',
+                'jquery'
+              ],
               scripts: []
             },
             configurations: {
               production: {
                 budgets: [
-                  { type: 'initial', maximumWarning: '500kB', maximumError: '1MB' },
-                  { type: 'anyComponentStyle', maximumWarning: '4kB', maximumError: '8kB' }
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
                 ],
                 outputHashing: 'all'
               },
+              staging: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.staging.ts'
+                  }
+                ]
+              },
+              uat: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.uat.ts'
+                  }
+                ]
+              },
               development: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.development.ts'
+                  }
+                ]
+              },
+              preDevelopment: {
                 optimization: false,
                 extractLicenses: false,
-                sourceMap: true
+                sourceMap: true,
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.development.ts'
+                  }
+                ]
               }
-            },
-            defaultConfiguration: 'production'
-          },
-          serve: {
-            builder: '@angular/build:dev-server',
-            configurations: {
-              production: { buildTarget: 'migrated-angular-project:build:production' },
-              development: { buildTarget: 'migrated-angular-project:build:development' }
             },
             defaultConfiguration: 'development'
           },
+          serve: {
+            builder: '@angular-devkit/build-angular:dev-server',
+            configurations: {
+              production: { buildTarget: 'migrated-angular-project:build:production' },
+              staging: { buildTarget: 'migrated-angular-project:build:staging' },
+              uat: { buildTarget: 'migrated-angular-project:build:uat' },
+              development: { buildTarget: 'migrated-angular-project:build:development' },
+              preDevelopment: { buildTarget: 'migrated-angular-project:build:preDevelopment' }
+            },
+            defaultConfiguration: 'preDevelopment',
+            options: { hmr: false }
+          },
+          'extract-i18n': {
+            builder: '@angular-devkit/build-angular:extract-i18n'
+          },
           test: {
-            builder: '@angular/build:karma',
+            builder: '@angular-devkit/build-angular:karma',
             options: {
+              polyfills: ['zone.js', 'zone.js/testing'],
               tsConfig: 'tsconfig.spec.json',
+              inlineStyleLanguage: 'scss',
               assets: [
                 {
                   glob: '**/*',
-                  input: 'public',
-                  output: '/'
+                  input: 'public'
+                },
+                {
+                  glob: '**/*',
+                  input: 'src/assets/',
+                  output: '/assets/'
                 }
               ],
-              styles: ['src/styles.scss'],
+              styles: [
+                'src/styles.scss'
+              ],
+              stylePreprocessorOptions: {
+                includePaths: ['public/scss', 'public/scss/partials']
+              },
               scripts: []
+            }
+          },
+          lint: {
+            builder: '@angular-eslint/builder:lint',
+            options: {
+              lintFilePatterns: ['src/**/*.ts', 'src/**/*.html']
             }
           }
         }
       }
+    },
+    cli: {
+      analytics: false
     }
   };
   fs.writeFileSync(
@@ -739,23 +896,30 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
   ensureDirectoryExists(path.join(destPath, 'src'));
   fs.writeFileSync(path.join(destPath, 'src', 'index.html'), indexHtml);
 
-  // 7. app.config.ts - consolidated providers
-  const appConfigTs = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+  // 7. app.config.ts - consolidated providers with interceptors and routing
+  // NOTE: The actual app.config.ts is now copied from angular_required/routes/
+  // This ensures consistency with the shared template files.
+  // We create a minimal fallback here in case angular_required is not available.
+  const appConfigTsPath = path.join(destPath, 'src', 'app', 'app.config.ts');
+  if (!fs.existsSync(appConfigTsPath)) {
+    const appConfigTs = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
 import { provideHttpClient } from '@angular/common/http';
 import { provideRouter } from '@angular/router';
-import { provideAnimations } from '@angular/platform-browser/animations';
+import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
+import { routes } from './app.routes';
 
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZoneChangeDetection({ eventCoalescing: true }),
+    provideRouter(routes),
+    provideAnimationsAsync(),
     provideHttpClient(),
-    provideRouter([]),
-    provideAnimations()
-  ]
+  ],
 };
 `;
-  ensureDirectoryExists(path.join(destPath, 'src', 'app'));
-  fs.writeFileSync(path.join(destPath, 'src', 'app', 'app.config.ts'), appConfigTs);
+    ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+    fs.writeFileSync(appConfigTsPath, appConfigTs);
+  }
 
   // 8. main.ts - simplified, uses appConfig
   const mainTs = `import { bootstrapApplication } from '@angular/platform-browser';
@@ -849,9 +1013,27 @@ Thumbs.db
 `;
   fs.writeFileSync(path.join(destPath, '.gitignore'), gitignore);
 
-  // 11. Ensure app directory exists
+  // 11. Ensure Angular app structure exists
   ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'interceptors'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'guards'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'services'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'components'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'pipes'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'directives'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'common'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'auth'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'admin'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'environments'));
   ensureDirectoryExists(path.join(destPath, 'public'));
+  ensureDirectoryExists(path.join(destPath, 'public', 'scss'));
+
+  // 12-15. Environment files, routes, interceptors, store
+  // NOTE: These are now handled by injectAngularCoreSharedFiles() which copies
+  // from angular_required/ directory. This ensures consistency and avoids duplication.
+  // The files are copied AFTER this function runs in the migration pipeline.
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,22 +1311,78 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 /**
  * Recursively copies all files from the angular_required source directory
- * into src/core/shared of the generated Angular project.
- * This ensures the shared utilities, directives, pipes, validators, models,
- * components, and animations are always available in every generated project.
+ * into the appropriate locations of the generated Angular project.
+ * - shared/ → src/app/shared/
+ * - interceptors/ → src/app/core/interceptors/
+ * - store/ → src/app/store/
+ * - environments/ → src/environments/
+ * - routes/ → src/app/
  */
 function injectAngularCoreSharedFiles(destPath) {
-  const srcDir = path.resolve(destPath, 'src', 'core', 'shared');
   const angularRequiredDir = path.resolve(__dirname, '..', '..', 'angular_required');
 
   if (!fs.existsSync(angularRequiredDir)) {
-    console.warn(`[core/shared] angular_required directory not found at ${angularRequiredDir}. Skipping.`);
+    console.warn(`[angular_required] Directory not found at ${angularRequiredDir}. Skipping.`);
     return;
   }
 
-  ensureDirectoryExists(srcDir);
-  fs.cpSync(angularRequiredDir, srcDir, { recursive: true });
-  console.log(`[core/shared] Copied angular_required files to ${path.relative(destPath, srcDir)}`);
+  // Copy shared utilities, components, pipes, directives, validators, animations to src/app/shared/
+  const sharedSrcDir = path.join(angularRequiredDir);
+  const sharedDestDir = path.resolve(destPath, 'src', 'app', 'shared');
+  ensureDirectoryExists(sharedDestDir);
+  
+  // Copy specific subdirectories to shared
+  const sharedDirs = ['animations', 'components', 'directives', 'models', 'pipes', 'utilities', 'validators'];
+  for (const dir of sharedDirs) {
+    const srcPath = path.join(angularRequiredDir, dir);
+    if (fs.existsSync(srcPath)) {
+      const destSubDir = path.join(sharedDestDir, dir);
+      ensureDirectoryExists(destSubDir);
+      fs.cpSync(srcPath, destSubDir, { recursive: true });
+    }
+  }
+  console.log(`[angular_required] Copied shared files to ${path.relative(destPath, sharedDestDir)}`);
+
+  // Copy interceptors to src/app/core/interceptors/
+  const interceptorsSrcDir = path.join(angularRequiredDir, 'interceptors');
+  const interceptorsDestDir = path.resolve(destPath, 'src', 'app', 'core', 'interceptors');
+  if (fs.existsSync(interceptorsSrcDir)) {
+    ensureDirectoryExists(interceptorsDestDir);
+    fs.cpSync(interceptorsSrcDir, interceptorsDestDir, { recursive: true });
+    console.log(`[angular_required] Copied interceptors to ${path.relative(destPath, interceptorsDestDir)}`);
+  }
+
+  // Copy store to src/app/store/
+  const storeSrcDir = path.join(angularRequiredDir, 'store');
+  const storeDestDir = path.resolve(destPath, 'src', 'app', 'store');
+  if (fs.existsSync(storeSrcDir)) {
+    ensureDirectoryExists(storeDestDir);
+    fs.cpSync(storeSrcDir, storeDestDir, { recursive: true });
+    console.log(`[angular_required] Copied store to ${path.relative(destPath, storeDestDir)}`);
+  }
+
+  // Copy environments to src/environments/
+  const envSrcDir = path.join(angularRequiredDir, 'environments');
+  const envDestDir = path.resolve(destPath, 'src', 'environments');
+  if (fs.existsSync(envSrcDir)) {
+    ensureDirectoryExists(envDestDir);
+    fs.cpSync(envSrcDir, envDestDir, { recursive: true });
+    console.log(`[angular_required] Copied environments to ${path.relative(destPath, envDestDir)}`);
+  }
+
+  // Copy routes to src/app/
+  const routesSrcDir = path.join(angularRequiredDir, 'routes');
+  if (fs.existsSync(routesSrcDir)) {
+    const routesFiles = fs.readdirSync(routesSrcDir);
+    for (const file of routesFiles) {
+      const srcFile = path.join(routesSrcDir, file);
+      const destFile = path.join(destPath, 'src', 'app', file);
+      if (fs.statSync(srcFile).isFile()) {
+        fs.copyFileSync(srcFile, destFile);
+      }
+    }
+    console.log(`[angular_required] Copied routes to src/app/`);
+  }
 }
 
 function ensureAngularRuntimeFiles(destPath) {
@@ -1785,7 +2023,7 @@ function runCommand(cmd, args, cwd, timeoutMs = 300000) {
 }
 
 /**
- * Verify that the migrated project compiles by running npm ci + build.
+ * Verify that the migrated project compiles by running npm install + build.
  * Returns { success: boolean, errors: string }.
  */
 async function verifyBuild(workspacePath, targetTech, sessionId) {
@@ -1794,14 +2032,14 @@ async function verifyBuild(workspacePath, targetTech, sessionId) {
   const buildCmd = isAngular ? 'npx' : 'npm';
   const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
 
-  console.log(`[${sessionId}] Build verification: running npm ci...`);
-  const installResult = await runCommand('npm', ['ci', '--prefer-offline'], workspacePath, 300000);
+  console.log(`[${sessionId}] Build verification: running npm install...`);
+  const installResult = await runCommand('npm', ['install', '--prefer-offline'], workspacePath, 300000);
   if (installResult.exitCode !== 0) {
     const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
-    console.error(`[${sessionId}] npm ci failed:\n`, errOutput);
-    return { success: false, errors: `npm ci failed:\n${errOutput}` };
+    console.error(`[${sessionId}] npm install failed:\n`, errOutput);
+    return { success: false, errors: `npm install failed:\n${errOutput}` };
   }
-  console.log(`[${sessionId}] npm ci succeeded. Running build...`);
+  console.log(`[${sessionId}] npm install succeeded. Running build...`);
 
   const buildResult = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
   if (buildResult.exitCode === 0) {
@@ -1957,8 +2195,24 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // 1. Unpack original framework archive
   // -----------------------------------------------------------------------
   console.log(`[${sessionId}] Extracting archive...`);
-  const zip = new AdmZip(sourceZipPath);
-  zip.extractAllTo(extractPath, true);
+  let zip;
+  try {
+    zip = new AdmZip(sourceZipPath);
+  } catch (zipError) {
+    if (zipError.message && zipError.message.includes('Invalid filename')) {
+      throw new Error(
+        'The uploaded ZIP contains entries with invalid filenames. '
+        + 'Please re-create your ZIP file avoiding special characters in file/folder names '
+        + '(e.g., colons, backslashes, or absolute paths).'
+      );
+    }
+    throw new Error(`Could not read the uploaded ZIP file: ${zipError.message}`);
+  }
+  try {
+    zip.extractAllTo(extractPath, true);
+  } catch (extractError) {
+    throw new Error(`Could not extract ZIP archive: ${extractError.message}. The file may contain invalid entries or be corrupted.`);
+  }
 
   // -----------------------------------------------------------------------
   // 2. Determine best base path and read source files
@@ -2217,6 +2471,7 @@ You are writing the code for ONE file only in the new framework structure.
 - If writing an Angular Standalone Component TypeScript file: write ONLY TypeScript. Use templateUrl/styleUrl. Do NOT include HTML markup or CSS rules in the .ts file.
 - If writing an Angular .html file: write ONLY HTML markup with Tailwind utility classes on elements. No TypeScript, no CSS/SCSS, no file path comments.
 - If writing an Angular .scss (or legacy .css) file: write ONLY SCSS/CSS (complete rules with braces). Prefer empty/minimal SCSS — styling belongs in Tailwind classes in the HTML. No HTML, no TypeScript, no file path comments. Empty files must be a comment like /* component */.
+- For Angular: keep the app layout under src/app with core, shared, and pages/{common,auth,admin}; do not create top-level src/core or src/shared folders.
 - If writing a React Component: use functional components with hooks and TypeScript. Style with Tailwind className utilities; companion styles use .scss only.
 - If writing a React .scss file: minimal SCSS only; prefer Tailwind in JSX.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.

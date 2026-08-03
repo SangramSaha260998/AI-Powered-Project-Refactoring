@@ -61,19 +61,35 @@ export const PROVIDERS = {
     envPrefix: 'OPENROUTER',
     defaultBaseURL: 'https://openrouter.ai/api/v1',
     // Prefer a known free chat model over auto-router (auto can route to paid models).
-    defaultModel: 'google/gemma-4-31b-it:free',
+    defaultModel: 'google/gemma-4-26b-a4b-it:free',
     defaultHeaders: {
       'HTTP-Referer': 'http://localhost:4200',
       'X-Title': 'AI Framework Migration Studio',
     },
-    models: []
+    // Free-tier chat models, tried in order when a (key, model) pair hits its limit.
+    // Override with OPENROUTER_MODELS=custom/model1,custom/model2
+    models: [
+      'google/gemma-4-31b-it:free',
+      'google/gemma-4-26b-a4b-it:free',
+      'nvidia/nemotron-3-super-120b-a12b:free',
+      'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'inclusionai/ling-3.0-flash:free',
+      'openrouter/auto:free'
+    ]
   },
   genai: {
     name: 'Google Gemini',
     envPrefix: 'GENAI',
     defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
     defaultModel: 'gemini-2.0-flash',
-    models: []
+    // Free-tier usable Gemini chat models (free keys can call these within quota).
+    // Override with GENAI_MODELS=gemini-2.0-flash,gemini-1.5-flash
+    models: [
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-lite',
+      'gemini-1.5-flash',
+      'gemini-1.5-flash-8b'
+    ]
   },
   ollama: {
     name: 'Ollama Cloud',
@@ -84,14 +100,26 @@ export const PROVIDERS = {
     defaultModel: 'gpt-oss:20b',
     // Cloud needs an API key; local mode can run without one.
     requiresApiKey: false,
-    models: []
+    // Fallback models tried in order on the same key. Override with OLLAMA_MODELS=...
+    models: [
+      'gpt-oss:20b',
+      'gpt-oss:120b',
+      'qwen3-coder:30b'
+    ]
   },
   groq: {
     name: 'Groq',
     envPrefix: 'GROQ',
     defaultBaseURL: 'https://api.groq.com/openai/v1',
     defaultModel: 'llama-3.1-8b-instant',
-    models: []
+    // All Groq models are free-tier accessible. Override with GROQ_MODELS=...
+    models: [
+      'llama-3.1-8b-instant',
+      'llama-3.3-70b-versatile',
+      'llama-3.3-70b-specdec',
+      'gemma2-9b-it',
+      'mixtral-8x7b-32768'
+    ]
   }
 };
 
@@ -245,6 +273,50 @@ export function getProviderIds() {
 export function getProviderModels(provider = 'openrouter') {
   const prov = PROVIDERS[provider];
   return prov ? prov.models : [];
+}
+
+/**
+ * Builds the ordered list of models to try for a provider's automatic fallback.
+ * Order (duplicates removed, first occurrence wins):
+ *   1. UI-selected model (primary provider only)
+ *   2. Env override (<PREFIX>_MODELS, comma-separated) — server-admin preference
+ *   3. Provider's built-in free-model fallback list
+ *   4. Provider defaultModel as a final safety net
+ *
+ * This powers the "model → key → provider" rotation in callLLM(): when a
+ * (key, model) pair crosses its rate limit, the next free model on the SAME
+ * key is tried before moving to the next key or provider.
+ *
+ * @param {string} provider - Provider key from the PROVIDERS registry
+ * @param {string} [overrideModel] - Model chosen in the UI (primary provider only)
+ * @returns {string[]}
+ */
+export function getProviderFallbackModels(provider = 'openrouter', overrideModel) {
+  const prov = PROVIDERS[provider];
+  if (!prov) return [];
+
+  const fromEnv = (process.env[`${prov.envPrefix}_MODELS`] || '')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+
+  const candidates = [
+    ...(overrideModel ? [overrideModel] : []),
+    ...fromEnv,
+    ...(prov.models || []),
+    ...(prov.defaultModel ? [prov.defaultModel] : [])
+  ];
+
+  const seen = new Set();
+  const result = [];
+  for (const model of candidates) {
+    if (!model) continue;
+    if (seen.has(model)) continue;
+    seen.add(model);
+    result.push(model);
+  }
+
+  return result;
 }
 
 /**

@@ -278,6 +278,7 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     removeDirectoryRecursive(preExtractPath);
 
     if (!validation.valid) {
+      removeDirectoryRecursive(preExtractPath);
       removeFile(zipFile.path);
       sessionFailed.add(id);
       return res.status(400).json({ error: `Project validation failed: ${validation.reason}` });

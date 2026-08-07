@@ -324,3 +324,11 @@ export function getProviderFallbackModels(provider = 'openrouter', overrideModel
  * Helps stay under free-tier TPM quotas.
  */
 export const RATE_LIMIT_PAUSE_MS = 5500;
+
+/**
+ * Max build-fix attempts per incremental step before failing the migration.
+ * Each step writes ONE file, builds, and if it fails, asks AI to fix.
+ * After this many failures the step is skipped and migration continues.
+ * Override via MAX_BUILD_FIX_ATTEMPTS=5
+ */
+export const MAX_BUILD_FIX_ATTEMPTS = parseInt(process.env.MAX_BUILD_FIX_ATTEMPTS, 10) || 3;

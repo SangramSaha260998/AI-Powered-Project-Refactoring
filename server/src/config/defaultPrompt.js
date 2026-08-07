@@ -309,6 +309,96 @@ export const REACT_TO_ANGULAR_PROMPT = `
 `;
 
 /**
+ * Incremental migration blueprint prompt — instructs the AI to create an
+ * ordered plan from leaf nodes (no dependencies) to root nodes.
+ */
+export const INCREMENTAL_BLUEPRINT_PROMPT = `
+## INCREMENTAL MIGRATION BLUEPRINT — DEPENDENCY ORDER (applied automatically)
+
+You are creating an INCREMENTAL migration plan. The plan must be ordered from
+SMALLEST/SIMPLEST changes to LARGEST/MOST COMPLEX changes.
+
+### Ordering Rules (MANDATORY):
+1. **Leaf nodes first**: Files with NO dependencies on other source files
+   (utilities, types, constants, validators, pipes, pure functions)
+2. **Simple components**: Small standalone components with minimal imports
+3. **Services**: Angular services, React hooks, API clients
+4. **Complex components**: Pages, forms, modals, layouts
+5. **Root components last**: App shell, routing, configuration wiring
+
+### Output Format:
+Return a JSON object with a single key "incrementalPlan" containing an array.
+Each element represents ONE migration step with this exact structure:
+
+\`\`\`json
+{
+  "incrementalPlan": [
+    {
+      "step": 1,
+      "newPath": "src/app/shared/utils/format.ts",
+      "explanationOfSource": "Convert utility function from React to Angular",
+      "approximateSourceFilesToRead": ["src/lib/utils/format.ts"],
+      "dependencies": [],
+      "complexity": "low"
+    },
+    {
+      "step": 2,
+      "newPath": "src/app/shared/pipes/truncate.pipe.ts",
+      "explanationOfSource": "Convert truncate utility to Angular pipe",
+      "approximateSourceFilesToRead": ["src/lib/utils/truncate.ts"],
+      "dependencies": [],
+      "complexity": "low"
+    },
+    {
+      "step": 3,
+      "newPath": "src/app/core/services/auth.service.ts",
+      "explanationOfSource": "Convert auth context to Angular service",
+      "approximateSourceFilesToRead": ["src/contexts/AuthContext.tsx", "src/hooks/useAuth.ts"],
+      "dependencies": ["src/app/shared/utils/format.ts"],
+      "complexity": "medium"
+    },
+    {
+      "step": 4,
+      "newPath": "src/app/pages/auth/login/login.component.ts",
+      "explanationOfSource": "Convert login page",
+      "approximateSourceFilesToRead": ["src/pages/Login.tsx", "src/components/LoginForm.tsx"],
+      "dependencies": ["src/app/core/services/auth.service.ts"],
+      "complexity": "medium"
+    },
+    {
+      "step": 5,
+      "newPath": "src/app/pages/admin/dashboard/dashboard.component.ts",
+      "explanationOfSource": "Convert dashboard page",
+      "approximateSourceFilesToRead": ["src/pages/Dashboard.tsx", "src/components/StatsCard.tsx"],
+      "dependencies": ["src/app/core/services/auth.service.ts"],
+      "complexity": "high"
+    },
+    {
+      "step": 6,
+      "newPath": "src/app/app.component.ts",
+      "explanationOfSource": "Convert root App component",
+      "approximateSourceFilesToRead": ["src/App.tsx"],
+      "dependencies": ["src/app/pages/auth/login/login.component.ts", "src/app/pages/admin/dashboard/dashboard.component.ts"],
+      "complexity": "high"
+    }
+  ]
+}
+\`\`\`
+
+### Rules:
+- Each step MUST be independently compilable after it is written
+- "dependencies" lists files from THIS PLAN that must exist before this step
+- "complexity" must be one of: "low", "medium", "high"
+- Steps with the same complexity can be reordered if dependencies allow
+- Include ALL files needed: components (.ts + .html + .scss triad), services, pipes, directives, utils
+- For Angular: plan templateUrl/styleUrl pairs — each .ts gets matching .html and .scss
+- For React: plan .tsx files with optional .scss companions
+- Do NOT include config files (package.json, tsconfig.json, angular.json, vite.config.ts)
+- The plan must cover ALL source files from the original project
+- Output ONLY raw JSON — no markdown, no explanation, no backticks
+`;
+
+/**
  * Returns the appropriate default prompt based on source → target frameworks.
  *
  * @param {string} fromTech - Source framework

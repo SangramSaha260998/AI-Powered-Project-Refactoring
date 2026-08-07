@@ -16,9 +16,10 @@ import {
   getProviderFallbackModels,
   isProviderConfigured,
   isOllamaCloudMode,
-  RATE_LIMIT_PAUSE_MS
+  RATE_LIMIT_PAUSE_MS,
+  MAX_BUILD_FIX_ATTEMPTS
 } from '../config/index.js';
-import { getDefaultPrompt } from '../config/defaultPrompt.js';
+import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
 import { resolveTargetVersions, formatVersionMandate } from '../config/targetVersions.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
@@ -2003,7 +2004,7 @@ export {
 // -----------------------------------------------------------------------
 // Build verification — ensures the migrated project compiles before delivery
 // -----------------------------------------------------------------------
-const MAX_BUILD_RETRIES = 2;
+// MAX_BUILD_FIX_ATTEMPTS is imported from config — used for incremental build retries
 
 /**
  * Run a shell command and return { stdout, stderr, exitCode }.
@@ -2026,20 +2027,28 @@ function runCommand(cmd, args, cwd, timeoutMs = 300000) {
  * Verify that the migrated project compiles by running npm install + build.
  * Returns { success: boolean, errors: string }.
  */
-async function verifyBuild(workspacePath, targetTech, sessionId) {
+async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = false) {
   const isAngular = targetTech.toLowerCase().includes('angular');
   const isReact = targetTech.toLowerCase().includes('react');
   const buildCmd = isAngular ? 'npx' : 'npm';
   const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
 
-  console.log(`[${sessionId}] Build verification: running npm install...`);
-  const installResult = await runCommand('npm', ['install', '--prefer-offline'], workspacePath, 300000);
-  if (installResult.exitCode !== 0) {
-    const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
-    console.error(`[${sessionId}] npm install failed:\n`, errOutput);
-    return { success: false, errors: `npm install failed:\n${errOutput}` };
+  // Check if node_modules already exists to skip expensive npm install
+  const nodeModulesPath = path.join(workspacePath, 'node_modules');
+  const hasNodeModules = fs.existsSync(nodeModulesPath);
+
+  if (!skipInstall && !hasNodeModules) {
+    console.log(`[${sessionId}] Build verification: running npm install...`);
+    const installResult = await runCommand('npm', ['install', '--prefer-offline'], workspacePath, 300000);
+    if (installResult.exitCode !== 0) {
+      const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
+      console.error(`[${sessionId}] npm install failed:\n`, errOutput);
+      return { success: false, errors: `npm install failed:\n${errOutput}` };
+    }
+    console.log(`[${sessionId}] npm install succeeded. Running build...`);
+  } else {
+    console.log(`[${sessionId}] Build verification: skipping npm install (node_modules exists). Running build...`);
   }
-  console.log(`[${sessionId}] npm install succeeded. Running build...`);
 
   const buildResult = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
   if (buildResult.exitCode === 0) {
@@ -2110,14 +2119,15 @@ IMPORTANT RULES:
  * Returns { verified: boolean }.
  */
 async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel) {
-  for (let attempt = 1; attempt <= MAX_BUILD_RETRIES; attempt++) {
-    console.log(`[${sessionId}] Build verification attempt ${attempt}/${MAX_BUILD_RETRIES}...`);
-    const result = await verifyBuild(workspacePath, targetTech, sessionId);
+  for (let attempt = 1; attempt <= MAX_BUILD_FIX_ATTEMPTS; attempt++) {
+    console.log(`[${sessionId}] Final build verification attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS}...`);
+    // Skip npm install - node_modules should already exist from incremental builds
+    const result = await verifyBuild(workspacePath, targetTech, sessionId, true);
     if (result.success) {
       return { verified: true };
     }
 
-    if (attempt < MAX_BUILD_RETRIES) {
+    if (attempt < MAX_BUILD_FIX_ATTEMPTS) {
       console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
       const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
       if (fixes.length === 0) {
@@ -2272,10 +2282,11 @@ RULES:
 
   const crossFrameworkInstruction = `
 You are a Principal Software Architect. Your task is to analyze an incoming source codebase and plan out a structural framework migration based on the user's demands.
-Analyze the file directory structure. Provide an array mapping of target framework files that must be created from scratch to fully rebuild the app in the new architecture.
+
+${INCREMENTAL_BLUEPRINT_PROMPT}
+
 - If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.scss, src/app/app.routes.ts, etc.
 - If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
-Your output must strictly be raw valid JSON. No markdown wrappers. The JSON must have a single top-level key "migrationPlan" whose value is an array of objects. Each object must have these keys: "newPath" (string), "explanationOfSource" (string), "approximateSourceFilesToRead" (array of strings).
 
 IMPORTANT RULES FOR FILE GENERATION:
 - For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
@@ -2387,8 +2398,16 @@ ${enhancedPrompt}`
       try {
         const cleaned = blueprintText.replace(/^```(?:json)?\n?/gm, '').replace(/\n?```$/gm, '').trim();
         parsedPlan = JSON.parse(cleaned);
-        targetFileList = parsedPlan.migrationPlan;
+        // Support both legacy migrationPlan and new incrementalPlan formats
+        targetFileList = parsedPlan.incrementalPlan || parsedPlan.migrationPlan;
         if (targetFileList && Array.isArray(targetFileList) && targetFileList.length > 0) {
+          // If incrementalPlan, log the dependency ordering info
+          if (parsedPlan.incrementalPlan) {
+            const low = targetFileList.filter(f => f.complexity === 'low').length;
+            const med = targetFileList.filter(f => f.complexity === 'medium').length;
+            const high = targetFileList.filter(f => f.complexity === 'high').length;
+            console.log(`[${sessionId}] Incremental plan detected: ${targetFileList.length} steps (low: ${low}, medium: ${med}, high: ${high})`);
+          }
           success = true;
         }
       } catch (_) {
@@ -2585,6 +2604,55 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
     fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
     generatedFiles[safePath.relative] = trimmedContent;
 
+    // -----------------------------------------------------------------------
+    // INCREMENTAL BUILD VERIFICATION: After each file, verify build compiles
+    // If build fails, ask AI to fix errors before moving to next file
+    // -----------------------------------------------------------------------
+    if (targetLower.includes('angular') || targetLower.includes('react')) {
+      console.log(`[${sessionId}] Step ${i + 1}/${filteredPlan.length}: Verifying build after writing ${fileTarget.newPath}...`);
+      
+      let stepBuildVerified = false;
+      // Skip npm install on incremental builds - node_modules exists from initial install
+      const skipInstall = i > 0;
+      for (let buildAttempt = 1; buildAttempt <= MAX_BUILD_FIX_ATTEMPTS; buildAttempt++) {
+        const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, skipInstall);
+        if (buildResult.success) {
+          stepBuildVerified = true;
+          console.log(`[${sessionId}] Step ${i + 1} build ✅ PASSED (attempt ${buildAttempt})`);
+          break;
+        }
+        
+        if (buildAttempt < MAX_BUILD_FIX_ATTEMPTS) {
+          console.log(`[${sessionId}] Step ${i + 1} build ❌ FAILED (attempt ${buildAttempt}/${MAX_BUILD_FIX_ATTEMPTS}). Asking AI to fix...`);
+          const fixes = await askAIToFixBuildErrors(sessionId, buildResult.errors, migrationWorkspacePath, aiProvider, aiModel, toTech);
+          if (fixes.length === 0) {
+            console.warn(`[${sessionId}] AI returned no fixes for step ${i + 1}. Continuing to next step.`);
+            break;
+          }
+          for (const fix of fixes) {
+            const fixPath = resolveSafeWritePath(migrationWorkspacePath, fix.relativePath);
+            if (!fixPath) {
+              console.warn(`[${sessionId}] Skipping unsafe fix path: ${fix.relativePath}`);
+              continue;
+            }
+            ensureDirectoryExists(path.dirname(fixPath.full));
+            fs.writeFileSync(fixPath.full, sanitizeGeneratedContent(fix.relativePath, fix.content), 'utf-8');
+            console.log(`[${sessionId}] Fixed: ${fix.relativePath}`);
+            // Update generatedFiles with the fix
+            generatedFiles[fixPath.relative] = fix.content;
+          }
+          // Re-run post-process repairs after AI fixes
+          if (targetLower.includes('angular')) {
+            repairAngularWorkspace(migrationWorkspacePath, {});
+          } else if (targetLower.includes('react')) {
+            repairReactWorkspace(migrationWorkspacePath, {});
+          }
+        } else {
+          console.warn(`[${sessionId}] Step ${i + 1} build FAILED after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Continuing to next step.`);
+        }
+      }
+    }
+
     // Rate-limit pause between files (not after the last one)
     if (i < filteredPlan.length - 1) {
       console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s...`);
@@ -2707,7 +2775,7 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
     aiModel || undefined
   );
   if (!buildCheck.verified) {
-    console.warn(`[${sessionId}] Build verification failed after ${MAX_BUILD_RETRIES} attempts. Delivering anyway.`);
+    console.warn(`[${sessionId}] Final build verification failed after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Delivering anyway.`);
   }
 
   // Remove node_modules to keep ZIP small (user will run npm ci locally)

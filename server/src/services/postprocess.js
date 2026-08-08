@@ -207,10 +207,67 @@ function insertIntoClassBody(source, snippet) {
 }
 
 function classHasMember(source, name) {
+  const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Must detect `@Input() foo!`, `foo = input()`, methods, and fields.
+  // The definite-assignment `!` previously caused false misses → duplicate stubs.
   const re = new RegExp(
-    `\\b(?:(?:public|protected|private|readonly)\\s+)*${name}\\s*[=:(]|\\bget\\s+${name}\\s*\\(|\\b${name}\\s*\\(`
+    [
+      `@(?:Input|Output)\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b`,
+      `(?:readonly\\s+)?${esc}\\s*=\\s*(?:input|output|model)\\s*(?:<[^>]*>)?\\s*\\(`,
+      `\\b(?:(?:public|protected|private|readonly)\\s+)*${esc}\\s*!\\s*[=:]`,
+      `\\b(?:(?:public|protected|private|readonly)\\s+)*${esc}\\s*[=:(]`,
+      `\\bget\\s+${esc}\\s*\\(`,
+      `\\b${esc}\\s*\\(`
+    ].join('|')
   );
   return re.test(source);
+}
+
+/**
+ * Remove heuristic stubs that collide with real @Input/@Output/input()/output() members.
+ * Typical failure: stub `onClick(..._args)` + `@Input() onClick!` → TS2300 / TS2717.
+ */
+function dedupeStubbedClassMembers(source) {
+  const names = new Set();
+  for (const m of source.matchAll(/@(?:Input|Output)\s*\([^)]*\)\s*(?:readonly\s+)?(\w+)/g)) {
+    names.add(m[1]);
+  }
+  for (const m of source.matchAll(/(?:readonly\s+)?(\w+)\s*=\s*(?:input|output|model)\s*(?:<[^>]*>)?\s*\(/g)) {
+    names.add(m[1]);
+  }
+  if (!names.size) return source;
+
+  let updated = source;
+  for (const name of names) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Drop postprocess method stubs
+    updated = updated.replace(
+      new RegExp(
+        `^[ \\t]*${esc}\\(\\.\.\._args:\\s*any\\[\\]\\)\\s*\\{[\\s\\S]*?\\}\\s*\\n?`,
+        'gm'
+      ),
+      ''
+    );
+    // Drop simple field stubs (not @Input/@Output lines)
+    updated = updated.replace(
+      new RegExp(
+        `^[ \\t]*(?:public|protected|private|readonly\\s+)*${esc}\\s*!?:\\s*[^=;\\n]+?=\\s*(?:null|false|''|""|\\[\\])\\s*;\\s*\\n?`,
+        'gm'
+      ),
+      ''
+    );
+  }
+  return updated;
+}
+
+/**
+ * Fix `prop: string = null` / `prop: number = null` (strictNullChecks).
+ */
+function repairNullAssignedPrimitives(source) {
+  return source.replace(
+    /(^\s*(?:public|protected|private|readonly\s+)*(?:@Input\(\)\s*)?)(\w+)(\s*!?:\s*)(string|number|boolean)(\s*=\s*null\s*;)/gm,
+    '$1$2$3$4 | null$5'
+  );
 }
 
 /**
@@ -1223,6 +1280,10 @@ function repairAngularComponentFile(tsPath) {
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
 
+  // Prefer real @Input/@Output over heuristic stubs; fix strict-null field inits
+  source = dedupeStubbedClassMembers(source);
+  source = repairNullAssignedPrimitives(source);
+
   // Ensure default sibling css exists / is valid
   const cssFiles = new Set(
     assets.filter((a) => a.type === 'css').map((a) => a.full)
@@ -1768,6 +1829,164 @@ function rewriteAtAliasImportsInTree(destPath) {
 /**
  * Full Angular workspace repair after AI generation.
  */
+/** Event-style outputs only — not callback Inputs like onClick used as `[onClick]="fn"`. */
+const PROMOTE_TO_OUTPUT = new Set([
+  'onSave', 'onCancel', 'onSubmit', 'onClose', 'onConfirm', 'onSelect',
+  'onChange', 'onDelete', 'onEdit', 'onCreate', 'onUpdate', 'onRemove'
+]);
+
+const SKIP_AUTO_INPUT = new Set([
+  'class', 'style', 'ngClass', 'ngStyle', 'ngIf', 'ngFor', 'ngSwitch', 'ngModel',
+  'formGroup', 'formControl', 'formControlName', 'routerLink', 'routerLinkActive',
+  'cdkDrag', 'cdkDropList', 'matTooltip', 'matMenuTriggerFor'
+]);
+
+/**
+ * Ensure child components declare `@Input()` for parent property bindings like `[description]`.
+ */
+function ensureInputsFromParentPropertyBindings(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const bySelector = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+      if (sel) bySelector.set(sel[1].toLowerCase(), file);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** @type {Map<string, Set<string>>} */
+  const needed = new Map();
+  for (const htmlFile of walkFiles(srcRoot, (n) => n.endsWith('.html'))) {
+    let html;
+    try {
+      html = fs.readFileSync(htmlFile, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const m of html.matchAll(
+      /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b([^>]*)>/gi
+    )) {
+      const tag = m[1].toLowerCase();
+      const attrs = m[2] || '';
+      const file = bySelector.get(tag);
+      if (!file) continue;
+      for (const am of attrs.matchAll(/\[([A-Za-z_][A-Za-z0-9_]*)\]\s*=/g)) {
+        const inputName = am[1];
+        if (SKIP_AUTO_INPUT.has(inputName) || inputName.startsWith('attr.')) continue;
+        if (!needed.has(file)) needed.set(file, new Set());
+        needed.get(file).add(inputName);
+      }
+    }
+  }
+
+  for (const [file, names] of needed) {
+    let source = fs.readFileSync(file, 'utf-8');
+    const original = source;
+    for (const name of names) {
+      if (classHasMember(source, name)) continue;
+      source = ensureImport(source, 'Input', '@angular/core');
+      source = insertIntoClassBody(source, `  @Input() ${name}: any = null;`);
+    }
+    if (source !== original) {
+      source = repairNullAssignedPrimitives(source);
+      fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+    }
+  }
+}
+
+/**
+ * Parents binding `(onSave)="..."` on a child need `@Output() onSave`, not `@Input()`.
+ * Without this, Angular treats the binding as a DOM listener and `$event` is `Event`.
+ */
+function ensureOutputsFromParentEventBindings(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const bySelector = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    try {
+      const content = fs.readFileSync(file, 'utf-8');
+      const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+      if (sel) bySelector.set(sel[1].toLowerCase(), file);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** @type {Map<string, Set<string>>} */
+  const needed = new Map();
+  for (const htmlFile of walkFiles(srcRoot, (n) => n.endsWith('.html'))) {
+    let html;
+    try {
+      html = fs.readFileSync(htmlFile, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const m of html.matchAll(
+      /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b[^>]*\((on[A-Za-z][A-Za-z0-9]*)\)\s*=/gi
+    )) {
+      const tag = m[1].toLowerCase();
+      const outName = m[2];
+      if (!PROMOTE_TO_OUTPUT.has(outName)) continue;
+      const file = bySelector.get(tag);
+      if (!file) continue;
+      if (!needed.has(file)) needed.set(file, new Set());
+      needed.get(file).add(outName);
+    }
+  }
+
+  for (const [file, names] of needed) {
+    let source = fs.readFileSync(file, 'utf-8');
+    const original = source;
+    for (const name of names) {
+      const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (
+        new RegExp(`@Output\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b`).test(source) ||
+        new RegExp(`\\b${esc}\\s*=\\s*output\\s*(?:<[^>]*>)?\\s*\\(`).test(source)
+      ) {
+        continue;
+      }
+
+      source = source.replace(
+        new RegExp(`^[ \\t]*@Input\\s*\\([^)]*\\)\\s*${esc}\\s*!?:[^;\\n]*;\\s*\\n?`, 'gm'),
+        ''
+      );
+      source = source.replace(
+        new RegExp(`^[ \\t]*${esc}\\(\\.\.\._args:[\\s\\S]*?\\}\\s*\\n?`, 'gm'),
+        ''
+      );
+      source = source.replace(
+        new RegExp(
+          `^[ \\t]*(?:public|protected|private|readonly\\s+)*${esc}\\s*!?:\\s*[^=;\\n]+=\\s*[^;\\n]+;\\s*\\n?`,
+          'gm'
+        ),
+        ''
+      );
+
+      source = ensureImport(source, 'Output', '@angular/core');
+      source = ensureImport(source, 'EventEmitter', '@angular/core');
+      source = insertIntoClassBody(source, `  @Output() ${name} = new EventEmitter<any>();`);
+
+      // Child template may still call onSave(...) as a React callback — use .emit()
+      const htmlPath = file.replace(/\.ts$/, '.html');
+      if (fs.existsSync(htmlPath)) {
+        let html = fs.readFileSync(htmlPath, 'utf-8');
+        const nextHtml = html.replace(
+          new RegExp(`\\b${esc}(?!\\.emit)\\s*\\(`, 'g'),
+          `${name}.emit(`
+        );
+        if (nextHtml !== html) {
+          fs.writeFileSync(htmlPath, nextHtml.endsWith('\n') ? nextHtml : `${nextHtml}\n`, 'utf-8');
+        }
+      }
+    }
+    if (source !== original) {
+      fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+    }
+  }
+}
+
 export function repairAngularWorkspace(destPath, options = {}) {
   const { sourceFilesMap = null, sourcePackageJson = null } = options;
 
@@ -1785,6 +2004,13 @@ export function repairAngularWorkspace(destPath, options = {}) {
     } catch (err) {
       console.warn(`[postprocess] Failed repairing ${file}: ${err.message}`);
     }
+  }
+
+  try {
+    ensureInputsFromParentPropertyBindings(destPath);
+    ensureOutputsFromParentEventBindings(destPath);
+  } catch (err) {
+    console.warn(`[postprocess] Input/Output binding repair failed: ${err.message}`);
   }
 
   // Also repair standalone .ts under components that use @Component without .component.ts suffix

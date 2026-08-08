@@ -363,6 +363,84 @@ const PROTECTED_OUTPUT_FILES = new Set([
 ]);
 
 /**
+ * Extract source paths mentioned in Angular/Vite build error output.
+ */
+function extractPathsFromBuildErrors(buildErrors) {
+  const text = String(buildErrors || '');
+  const matches = text.match(/src\/[\w./-]+\.(?:ts|tsx|html|scss|css|jsx)/g) || [];
+  return [...new Set(matches.map((p) => p.replace(/\\/g, '/')))];
+}
+
+/**
+ * Map AI-suggested fix paths onto real workspace files.
+ * Common failure: AI writes src/admin/... while the real file is src/app/admin/...
+ */
+function resolveFixWritePath(workspaceRoot, requestedPath, buildErrors = '') {
+  if (!requestedPath || typeof requestedPath !== 'string') return null;
+
+  let normalized = requestedPath
+    .replace(/\\/g, '/')
+    .trim()
+    .replace(/^\.?\//, '')
+    .replace(/^(migrated-(?:angular|react)-project\/)+/i, '');
+
+  const remapPrefixes = [
+    [/^src\/admin\//i, 'src/app/admin/'],
+    [/^src\/pages\//i, 'src/app/pages/'],
+    [/^src\/core\//i, 'src/app/core/'],
+    [/^src\/shared\//i, 'src/app/shared/'],
+    [/^src\/store\//i, 'src/app/store/'],
+    [/^src\/config\//i, 'src/app/config/'],
+    [/^admin\//i, 'src/app/admin/'],
+    [/^pages\//i, 'src/app/pages/'],
+    [/^app\//i, 'src/app/']
+  ];
+  for (const [re, replacement] of remapPrefixes) {
+    if (re.test(normalized)) {
+      normalized = normalized.replace(re, replacement);
+      break;
+    }
+  }
+
+  const errorPaths = extractPathsFromBuildErrors(buildErrors);
+  const base = path.posix.basename(normalized);
+  const errorMatch = errorPaths.find((p) => path.posix.basename(p) === base);
+  if (errorMatch) {
+    normalized = errorMatch;
+  } else if (!fs.existsSync(path.join(workspaceRoot, normalized))) {
+    // Fall back to any existing file with the same basename under src/
+    const srcRoot = path.join(workspaceRoot, 'src');
+    if (fs.existsSync(srcRoot)) {
+      const found = [];
+      const walk = (dir) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (entry.name === base) found.push(path.relative(workspaceRoot, full).replace(/\\/g, '/'));
+        }
+      };
+      try { walk(srcRoot); } catch { /* ignore */ }
+      if (found.length === 1) normalized = found[0];
+      else if (found.length > 1) {
+        const preferApp = found.find((p) => p.includes('/app/')) || found[0];
+        normalized = preferApp;
+      }
+    }
+  }
+
+  return resolveSafeWritePath(workspaceRoot, normalized);
+}
+
+/**
+ * True when build output looks like truncated / invalid TypeScript syntax
+ * (not a missing import or type mismatch).
+ */
+function isSyntaxHeavyBuildFailure(buildErrors) {
+  const text = String(buildErrors || '');
+  return /TS1005|TS1109|TS1128|TS1131|TS1003|TS2695|Unexpected EOF|Expression expected/i.test(text);
+}
+
+/**
  * Resolve a write path that must stay inside the migration workspace.
  * Returns null if the path is unsafe or points at a protected config file.
  */
@@ -1617,8 +1695,16 @@ function injectAngularCoreSharedFiles(destPath, versionStack = null) {
   const envDestDir = path.resolve(destPath, 'src', 'environments');
   if (fs.existsSync(envSrcDir)) {
     ensureDirectoryExists(envDestDir);
-    fs.cpSync(envSrcDir, envDestDir, { recursive: true });
-    console.log(`[angular_required] Copied environments → ${path.relative(destPath, envDestDir)}`);
+    // Do not wipe AI-extended environment files on re-inject — only seed missing ones
+    for (const file of fs.readdirSync(envSrcDir)) {
+      const srcFile = path.join(envSrcDir, file);
+      const destFile = path.join(envDestDir, file);
+      if (!fs.statSync(srcFile).isFile()) continue;
+      if (!fs.existsSync(destFile)) {
+        fs.copyFileSync(srcFile, destFile);
+      }
+    }
+    console.log(`[angular_required] Seeded environments → ${path.relative(destPath, envDestDir)} (existing files preserved)`);
   }
 
   console.log(
@@ -2421,24 +2507,97 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
 }
 
 /**
+ * Deterministic fix: when build errors say environment is missing props
+ * (theme, appTitle, …), inject those keys into all environment*.ts files.
+ * Returns number of files patched.
+ */
+function patchEnvironmentMissingProps(workspacePath, buildErrors) {
+  const text = String(buildErrors || '');
+  if (!/environment/i.test(text)) return 0;
+
+  const missing = new Set();
+  const patterns = [
+    /Property '([A-Za-z_][\w]*)' does not exist on type '\{[^']*production:\s*boolean[^']*\}'/g,
+    /expression of type '"([A-Za-z_][\w]*)"' can't be used to index type '\{[^']*production:\s*boolean/g,
+    /Property '([A-Za-z_][\w]*)' does not exist[\s\S]{0,160}?environment/gi
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) missing.add(m[1]);
+  }
+  for (const key of ['theme', 'appTitle']) {
+    if (new RegExp(`['"]${key}['"]|\\.${key}\\b`).test(text)) missing.add(key);
+  }
+
+  const reserved = new Set(['production', 'encryption', 'length', 'name', 'prototype', 'constructor', 'string', 'boolean', 'unknown']);
+  for (const k of [...missing]) {
+    if (reserved.has(k) || k.length > 40) missing.delete(k);
+  }
+  if (missing.size === 0) return 0;
+
+  const defaults = {
+    theme: "'light'",
+    appTitle: "'Migrated Application'",
+    apiUrl: "'http://localhost:3000/api'",
+    host: "'http://localhost:3000'"
+  };
+
+  const envDir = path.join(workspacePath, 'src', 'environments');
+  if (!fs.existsSync(envDir)) return 0;
+
+  let patchedFiles = 0;
+  for (const file of fs.readdirSync(envDir)) {
+    if (!/^environment.*\.ts$/i.test(file)) continue;
+    const full = path.join(envDir, file);
+    let src = fs.readFileSync(full, 'utf-8');
+    let changed = false;
+
+    for (const key of missing) {
+      if (new RegExp(`\\b${key}\\s*:`).test(src)) continue;
+      const value = defaults[key] ?? "''";
+      const next = src.replace(/\n(\s*)\}\s*;\s*$/m, (match, indent) => {
+        changed = true;
+        return `\n${indent}  ${key}: ${value},\n${indent}};\n`;
+      });
+      if (next !== src) src = next;
+    }
+
+    if (changed) {
+      fs.writeFileSync(full, src.endsWith('\n') ? src : `${src}\n`, 'utf-8');
+      patchedFiles += 1;
+      console.log(`[env-patch] Updated ${path.relative(workspacePath, full)} (+ ${[...missing].join(', ')})`);
+    }
+  }
+  return patchedFiles;
+}
+
+/**
  * Ask the AI to fix build errors. Returns an array of { relativePath, content }.
  */
 async function askAIToFixBuildErrors(sessionId, buildErrors, workspacePath, aiProvider, aiModel, targetTech) {
   const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
   const filesContext = buildFilesContext(currentFiles);
 
+  const errorPaths = extractPathsFromBuildErrors(buildErrors);
   const fixPrompt = `The migrated ${targetTech} project has BUILD ERRORS. Fix ONLY the files causing errors.
 
 BUILD ERROR OUTPUT:
-\n${buildErrors}\n\nCURRENT PROJECT FILES:
+\n${buildErrors}\n\nFILES MENTIONED IN ERRORS (use these EXACT paths — do not drop "app/" from Angular paths):
+${errorPaths.length ? errorPaths.map((p) => `- ${p}`).join('\n') : '- (parse from error output)'}
+
+CURRENT PROJECT FILES:
 ${filesContext}
 
 IMPORTANT RULES:
 - Output a JSON object with key "files" containing an array of objects:
   [{"path": "src/path/file.ts", "content": "full file content"}]
+- path MUST be an exact workspace-relative path from the error list (e.g. src/app/admin/... NOT src/admin/...).
+- For Angular, application code lives under src/app/ — never write src/admin or src/pages at the top of src/.
 - Only include files that need to be changed to fix the build errors.
-- Each file must be complete (not a diff).
-- Do NOT include package.json, angular.json, tsconfig.json, or any config files.
+- Each file must be COMPLETE valid TypeScript/HTML/SCSS (not a diff, not truncated, no dangling commas/object literals).
+- Do NOT include package.json, angular.json, tsconfig.json, or any root config files.
+- You MAY update src/environments/environment*.ts when errors are about missing environment properties (theme, appTitle, etc.).
+- Prefer extending environment with the missing keys rather than casting.
 - Make the minimum changes needed to fix compilation errors.
 - Output ONLY valid JSON, no markdown fences.`;
 
@@ -2488,20 +2647,30 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
 
     if (attempt < MAX_BUILD_FIX_ATTEMPTS) {
       console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
+      if (String(targetTech).toLowerCase().includes('angular')) {
+        const envPatched = patchEnvironmentMissingProps(workspacePath, result.errors);
+        if (envPatched > 0) {
+          console.log(`[${sessionId}] Patched ${envPatched} environment file(s). Retrying build...`);
+          continue;
+        }
+      }
       const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
       if (fixes.length === 0) {
         console.warn(`[${sessionId}] AI returned no fixes. Skipping remaining retries.`);
         break;
       }
       for (const fix of fixes) {
-        const safePath = resolveSafeWritePath(workspacePath, fix.relativePath);
+        const safePath = resolveFixWritePath(workspacePath, fix.relativePath, result.errors);
         if (!safePath) {
-          console.warn(`[${sessionId}] Skipping unsafe fix path: ${fix.relativePath}`);
+          console.warn(`[${sessionId}] Skipping unsafe/unresolved fix path: ${fix.relativePath}`);
           continue;
         }
+        if (safePath.relative !== fix.relativePath.replace(/\\/g, '/').replace(/^\.?\//, '')) {
+          console.log(`[${sessionId}] Remapped fix path ${fix.relativePath} → ${safePath.relative}`);
+        }
         ensureDirectoryExists(path.dirname(safePath.full));
-        fs.writeFileSync(safePath.full, sanitizeGeneratedContent(fix.relativePath, fix.content), 'utf-8');
-        console.log(`[${sessionId}] Fixed: ${fix.relativePath}`);
+        fs.writeFileSync(safePath.full, sanitizeGeneratedContent(safePath.relative, fix.content), 'utf-8');
+        console.log(`[${sessionId}] Fixed: ${safePath.relative}`);
       }
       // Re-run post-process repairs after AI fixes
       if (targetTech.toLowerCase().includes('angular')) {
@@ -2857,7 +3026,7 @@ You are a Principal Software Architect. Your task is to analyze an incoming sour
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
 
-- If targeting Angular: convert React components into Angular Standalone Components. Create/update src/app/app.component.ts, src/app/app.component.html, src/app/app.component.scss, src/app/app.routes.ts, etc.
+- If targeting Angular: convert React components into Angular Standalone Components under src/app/ (e.g. src/app/pages/..., src/app/admin/...). NEVER plan paths like src/admin or src/pages outside src/app/.
 - If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 
 IMPORTANT RULES FOR FILE GENERATION:
@@ -2874,10 +3043,11 @@ IMPORTANT RULES FOR FILE GENERATION:
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
 - ANGULAR_REQUIRED KIT (already injected — do NOT re-plan these paths):
   src/app/shared/{animations,components,directives,models,pipes,utilities,validators},
-  src/app/core/interceptors/, src/app/store/, src/environments/.
+  src/app/core/interceptors/, src/app/store/.
   Reuse breadcrumbs / confirmation-dialog / global-search / pipes / directives / validators from shared.
   Path aliases: @app/*, @core/*, @env/*, @shared/*, @/*.
   Do NOT delete or regenerate those kit files. Wire app.config / providers to use real interceptors from core/interceptors when needed.
+- ENVIRONMENTS: src/environments already has appTitle, theme, host, apiUrl, encryption. When a config unit needs more env keys, plan environment*.ts updates in the SAME unit as that config file.
 - Map lucide-react icons to plain inline SVG markup in Angular (NO @lucide/angular / lucide-angular / lucide-react packages). Every icon must be a real <svg xmlns=...>...</svg> with Lucide paths. For React target keep lucide-react.
 - For Angular: NEVER plan Lucide* imports, LucideIconModule, <lucide-*> tags, or <svg lucideXxx>. Plan inline SVG only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
@@ -3035,6 +3205,37 @@ ${enhancedPrompt}`
   // Drop unsafe / protected / framework-mismatched planned files before writing
   const filteredPlan = targetFileList.filter((item) => {
     if (!item || typeof item.newPath !== 'string') return false;
+
+    // Normalize Angular plan paths that omit src/app/
+    let planned = item.newPath.replace(/\\/g, '/').replace(/^\.?\//, '');
+    if (targetLower.includes('angular')) {
+      const planRemaps = [
+        [/^src\/admin\//i, 'src/app/admin/'],
+        [/^src\/pages\//i, 'src/app/pages/'],
+        [/^src\/core\//i, 'src/app/core/'],
+        [/^src\/shared\//i, 'src/app/shared/'],
+        [/^src\/store\//i, 'src/app/store/'],
+        [/^src\/config\//i, 'src/app/config/'],
+        [/^admin\//i, 'src/app/admin/'],
+        [/^pages\//i, 'src/app/pages/']
+      ];
+      for (const [re, to] of planRemaps) {
+        if (re.test(planned)) {
+          console.log(`[${sessionId}] Remapped plan path ${planned} → ${planned.replace(re, to)}`);
+          planned = planned.replace(re, to);
+          break;
+        }
+      }
+      item.newPath = planned;
+      if (item.unit && typeof item.unit === 'string') {
+        let u = item.unit.replace(/\\/g, '/');
+        for (const [re, to] of planRemaps) {
+          if (re.test(u)) { u = u.replace(re, to); break; }
+        }
+        item.unit = u;
+      }
+    }
+
     const safe = resolveSafeWritePath(migrationWorkspacePath, item.newPath);
     if (!safe) {
       console.log(`[${sessionId}] Skipping protected/unsafe planned file: ${item.newPath}`);
@@ -3119,7 +3320,8 @@ CRITICAL RULES:
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
-36. ANGULAR_REQUIRED: Shared kit under src/app/shared, core/interceptors, store, environments is ALREADY present. Do not recreate those files. Import from @app/shared/*, @app/core/interceptors, @app/store, @env/environment as needed. Auth/services under core may be expanded by you.
+36. ANGULAR_REQUIRED: Shared kit under src/app/shared, core/interceptors, store is ALREADY present. Do not recreate those files. Import from @app/shared/*, @app/core/interceptors, @app/store, @env/environment as needed.
+37. ENVIRONMENTS: src/environments/environment*.ts already include production, host, apiUrl, appTitle, theme, encryption, plus an index signature. Prefer those keys. If you need another env key, UPDATE the environment*.ts files in the SAME unit (do not cast missing keys).
 `;
 
   const generatedFiles = {};
@@ -3247,6 +3449,17 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
             continue;
           }
 
+          // Deterministic env patch first (theme/appTitle mismatches) — cheaper than LLM
+          if (targetLower.includes('angular')) {
+            const envPatched = patchEnvironmentMissingProps(migrationWorkspacePath, buildResult.errors);
+            if (envPatched > 0) {
+              console.log(
+                `[${sessionId}] Patched ${envPatched} environment file(s) for missing keys. Retrying build before AI fix...`
+              );
+              continue;
+            }
+          }
+
           const fixes = await askAIToFixBuildErrors(
             sessionId,
             buildResult.errors,
@@ -3257,27 +3470,81 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
           );
           if (fixes.length === 0) {
             console.warn(`[${sessionId}] AI returned no fixes for unit ${unitIndex + 1}.`);
+            // On syntax failures, force a full rewrite of this unit's primary .ts/.tsx file
+            if (isSyntaxHeavyBuildFailure(buildResult.errors)) {
+              const primary = unit.files.find((f) => /\.(ts|tsx)$/i.test(f.newPath) && !/\.d\.ts$/i.test(f.newPath));
+              if (primary) {
+                console.log(`[${sessionId}] Syntax-heavy failure — forcing rewrite of ${primary.newPath}`);
+                const rewritePrompt = `
+[MANDATORY USER MIGRATION REQUIREMENTS]
+${enhancedPrompt}
+
+[BUILD ERRORS]
+${buildResult.errors}
+
+[ASSIGNMENT]
+Rewrite COMPLETE valid contents for: "${primary.newPath}"
+Purpose: ${primary.explanationOfSource}
+Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
+`;
+                try {
+                  let rewritten = await callLLM(fileWriterSystemInstruction, rewritePrompt, false, aiProvider, aiModel);
+                  const safePath = resolveSafeWritePath(migrationWorkspacePath, primary.newPath);
+                  if (safePath) {
+                    const sanitized = sanitizeGeneratedContent(safePath.relative, rewritten);
+                    fs.writeFileSync(safePath.full, sanitized, 'utf-8');
+                    generatedFiles[safePath.relative] = sanitized;
+                    console.log(`[${sessionId}] Rewrote: ${safePath.relative}`);
+                  }
+                } catch (err) {
+                  console.warn(`[${sessionId}] Forced rewrite failed: ${err.message}`);
+                }
+              }
+            }
             continue;
           }
           for (const fix of fixes) {
-            const fixPath = resolveSafeWritePath(migrationWorkspacePath, fix.relativePath);
+            const fixPath = resolveFixWritePath(migrationWorkspacePath, fix.relativePath, buildResult.errors);
             if (!fixPath) {
-              console.warn(`[${sessionId}] Skipping unsafe fix path: ${fix.relativePath}`);
+              console.warn(`[${sessionId}] Skipping unsafe/unresolved fix path: ${fix.relativePath}`);
               continue;
             }
+            if (fixPath.relative.replace(/\\/g, '/') !== String(fix.relativePath).replace(/\\/g, '/').replace(/^\.?\//, '')) {
+              console.log(`[${sessionId}] Remapped fix path ${fix.relativePath} → ${fixPath.relative}`);
+              // Remove mistaken orphan path if AI created src/admin/... duplicate
+              const orphan = path.join(migrationWorkspacePath, String(fix.relativePath).replace(/^\.?\//, ''));
+              if (
+                fs.existsSync(orphan) &&
+                String(fix.relativePath).replace(/\\/g, '/').startsWith('src/admin/') &&
+                fixPath.relative.startsWith('src/app/admin/')
+              ) {
+                try { fs.unlinkSync(orphan); } catch { /* ignore */ }
+              }
+            }
             ensureDirectoryExists(path.dirname(fixPath.full));
-            const sanitized = sanitizeGeneratedContent(fix.relativePath, fix.content);
+            const sanitized = sanitizeGeneratedContent(fixPath.relative, fix.content);
             fs.writeFileSync(fixPath.full, sanitized, 'utf-8');
-            console.log(`[${sessionId}] Fixed: ${fix.relativePath}`);
+            console.log(`[${sessionId}] Fixed: ${fixPath.relative}`);
             generatedFiles[fixPath.relative] = sanitized;
           }
           if (targetLower.includes('angular')) {
+            const pkgBefore = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
+              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
+              : '';
             repairAngularWorkspace(migrationWorkspacePath, {});
-            // repair may add npm deps (clsx, etc.) — force reinstall on next verify
-            npmInstallDone = false;
+            const pkgAfter = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
+              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
+              : '';
+            if (pkgBefore !== pkgAfter) npmInstallDone = false;
           } else if (targetLower.includes('react')) {
+            const pkgBefore = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
+              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
+              : '';
             repairReactWorkspace(migrationWorkspacePath, {});
-            npmInstallDone = false;
+            const pkgAfter = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
+              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
+              : '';
+            if (pkgBefore !== pkgAfter) npmInstallDone = false;
           }
         } else {
           const errTail = (buildResult.errors || '').slice(-2000);

@@ -300,6 +300,13 @@ export const REACT_TO_ANGULAR_PROMPT = `
 - Icons: plain inline \`<svg>...</svg>\` only — never lucide packages or lucideXxx attributes.
 - Child tags MUST match the child's \`selector\` (prefer \`app-*\`) and be listed in \`imports\`.
 - No \`private\` members in templates. No field + getter with the same name.
+- NEVER declare the same member twice (e.g. stub method \`onClick(...)\` AND
+  \`@Input() onClick\`). One declaration only.
+- NEVER \`prop: string = null\` / \`prop: number = null\` — use \`string | null\`,
+  \`number | null\`, or a non-null default (\`''\`, \`0\`).
+- Parent \`(onSave)="save($event)"\` requires the child \`@Output() onSave =
+  new EventEmitter<...>()\` (not \`@Input()\`). Typed \`$event\` must match
+  the handler parameter (not DOM \`Event\` unless it is a native DOM listener).
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.

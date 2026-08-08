@@ -322,8 +322,9 @@ export function getProviderFallbackModels(provider = 'openrouter', overrideModel
 /**
  * Rate-limit pause between AI file generations (in ms).
  * Helps stay under free-tier TPM quotas.
+ * Override via RATE_LIMIT_PAUSE_MS=2200
  */
-export const RATE_LIMIT_PAUSE_MS = 5500;
+export const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS, 10) || 2200;
 
 /**
  * Max build-fix attempts per incremental UNIT before failing the migration.

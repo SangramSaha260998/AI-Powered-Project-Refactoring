@@ -44,8 +44,9 @@ export const ANGULAR_REQUIRED_PROTECTED_PREFIXES = [
   'src/app/shared/utilities/',
   'src/app/shared/validators/',
   'src/app/core/interceptors/',
-  'src/app/store/',
-  'src/environments/'
+  'src/app/store/'
+  // NOTE: src/environments/ is intentionally NOT protected — incremental units
+  // (e.g. app.settings) often need to extend environment with theme/appTitle/etc.
 ];
 
 export function isAngularRequiredProtectedPath(relativePath) {

@@ -47,3 +47,10 @@ interface IFetchAllEventsResponse {
   parent_event_id: number;
   event_name: string;
 }
+
+interface IAiReportInfoList {
+  master_ai_report_id: number;
+  report_main_category: number;
+  report_name: string;
+  report_description: string;
+}

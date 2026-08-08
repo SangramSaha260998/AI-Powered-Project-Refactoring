@@ -248,7 +248,7 @@ export function fileUploadValidation(
 
   if (files.length > 0) {
     // Getting list of files
-    for (const file of files) {
+    for (const file of Array.from(files)) {
       const _fileName = file.name; // file name
       const _fileSize = file.size; // file size
       const _fileTypes = fileTypes; // preferred extensions

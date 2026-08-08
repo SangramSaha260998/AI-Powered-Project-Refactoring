@@ -22,8 +22,12 @@ export class ClickOutsideDirective implements OnInit {
   constructor(private _elementRef: ElementRef) {}
 
   @HostListener('document:click', ['$event.target'])
-  onClick(target: HTMLElement) {
+  onClick(target: EventTarget | null) {
     if (!this.captured) {
+      return;
+    }
+
+    if (!(target instanceof HTMLElement)) {
       return;
     }
 

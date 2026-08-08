@@ -52,12 +52,16 @@ src/
   main.ts
   index.html
   styles.scss
+  environments/     # from angular_required (do not delete)
   app/
     app.component.ts|html|scss
     app.config.ts
     app.routes.ts
+    config/         # appSettings (stub or real)
     core/           # singleton services, guards, interceptors, auth
-    shared/         # reusable UI, pipes, directives, utils
+      interceptors/ # from angular_required (do not regenerate)
+    shared/         # from angular_required: UI, pipes, directives, utils, validators
+    store/          # from angular_required (NGXS)
     pages/          # one folder per feature (auth/, dashboard/, …)
       common/       # for all common pages
         not-found/
@@ -73,6 +77,10 @@ src/
 - Clear names, small focused components, no dead code, no unused imports.
 - Strict typing; no \`any\` unless unavoidable. Public template API only
   (public/protected — never private in templates).
+- When targeting Angular, the workspace already includes the \`angular_required\` shared kit
+  (shared components/directives/pipes/validators/utilities, core interceptors, store, environments)
+  plus npm deps (\`@angular/material\`, \`@angular/cdk\`, \`@ngxs/store\`, \`@ngx-loading-bar/core\`, \`bowser\`).
+  Reuse those modules; do not delete or reinvent them.
 
 ### React best structure
 \`\`\`
@@ -311,24 +319,34 @@ export const REACT_TO_ANGULAR_PROMPT = `
 /**
  * Incremental migration blueprint prompt — instructs the AI to create an
  * ordered plan from leaf nodes (no dependencies) to root nodes.
+ * Used for BOTH cross-framework conversion and same-framework strip-down.
  */
 export const INCREMENTAL_BLUEPRINT_PROMPT = `
 ## INCREMENTAL MIGRATION BLUEPRINT — DEPENDENCY ORDER (applied automatically)
 
-You are creating an INCREMENTAL migration plan. The plan must be ordered from
-SMALLEST/SIMPLEST changes to LARGEST/MOST COMPLEX changes.
+You are creating an INCREMENTAL migration plan. The uploaded project must be
+converted in SMALL PIECES, ordered from SMALLEST/SIMPLEST to LARGEST/MOST COMPLEX.
+The runtime will write one logical UNIT at a time, run a build, and only proceed
+after that unit compiles.
 
 ### Ordering Rules (MANDATORY):
-1. **Leaf nodes first**: Files with NO dependencies on other source files
+1. **Leaf nodes first**: Files with NO dependencies on other app files
    (utilities, types, constants, validators, pipes, pure functions)
-2. **Simple components**: Small standalone components with minimal imports
-3. **Services**: Angular services, React hooks, API clients
-4. **Complex components**: Pages, forms, modals, layouts
-5. **Root components last**: App shell, routing, configuration wiring
+2. **Simple shared UI**: Small presentational components with minimal imports
+3. **Services / hooks**: Angular services, React hooks, API clients, stores
+4. **Feature pages**: Forms, modals, layouts, auth pages, dashboard
+5. **Root wiring last**: App shell, routing, bootstrap-related src files
+
+### Logical units (MANDATORY):
+- Angular component = ONE unit of three sibling paths listed BACK-TO-BACK in order:
+  \`name.component.ts\`, then \`name.component.html\`, then \`name.component.scss\`
+- React component = ONE unit: \`Name.tsx\` then optional companion \`Name.scss\`
+- Services, pipes, utils, routes, configs-in-src = ONE file = ONE unit
+- Never scatter a component triad across distant steps
 
 ### Output Format:
 Return a JSON object with a single key "incrementalPlan" containing an array.
-Each element represents ONE migration step with this exact structure:
+Each element is ONE file in the ordered plan (triad siblings listed consecutively):
 
 \`\`\`json
 {
@@ -336,65 +354,63 @@ Each element represents ONE migration step with this exact structure:
     {
       "step": 1,
       "newPath": "src/app/shared/utils/format.ts",
-      "explanationOfSource": "Convert utility function from React to Angular",
+      "explanationOfSource": "Port utility (leaf — no app deps)",
       "approximateSourceFilesToRead": ["src/lib/utils/format.ts"],
       "dependencies": [],
-      "complexity": "low"
+      "complexity": "low",
+      "unit": "src/app/shared/utils/format.ts"
     },
     {
       "step": 2,
-      "newPath": "src/app/shared/pipes/truncate.pipe.ts",
-      "explanationOfSource": "Convert truncate utility to Angular pipe",
-      "approximateSourceFilesToRead": ["src/lib/utils/truncate.ts"],
-      "dependencies": [],
-      "complexity": "low"
+      "newPath": "src/app/core/services/auth.service.ts",
+      "explanationOfSource": "Port auth service",
+      "approximateSourceFilesToRead": ["src/contexts/AuthContext.tsx"],
+      "dependencies": ["src/app/shared/utils/format.ts"],
+      "complexity": "medium",
+      "unit": "src/app/core/services/auth.service.ts"
     },
     {
       "step": 3,
-      "newPath": "src/app/core/services/auth.service.ts",
-      "explanationOfSource": "Convert auth context to Angular service",
-      "approximateSourceFilesToRead": ["src/contexts/AuthContext.tsx", "src/hooks/useAuth.ts"],
-      "dependencies": ["src/app/shared/utils/format.ts"],
-      "complexity": "medium"
+      "newPath": "src/app/pages/auth/login/login.component.ts",
+      "explanationOfSource": "Login page TypeScript",
+      "approximateSourceFilesToRead": ["src/pages/Login.tsx"],
+      "dependencies": ["src/app/core/services/auth.service.ts"],
+      "complexity": "medium",
+      "unit": "src/app/pages/auth/login/login.component"
     },
     {
       "step": 4,
-      "newPath": "src/app/pages/auth/login/login.component.ts",
-      "explanationOfSource": "Convert login page",
-      "approximateSourceFilesToRead": ["src/pages/Login.tsx", "src/components/LoginForm.tsx"],
+      "newPath": "src/app/pages/auth/login/login.component.html",
+      "explanationOfSource": "Login page template",
+      "approximateSourceFilesToRead": ["src/pages/Login.tsx"],
       "dependencies": ["src/app/core/services/auth.service.ts"],
-      "complexity": "medium"
+      "complexity": "medium",
+      "unit": "src/app/pages/auth/login/login.component"
     },
     {
       "step": 5,
-      "newPath": "src/app/pages/admin/dashboard/dashboard.component.ts",
-      "explanationOfSource": "Convert dashboard page",
-      "approximateSourceFilesToRead": ["src/pages/Dashboard.tsx", "src/components/StatsCard.tsx"],
+      "newPath": "src/app/pages/auth/login/login.component.scss",
+      "explanationOfSource": "Login page styles (minimal SCSS)",
+      "approximateSourceFilesToRead": [],
       "dependencies": ["src/app/core/services/auth.service.ts"],
-      "complexity": "high"
-    },
-    {
-      "step": 6,
-      "newPath": "src/app/app.component.ts",
-      "explanationOfSource": "Convert root App component",
-      "approximateSourceFilesToRead": ["src/App.tsx"],
-      "dependencies": ["src/app/pages/auth/login/login.component.ts", "src/app/pages/admin/dashboard/dashboard.component.ts"],
-      "complexity": "high"
+      "complexity": "low",
+      "unit": "src/app/pages/auth/login/login.component"
     }
   ]
 }
 \`\`\`
 
 ### Rules:
-- Each step MUST be independently compilable after it is written
-- "dependencies" lists files from THIS PLAN that must exist before this step
+- Prefer stubs/minimal wiring so each completed UNIT can compile before later units exist
+  (e.g. routes may temporarily omit pages not yet migrated; expand routes when those units land)
+- "dependencies" lists plan \`newPath\` values (or unit ids) that must exist before this file
+- "unit" groups sibling files of one component; identical \`unit\` for triad members
 - "complexity" must be one of: "low", "medium", "high"
-- Steps with the same complexity can be reordered if dependencies allow
-- Include ALL files needed: components (.ts + .html + .scss triad), services, pipes, directives, utils
-- For Angular: plan templateUrl/styleUrl pairs — each .ts gets matching .html and .scss
-- For React: plan .tsx files with optional .scss companions
-- Do NOT include config files (package.json, tsconfig.json, angular.json, vite.config.ts)
-- The plan must cover ALL source files from the original project
+- Include ALL needed app files for the migration scope (not config: package.json, tsconfig, angular.json, vite.config)
+- For Angular: always plan full .ts + .html + .scss triads with matching names
+- For React: plan .tsx (+ optional .scss)
+- Same-framework strip-down: only plan files that remain (auth + dashboard + shell); omit deleted features
+- Cover every file required for a runnable result within the user scope
 - Output ONLY raw JSON — no markdown, no explanation, no backticks
 `;
 

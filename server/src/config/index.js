@@ -326,9 +326,9 @@ export function getProviderFallbackModels(provider = 'openrouter', overrideModel
 export const RATE_LIMIT_PAUSE_MS = 5500;
 
 /**
- * Max build-fix attempts per incremental step before failing the migration.
- * Each step writes ONE file, builds, and if it fails, asks AI to fix.
- * After this many failures the step is skipped and migration continues.
+ * Max build-fix attempts per incremental UNIT before failing the migration.
+ * Each unit (e.g. Angular .ts+.html+.scss triad) is written, then built.
+ * On failure the AI is asked to fix; after this many failures the pipeline STOPS.
  * Override via MAX_BUILD_FIX_ATTEMPTS=5
  */
 export const MAX_BUILD_FIX_ATTEMPTS = parseInt(process.env.MAX_BUILD_FIX_ATTEMPTS, 10) || 3;

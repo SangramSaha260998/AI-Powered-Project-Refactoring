@@ -1446,12 +1446,27 @@ function repairAngularRoutes(destPath) {
 function addAngularPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfigAppPath = path.join(destPath, 'tsconfig.app.json');
+  const pathAliases = {
+    '@/*': ['src/*'],
+    '@app/*': ['src/app/*'],
+    '@core/*': ['src/app/core/*'],
+    '@env/*': ['src/environments/*'],
+    '@shared/*': ['src/app/shared/*']
+  };
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
   tsconfig.compilerOptions.baseUrl = './';
+  // Classic "node" resolution cannot read Angular package "exports" (e.g. @angular/common/http)
+  if (tsconfig.compilerOptions.moduleResolution === 'node') {
+    tsconfig.compilerOptions.moduleResolution = 'bundler';
+  }
+  const libs = tsconfig.compilerOptions.lib || [];
+  if (!libs.includes('dom.iterable')) {
+    tsconfig.compilerOptions.lib = [...new Set([...libs, 'ES2022', 'dom', 'dom.iterable'])];
+  }
   tsconfig.compilerOptions.paths = {
     ...(tsconfig.compilerOptions.paths || {}),
-    '@/*': ['src/*']
+    ...pathAliases
   };
   writeJson(tsconfigPath, tsconfig);
 
@@ -1461,7 +1476,7 @@ function addAngularPathAliases(destPath) {
     appCfg.compilerOptions.baseUrl = './';
     appCfg.compilerOptions.paths = {
       ...(appCfg.compilerOptions.paths || {}),
-      '@/*': ['src/*']
+      ...pathAliases
     };
     writeJson(tsconfigAppPath, appCfg);
   }
@@ -1546,6 +1561,27 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     if (!pkg.dependencies['@angular/animations']) {
       const coreVer = pkg.dependencies['@angular/core'] || '^22.0.8';
       pkg.dependencies['@angular/animations'] = coreVer;
+    }
+
+    // angular_required kit dependencies (Material, NGXS, loading-bar, bowser, …)
+    // Always overwrite Material/CDK — never keep a core-patch pin like ^21.2.18 (ETARGET).
+    const coreVer = String(pkg.dependencies['@angular/core'] || '^22.0.8').replace(/^\^/, '');
+    const major = parseInt(coreVer.split('.')[0], 10) || 22;
+    const materialVer = `^${major}.0.0`;
+    let ngxs = '^21.0.0';
+    if (major <= 18) ngxs = '^18.1.0';
+    else if (major === 19) ngxs = '^19.0.0';
+    else if (major === 20) ngxs = '^20.0.0';
+
+    const angularRequiredDeps = {
+      '@angular/cdk': materialVer,
+      '@angular/material': materialVer,
+      '@ngxs/store': ngxs,
+      '@ngx-loading-bar/core': '^7.0.0',
+      bowser: '^2.11.0'
+    };
+    for (const [name, version] of Object.entries(angularRequiredDeps)) {
+      pkg.dependencies[name] = version;
     }
 
     // Remove ALL lucide packages from Angular output — icons are plain inline SVG
@@ -2193,5 +2229,6 @@ export {
   componentClassNameFromFile,
   mergePackageDependencies,
   addAngularPathAliases,
-  addReactPathAliases
+  addReactPathAliases,
+  ensureCnUtil
 };

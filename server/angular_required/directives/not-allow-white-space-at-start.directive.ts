@@ -11,7 +11,7 @@ export class NotAllowWhiteSpaceAtStartDirective {
     @Optional() @Self() private control: NgControl,
   ) {}
 
-  @HostListener('input', ['$event']) onInput(): void {
+  @HostListener('input') onInput(): void {
     const input = this.el.nativeElement as HTMLInputElement;
     const trimmed = input.value.replace(/^\s+/, '');
 

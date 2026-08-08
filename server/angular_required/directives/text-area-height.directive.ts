@@ -21,11 +21,11 @@ export class TextAreaHeightDirective {
     private renderer: Renderer2,
   ) {}
 
-  @HostListener('input', ['$event'])
+  @HostListener('input')
   onInputEvent() {
     this.updateRowCount();
   }
-  @HostListener('keydown', ['$event'])
+  @HostListener('keydown')
   onKeyupEvent() {
     this.updateRowCount();
   }

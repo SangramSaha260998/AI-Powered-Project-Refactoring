@@ -7,7 +7,7 @@ import { Directive, EventEmitter, HostListener, Output } from '@angular/core';
 export class ShortClickDirective {
   private startX: number | null = null;
   private startY: number | null = null;
-  private timer: NodeJS.Timeout | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
   private movementThreshold = 25; // Movement threshold in pixels
   @Output() shortClick = new EventEmitter<void>();
 

@@ -78,6 +78,9 @@ interface ISubMenu {
   value: boolean;
   action: IAction[];
 }
+
+type AclSubMenu = ISubMenu;
+
 interface IAction {
   operation_id: number;
   fk_menu_id: number;

@@ -2,6 +2,7 @@ import {
   Host,
   Self,
   DoCheck,
+  Inject,
   Optional,
   Renderer2,
   Directive,
@@ -26,7 +27,7 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
   private checkPage: number[];
 
   constructor(
-    @Host() @Self() @Optional() private readonly matPag: MatPaginator,
+    @Host() @Self() @Optional() @Inject(MatPaginator) private readonly matPag: MatPaginator | null,
     private readonly ViewContainer: ViewContainerRef,
     private readonly renderer: Renderer2,
     private el: ElementRef,
@@ -35,29 +36,9 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
     this.pageGapTxt = ['•••', '---'];
     this.showTotalPages = 3;
     this.checkPage = [0, 0, 0];
-    // Display custom range label text
-    // this.matPag._intl.getRangeLabel = (
-    //   page: number,
-    //   pageSize: number,
-    //   length: number
-    // ): string => {
-    //   const startIndex = page * pageSize;
-    //   const endIndex =
-    //     startIndex < length
-    //       ? Math.min(startIndex + pageSize, length)
-    //       : startIndex + pageSize;
-    //   return length > 0
-    //     ? 'Showing ' +
-    //         (startIndex + 1) +
-    //         ' – ' +
-    //         endIndex +
-    //         ' of ' +
-    //         length +
-    //         ' records'
-    //     : 'Showing 0 – 0 of 0 records';
-    // };
     // Subscribe to rerender buttons when next page and last page button is used
-    this.matPag.page.subscribe((paginator: PageEvent) => {
+    this.matPag?.page.subscribe((paginator: PageEvent) => {
+      if (!this.matPag) return;
       this.currentPage = paginator.pageIndex;
       this.matPag.pageIndex = paginator.pageIndex;
       this.initPageRange();
@@ -65,11 +46,12 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
   }
 
   ngDoCheck(): void {
+    if (!this.matPag) return;
     // Reset paginator if the pageSize, pageIndex, length changes
     if (
-      this.matPag?.length !== this.checkPage[0] ||
-      this.matPag?.pageSize !== this.checkPage[1] ||
-      this.matPag?.pageIndex !== this.checkPage[2]
+      this.matPag.length !== this.checkPage[0] ||
+      this.matPag.pageSize !== this.checkPage[1] ||
+      this.matPag.pageIndex !== this.checkPage[2]
     ) {
       const pageCount = this.matPag.getNumberOfPages();
       if (this.currentPage > pageCount && pageCount !== 0) {
@@ -83,6 +65,7 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
   }
 
   private buildPageNumbers = () => {
+    if (!this.matPag) return;
     const totalPages: number = this.matPag.getNumberOfPages();
     // Container div with paginator elements
 
@@ -131,11 +114,12 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
     }
 
     const dots: boolean[] = [false, false];
+    const pageIndex = this.matPag.pageIndex;
 
     if (totalPages > 0) {
       this.renderer.insertBefore(
         actionContainer,
-        this.createButton('0', this.matPag.pageIndex),
+        this.createButton('0', pageIndex),
         nextPageNode,
       );
     }
@@ -153,14 +137,14 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
       ) {
         this.renderer.insertBefore(
           actionContainer,
-          this.createButton(`${index}`, this.matPag.pageIndex),
+          this.createButton(`${index}`, pageIndex),
           nextPageNode,
         );
       } else {
         if (index > this.rangeEnd && !dots[0]) {
           this.renderer.insertBefore(
             actionContainer,
-            this.createButton(this.pageGapTxt[0], this.matPag.pageIndex),
+            this.createButton(this.pageGapTxt[0], pageIndex),
             nextPageNode,
           );
           dots[0] = true;
@@ -169,7 +153,7 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
         if (index < this.rangeEnd && !dots[1]) {
           this.renderer.insertBefore(
             actionContainer,
-            this.createButton(this.pageGapTxt[1], this.matPag.pageIndex),
+            this.createButton(this.pageGapTxt[1], pageIndex),
             nextPageNode,
           );
           dots[1] = true;
@@ -180,7 +164,7 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
     if (totalPages > 1) {
       this.renderer.insertBefore(
         actionContainer,
-        this.createButton(`${totalPages - 1}`, this.matPag.pageIndex),
+        this.createButton(`${totalPages - 1}`, pageIndex),
         nextPageNode,
       );
     }
@@ -213,9 +197,10 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
         break;
       case this.pageGapTxt[1]:
         this.renderer.listen(linkBtn, 'click', () => {
+          const total = this.matPag?.getNumberOfPages() ?? 0;
           this.switchPage(
-            this.currentPage > this.matPag.getNumberOfPages() - this.showTotalPages - 2
-              ? this.matPag.getNumberOfPages() - this.showTotalPages - 3
+            this.currentPage > total - this.showTotalPages - 2
+              ? total - this.showTotalPages - 3
               : this.currentPage - this.showTotalPages + 1,
           );
         });
@@ -242,6 +227,7 @@ export class PaginatorDirective implements DoCheck, AfterViewInit {
   }
 
   private switchPage(index: number): void {
+    if (!this.matPag) return;
     this.matPag.pageIndex = index;
     this.matPag.page.emit({
       previousPageIndex: this.currentPage,

@@ -8,9 +8,7 @@ import {
   OnDestroy,
   OnInit,
   output,
-  ViewChild,
 } from '@angular/core';
-import { GlobalSearchComponent } from '../global-search/global-search.component';
 import { EncryptionService } from '@app/core/services';
 import { Store } from '@ngxs/store';
 import { Subscription } from 'rxjs';
@@ -49,7 +47,6 @@ export class BreadcrumbsComponent implements OnInit, OnDestroy {
   private subscriptions: Subscription[] = [];
   public aiReportInfoList: IAiReportInfoList[] = [];
   @Input() showAiInfoId = 0;
-  @ViewChild('globalSearchComponentRef') globalSearchComponentRef!: GlobalSearchComponent;
 
   private aiReportInfoList$ = this._store.select(AppState.aiReportInfoList);
 

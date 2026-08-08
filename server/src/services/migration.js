@@ -21,8 +21,13 @@ import {
 } from '../config/index.js';
 import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
 import { resolveTargetVersions, formatVersionMandate } from '../config/targetVersions.js';
+import {
+  angularRequiredNpmDeps,
+  ANGULAR_REQUIRED_PATH_ALIASES,
+  isAngularRequiredProtectedPath
+} from '../config/angularRequired.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
 // Multi-key / multi-provider OpenAI clients — rotate keys, then providers
@@ -377,6 +382,11 @@ function resolveSafeWritePath(workspaceRoot, relativePath) {
     return null;
   }
 
+  // angular_required kit — AI must not overwrite injected shared/core assets
+  if (isAngularRequiredProtectedPath(normalized)) {
+    return null;
+  }
+
   // Only allow application source (and public assets) under known roots
   if (
     !normalized.startsWith('src/') &&
@@ -487,6 +497,8 @@ function findBaseSearchPath(extractPath) {
 
 /**
  * Final lock so package.json cannot drift to a different Angular major after AI/postprocess.
+ * Core framework packages track stack.core exactly; Material/CDK use major-aligned ranges
+ * (their patch lines often differ from @angular/core and pinning ^21.2.18 causes ETARGET).
  */
 function enforceAngularPackageVersions(destPath, stack) {
   if (!stack?.core) return;
@@ -514,13 +526,18 @@ function enforceAngularPackageVersions(destPath, stack) {
       pkg.dependencies[name] = `^${stack.core}`;
     }
   }
+  // angular_required deps: Material/CDK = major only; others as configured
+  const requiredDeps = angularRequiredNpmDeps(stack.core);
+  for (const [name, version] of Object.entries(requiredDeps)) {
+    pkg.dependencies[name] = version;
+  }
   pkg.devDependencies['@angular/compiler-cli'] = `^${stack.core}`;
   pkg.devDependencies['@angular/build'] = `^${stack.tooling}`;
   pkg.devDependencies['@angular/cli'] = `^${stack.tooling}`;
   if (stack.typescript) pkg.devDependencies.typescript = stack.typescript;
   if (stack.zone) pkg.dependencies['zone.js'] = stack.zone;
   fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
-  console.log(`[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source})`);
+  console.log(`[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source}); Material/CDK major-aligned`);
 }
 
 function enforceReactPackageVersions(destPath, stack) {
@@ -557,6 +574,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
   };
   const angularVersion = stack.core;
   const angularToolingVersion = stack.tooling;
+  const requiredKitDeps = angularRequiredNpmDeps(angularVersion);
 
   // 1. package.json - standalone bootstrap via @angular-devkit/build-angular
   const packageJson = {
@@ -576,12 +594,20 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
     },
     dependencies: {
       '@angular/animations': `^${angularVersion}`,
+      '@angular/cdk': requiredKitDeps['@angular/cdk'],
       '@angular/common': `^${angularVersion}`,
       '@angular/compiler': `^${angularVersion}`,
       '@angular/core': `^${angularVersion}`,
       '@angular/forms': `^${angularVersion}`,
+      '@angular/material': requiredKitDeps['@angular/material'],
       '@angular/platform-browser': `^${angularVersion}`,
       '@angular/router': `^${angularVersion}`,
+      '@ngxs/store': requiredKitDeps['@ngxs/store'],
+      '@ngx-loading-bar/core': requiredKitDeps['@ngx-loading-bar/core'],
+      bowser: requiredKitDeps.bowser,
+      clsx: '^2.1.1',
+      'tailwind-merge': '^2.5.0',
+      'class-variance-authority': '^0.7.0',
       'normalize.css': '^8.0.1',
       'rxjs': '~7.8.0',
       'tslib': '^2.3.0',
@@ -822,15 +848,15 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
       skipLibCheck: true,
       esModuleInterop: true,
       experimentalDecorators: true,
-      moduleResolution: 'node',
+      moduleResolution: 'bundler',
       importHelpers: true,
       target: 'ES2022',
       module: 'ES2022',
       useDefineForClassFields: false,
-      lib: ['ES2022', 'dom'],
+      lib: ['ES2022', 'dom', 'dom.iterable'],
       baseUrl: './',
       paths: {
-        '@/*': ['src/*']
+        ...ANGULAR_REQUIRED_PATH_ALIASES
       }
     },
     angularCompilerOptions: {
@@ -853,7 +879,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
       types: [],
       baseUrl: './',
       paths: {
-        '@/*': ['src/*']
+        ...ANGULAR_REQUIRED_PATH_ALIASES
       }
     },
     files: ['src/main.ts'],
@@ -1311,15 +1337,243 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 // ---------------------------------------------------------------------------
 
 /**
- * Recursively copies all files from the angular_required source directory
- * into the appropriate locations of the generated Angular project.
- * - shared/ → src/app/shared/
- * - interceptors/ → src/app/core/interceptors/
- * - store/ → src/app/store/
- * - environments/ → src/environments/
- * - routes/ → src/app/
+ * Write a file only when missing so AI-generated auth/services can replace stubs.
  */
-function injectAngularCoreSharedFiles(destPath) {
+function writeFileIfMissing(filePath, content) {
+  if (fs.existsSync(filePath)) return false;
+  ensureDirectoryExists(path.dirname(filePath));
+  fs.writeFileSync(filePath, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+  return true;
+}
+
+/**
+ * Companion stubs required by angular_required imports (@app/config, @core/services, …).
+ * AI may overwrite these with real implementations later.
+ */
+function ensureAngularRequiredCompanionStubs(destPath) {
+  const created = [];
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'config', 'index.ts'),
+      `export const appSettings = {
+  credentialsKey: 'credentials',
+  ajaxTimeout: 60000
+};
+`
+    )
+  ) {
+    created.push('src/app/config/index.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'common.service.ts'),
+      `import { Injectable } from '@angular/core';
+import { BehaviorSubject } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class CommonService {
+  public isRefreshingToken = false;
+  public tokenSubject = new BehaviorSubject<string | null>(null);
+  public accessControls$ = new BehaviorSubject<IACLResponse[]>([]);
+  public aclBroadcastChannel = typeof BroadcastChannel !== 'undefined'
+    ? new BroadcastChannel('acl')
+    : ({ onmessage: null } as unknown as BroadcastChannel);
+
+  setAccessControls(data: IACLResponse[], _broadcast = true): void {
+    this.accessControls$.next(data || []);
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/common.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'encryption.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class EncryptionService {
+  encryptUsingAES256(value: unknown): string {
+    try {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(value ?? {}))));
+    } catch {
+      return '';
+    }
+  }
+
+  decryptUsingAES256(value: string): unknown {
+    try {
+      return JSON.parse(decodeURIComponent(escape(atob(value))));
+    } catch {
+      return null;
+    }
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/encryption.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'crypto.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+/** Stub crypto used by angular_required HTTP success interceptor. */
+@Injectable({ providedIn: 'root' })
+export class CryptoService {
+  async encrypt(data: Record<string, unknown>): Promise<string> {
+    try {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(data ?? {}))));
+    } catch {
+      return '';
+    }
+  }
+
+  async decrypt(payload: string): Promise<unknown> {
+    try {
+      return JSON.parse(decodeURIComponent(escape(atob(payload))));
+    } catch {
+      return null;
+    }
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/crypto.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'socket-io.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class SocketIoService {
+  reconnectWithLatestToken(): void {}
+  disconnect(): void {}
+  clearConversationState(): void {}
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/socket-io.service.ts');
+  }
+
+  const servicesIndexPath = path.join(destPath, 'src', 'app', 'core', 'services', 'index.ts');
+  const servicesBarrel = `export { CommonService } from './common.service';
+export { EncryptionService } from './encryption.service';
+export { SocketIoService } from './socket-io.service';
+export { CryptoService } from './crypto.service';
+`;
+  if (!fs.existsSync(servicesIndexPath)) {
+    ensureDirectoryExists(path.dirname(servicesIndexPath));
+    fs.writeFileSync(servicesIndexPath, servicesBarrel, 'utf-8');
+    created.push('src/app/core/services/index.ts');
+  } else {
+    const existing = fs.readFileSync(servicesIndexPath, 'utf-8');
+    if (!existing.includes('CryptoService')) {
+      fs.writeFileSync(
+        servicesIndexPath,
+        `${existing.trimEnd()}\nexport { CryptoService } from './crypto.service';\n`,
+        'utf-8'
+      );
+      created.push('src/app/core/services/index.ts (CryptoService export)');
+    }
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'authentication', 'authentication.service.ts'),
+      `import { Injectable } from '@angular/core';
+import { Observable, of } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class AuthenticationService {
+  getToken(): string {
+    return '';
+  }
+
+  isAuthenticated(): boolean {
+    return false;
+  }
+
+  getRefreshToken(): Observable<{ response: { data: Omit<ITokenInfo, 'enc_email'> } }> {
+    return of({
+      response: {
+        data: {
+          access_token: '',
+          refresh_token: '',
+          refresh_token_expire_timestamp: ''
+        }
+      }
+    });
+  }
+
+  updateRefreshedToken(_data: Omit<ITokenInfo, 'enc_email'>): void {}
+
+  logout(): void {}
+}
+`
+    )
+  ) {
+    created.push('src/app/core/authentication/authentication.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'authentication', 'index.ts'),
+      `export { AuthenticationService } from './authentication.service';
+`
+    )
+  ) {
+    created.push('src/app/core/authentication/index.ts');
+  }
+
+  if (created.length) {
+    console.log(`[angular_required] Companion stubs created: ${created.join(', ')}`);
+  }
+}
+
+/**
+ * Ensure package.json includes every npm dependency used by angular_required.
+ */
+function ensureAngularRequiredNpmDeps(destPath, angularCoreVersion) {
+  const pkgPath = path.join(destPath, 'package.json');
+  if (!fs.existsSync(pkgPath)) return;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  } catch {
+    return;
+  }
+  pkg.dependencies = pkg.dependencies || {};
+  const deps = angularRequiredNpmDeps(angularCoreVersion);
+  let added = 0;
+  for (const [name, version] of Object.entries(deps)) {
+    if (!pkg.dependencies[name]) {
+      pkg.dependencies[name] = version;
+      added += 1;
+    }
+  }
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
+  if (added) {
+    console.log(`[angular_required] Added ${added} npm dependency(ies) to package.json`);
+  }
+}
+
+/**
+ * Copies angular_required into the migrated Angular workspace and wires deps/aliases/stubs.
+ * Does NOT overwrite AI-generated app.routes.ts (template routes need layouts the AI creates).
+ */
+function injectAngularCoreSharedFiles(destPath, versionStack = null) {
   const angularRequiredDir = path.resolve(__dirname, '..', '..', 'angular_required');
 
   if (!fs.existsSync(angularRequiredDir)) {
@@ -1327,12 +1581,11 @@ function injectAngularCoreSharedFiles(destPath) {
     return;
   }
 
-  // Copy shared utilities, components, pipes, directives, validators, animations to src/app/shared/
-  const sharedSrcDir = path.join(angularRequiredDir);
+  const angularCoreVersion = versionStack?.core || '22.0.8';
+
   const sharedDestDir = path.resolve(destPath, 'src', 'app', 'shared');
   ensureDirectoryExists(sharedDestDir);
-  
-  // Copy specific subdirectories to shared
+
   const sharedDirs = ['animations', 'components', 'directives', 'models', 'pipes', 'utilities', 'validators'];
   for (const dir of sharedDirs) {
     const srcPath = path.join(angularRequiredDir, dir);
@@ -1342,47 +1595,124 @@ function injectAngularCoreSharedFiles(destPath) {
       fs.cpSync(srcPath, destSubDir, { recursive: true });
     }
   }
-  console.log(`[angular_required] Copied shared files to ${path.relative(destPath, sharedDestDir)}`);
+  console.log(`[angular_required] Copied shared kit → ${path.relative(destPath, sharedDestDir)}`);
 
-  // Copy interceptors to src/app/core/interceptors/
   const interceptorsSrcDir = path.join(angularRequiredDir, 'interceptors');
   const interceptorsDestDir = path.resolve(destPath, 'src', 'app', 'core', 'interceptors');
   if (fs.existsSync(interceptorsSrcDir)) {
     ensureDirectoryExists(interceptorsDestDir);
     fs.cpSync(interceptorsSrcDir, interceptorsDestDir, { recursive: true });
-    console.log(`[angular_required] Copied interceptors to ${path.relative(destPath, interceptorsDestDir)}`);
+    console.log(`[angular_required] Copied interceptors → ${path.relative(destPath, interceptorsDestDir)}`);
   }
 
-  // Copy store to src/app/store/
   const storeSrcDir = path.join(angularRequiredDir, 'store');
   const storeDestDir = path.resolve(destPath, 'src', 'app', 'store');
   if (fs.existsSync(storeSrcDir)) {
     ensureDirectoryExists(storeDestDir);
     fs.cpSync(storeSrcDir, storeDestDir, { recursive: true });
-    console.log(`[angular_required] Copied store to ${path.relative(destPath, storeDestDir)}`);
+    console.log(`[angular_required] Copied store → ${path.relative(destPath, storeDestDir)}`);
   }
 
-  // Copy environments to src/environments/
   const envSrcDir = path.join(angularRequiredDir, 'environments');
   const envDestDir = path.resolve(destPath, 'src', 'environments');
   if (fs.existsSync(envSrcDir)) {
     ensureDirectoryExists(envDestDir);
     fs.cpSync(envSrcDir, envDestDir, { recursive: true });
-    console.log(`[angular_required] Copied environments to ${path.relative(destPath, envDestDir)}`);
+    console.log(`[angular_required] Copied environments → ${path.relative(destPath, envDestDir)}`);
   }
 
-  // Copy routes to src/app/
-  const routesSrcDir = path.join(angularRequiredDir, 'routes');
-  if (fs.existsSync(routesSrcDir)) {
-    const routesFiles = fs.readdirSync(routesSrcDir);
-    for (const file of routesFiles) {
-      const srcFile = path.join(routesSrcDir, file);
-      const destFile = path.join(destPath, 'src', 'app', file);
-      if (fs.statSync(srcFile).isFile()) {
-        fs.copyFileSync(srcFile, destFile);
-      }
+  console.log(
+    `[angular_required] Skipping routes copy (AI owns app.routes.ts). ` +
+    `Reference template remains in angular_required/routes.`
+  );
+
+  ensureAngularRequiredCompanionStubs(destPath);
+  ensureAngularRequiredNpmDeps(destPath, angularCoreVersion);
+
+  for (const cfgName of ['tsconfig.json', 'tsconfig.app.json']) {
+    const cfgPath = path.join(destPath, cfgName);
+    if (!fs.existsSync(cfgPath)) continue;
+    try {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      cfg.compilerOptions = cfg.compilerOptions || {};
+      cfg.compilerOptions.baseUrl = './';
+      cfg.compilerOptions.paths = {
+        ...(cfg.compilerOptions.paths || {}),
+        ...ANGULAR_REQUIRED_PATH_ALIASES
+      };
+      fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf-8');
+    } catch {
+      /* ignore */
     }
-    console.log(`[angular_required] Copied routes to src/app/`);
+  }
+
+  console.log(`[angular_required] Injection complete (shared kit + npm deps + companion stubs).`);
+
+  ensureAngularAppConfigUsesRequiredKit(destPath);
+}
+
+/**
+ * Ensure app.config.ts registers angular_required interceptors + NGXS AppState.
+ * Only patches when the file is missing those providers (won't clobber a richer AI config).
+ */
+function ensureAngularAppConfigUsesRequiredKit(destPath) {
+  const appConfigPath = path.join(destPath, 'src', 'app', 'app.config.ts');
+  const kitConfig = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
+import { provideStore } from '@ngxs/store';
+import { routes } from './app.routes';
+import { AppState } from './store';
+import {
+  httpAuthHeaderInterceptorFn,
+  httpErrorInterceptorFn,
+  httpSuccessHandlerInterceptorFn
+} from './core/interceptors';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideZoneChangeDetection({ eventCoalescing: true }),
+    provideRouter(routes),
+    provideAnimationsAsync(),
+    provideHttpClient(
+      withInterceptors([
+        httpAuthHeaderInterceptorFn,
+        httpErrorInterceptorFn,
+        httpSuccessHandlerInterceptorFn
+      ])
+    ),
+    provideStore([AppState])
+  ]
+};
+`;
+
+  if (!fs.existsSync(appConfigPath)) {
+    ensureDirectoryExists(path.dirname(appConfigPath));
+    fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
+    console.log(`[angular_required] Wrote app.config.ts with interceptors + NGXS store`);
+    return;
+  }
+
+  const existing = fs.readFileSync(appConfigPath, 'utf-8');
+  const hasStore = /provideStore\s*\(/.test(existing);
+  const hasInterceptors = /withInterceptors\s*\(/.test(existing) || /httpAuthHeaderInterceptorFn/.test(existing);
+  if (hasStore && hasInterceptors) return;
+
+  // Replace minimal scaffold configs; leave richer AI-authored configs alone
+  const looksMinimal =
+    /provideHttpClient\s*\(\s*\)/.test(existing) &&
+    !/provideStore/.test(existing) &&
+    existing.length < 1200;
+
+  if (looksMinimal || (!hasStore && !hasInterceptors && existing.length < 1200)) {
+    fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
+    console.log(`[angular_required] Upgraded app.config.ts with interceptors + NGXS store`);
+  } else {
+    console.log(
+      `[angular_required] app.config.ts already customized — left as-is ` +
+      `(store=${hasStore}, interceptors=${hasInterceptors})`
+    );
   }
 }
 
@@ -1421,6 +1751,21 @@ export class AppComponent {}
   const legacyCss = path.join(srcAppDir, 'app.component.css');
   if (fs.existsSync(legacyCss) && fs.existsSync(componentScssPath)) {
     try { fs.unlinkSync(legacyCss); } catch { /* ignore */ }
+  }
+
+  const routesPath = path.join(srcAppDir, 'app.routes.ts');
+  if (!fs.existsSync(routesPath)) {
+    fs.writeFileSync(
+      routesPath,
+      `import { Routes } from '@angular/router';
+
+export const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'login' },
+  { path: '**', redirectTo: 'login' }
+];
+`,
+      'utf-8'
+    );
   }
 }
 
@@ -2025,7 +2370,7 @@ function runCommand(cmd, args, cwd, timeoutMs = 300000) {
 
 /**
  * Verify that the migrated project compiles by running npm install + build.
- * Returns { success: boolean, errors: string }.
+ * Returns { success: boolean, errors: string, installOk: boolean }.
  */
 async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = false) {
   const isAngular = targetTech.toLowerCase().includes('angular');
@@ -2033,32 +2378,46 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
   const buildCmd = isAngular ? 'npx' : 'npm';
   const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
 
-  // Check if node_modules already exists to skip expensive npm install
   const nodeModulesPath = path.join(workspacePath, 'node_modules');
-  const hasNodeModules = fs.existsSync(nodeModulesPath);
+  const hasUsableTooling = isAngular
+    ? fs.existsSync(path.join(nodeModulesPath, '.bin', 'ng'))
+      || fs.existsSync(path.join(nodeModulesPath, '@angular', 'cli'))
+    : fs.existsSync(path.join(nodeModulesPath, '.bin', 'vite'))
+      || fs.existsSync(path.join(nodeModulesPath, 'vite'));
 
-  if (!skipInstall && !hasNodeModules) {
+  // Re-install when tooling is missing even if a partial node_modules folder exists
+  const shouldInstall = !skipInstall || !hasUsableTooling;
+
+  if (shouldInstall) {
     console.log(`[${sessionId}] Build verification: running npm install...`);
     const installResult = await runCommand('npm', ['install', '--prefer-offline'], workspacePath, 300000);
     if (installResult.exitCode !== 0) {
       const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
       console.error(`[${sessionId}] npm install failed:\n`, errOutput);
-      return { success: false, errors: `npm install failed:\n${errOutput}` };
+      // Remove partial node_modules so the next attempt does not skip install
+      try {
+        if (fs.existsSync(nodeModulesPath)) {
+          fs.rmSync(nodeModulesPath, { recursive: true, force: true });
+        }
+      } catch {
+        /* ignore */
+      }
+      return { success: false, errors: `npm install failed:\n${errOutput}`, installOk: false };
     }
     console.log(`[${sessionId}] npm install succeeded. Running build...`);
   } else {
-    console.log(`[${sessionId}] Build verification: skipping npm install (node_modules exists). Running build...`);
+    console.log(`[${sessionId}] Build verification: skipping npm install (tooling present). Running build...`);
   }
 
   const buildResult = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
   if (buildResult.exitCode === 0) {
     console.log(`[${sessionId}] ✅ Build succeeded!`);
-    return { success: true, errors: '' };
+    return { success: true, errors: '', installOk: true };
   }
 
   const errOutput = (buildResult.stderr || buildResult.stdout || '').slice(-4000);
   console.error(`[${sessionId}] Build failed:\n`, errOutput);
-  return { success: false, errors: errOutput };
+  return { success: false, errors: errOutput, installOk: true };
 }
 
 /**
@@ -2171,6 +2530,215 @@ function removeNodeModules(workspacePath) {
   }
 }
 
+const COMPLEXITY_RANK = { low: 0, medium: 1, high: 2 };
+
+/**
+ * Stable unit id for grouping sibling files (Angular triad / React + scss).
+ */
+function migrationUnitId(item) {
+  if (item?.unit && typeof item.unit === 'string') {
+    return item.unit.replace(/\\/g, '/').replace(/\.(ts|html|scss|css|tsx|jsx)$/i, '');
+  }
+  const p = (item?.newPath || '').replace(/\\/g, '/');
+  if (/\.component\.(ts|html|scss|css)$/i.test(p)) {
+    return p.replace(/\.component\.(ts|html|scss|css)$/i, '.component');
+  }
+  if (/\.(tsx|jsx)$/i.test(p)) {
+    return p.replace(/\.(tsx|jsx)$/i, '');
+  }
+  if (/\.scss$/i.test(p)) {
+    const withoutScss = p.replace(/\.scss$/i, '');
+    return withoutScss;
+  }
+  return p;
+}
+
+/**
+ * Topological sort by `dependencies` (newPath or unit id). Falls back to
+ * complexity then original order when deps are missing or cyclic.
+ */
+function sortPlanByDependencies(planItems) {
+  if (!Array.isArray(planItems) || planItems.length === 0) return [];
+
+  const items = planItems.map((item, index) => ({ ...item, __index: index }));
+  const byPath = new Map();
+  for (const item of items) {
+    if (item.newPath) byPath.set(item.newPath.replace(/\\/g, '/'), item);
+  }
+
+  const hasAnyDeps = items.some(
+    (item) => Array.isArray(item.dependencies) && item.dependencies.length > 0
+  );
+  if (!hasAnyDeps) {
+    return [...items].sort((a, b) => {
+      const ca = COMPLEXITY_RANK[a.complexity] ?? 1;
+      const cb = COMPLEXITY_RANK[b.complexity] ?? 1;
+      if (ca !== cb) return ca - cb;
+      return a.__index - b.__index;
+    });
+  }
+
+  const indegree = new Map(items.map((item) => [item.__index, 0]));
+  const edges = new Map(items.map((item) => [item.__index, []]));
+
+  for (const item of items) {
+    const deps = Array.isArray(item.dependencies) ? item.dependencies : [];
+    for (const dep of deps) {
+      const depNorm = String(dep).replace(/\\/g, '/');
+      const depItem =
+        byPath.get(depNorm) ||
+        items.find((c) => migrationUnitId(c) === depNorm.replace(/\.(ts|html|scss|css|tsx|jsx)$/i, ''));
+      if (!depItem || depItem.__index === item.__index) continue;
+      // dep → item
+      edges.get(depItem.__index).push(item.__index);
+      indegree.set(item.__index, (indegree.get(item.__index) || 0) + 1);
+    }
+  }
+
+  const queue = items
+    .filter((item) => (indegree.get(item.__index) || 0) === 0)
+    .sort((a, b) => {
+      const ca = COMPLEXITY_RANK[a.complexity] ?? 1;
+      const cb = COMPLEXITY_RANK[b.complexity] ?? 1;
+      if (ca !== cb) return ca - cb;
+      return a.__index - b.__index;
+    })
+    .map((item) => item.__index);
+
+  const sortedIndexes = [];
+  const itemByIndex = new Map(items.map((item) => [item.__index, item]));
+
+  while (queue.length > 0) {
+    const idx = queue.shift();
+    sortedIndexes.push(idx);
+    for (const next of edges.get(idx) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) {
+        queue.push(next);
+        queue.sort((ia, ib) => {
+          const a = itemByIndex.get(ia);
+          const b = itemByIndex.get(ib);
+          const ca = COMPLEXITY_RANK[a.complexity] ?? 1;
+          const cb = COMPLEXITY_RANK[b.complexity] ?? 1;
+          if (ca !== cb) return ca - cb;
+          return a.__index - b.__index;
+        });
+      }
+    }
+  }
+
+  if (sortedIndexes.length !== items.length) {
+    console.warn('[migration] Dependency cycle or unresolved deps — preserving partial order + remainder.');
+    const seen = new Set(sortedIndexes);
+    for (const item of items) {
+      if (!seen.has(item.__index)) sortedIndexes.push(item.__index);
+    }
+  }
+
+  return sortedIndexes.map((idx) => {
+    const { __index, ...rest } = itemByIndex.get(idx);
+    return rest;
+  });
+}
+
+/**
+ * Preferred write order inside an Angular component unit.
+ */
+function triadSiblingOrder(newPath) {
+  const p = newPath.replace(/\\/g, '/').toLowerCase();
+  if (p.endsWith('.component.ts')) return 0;
+  if (p.endsWith('.component.html')) return 1;
+  if (p.endsWith('.component.scss') || p.endsWith('.component.css')) return 2;
+  if (p.endsWith('.tsx') || p.endsWith('.jsx')) return 0;
+  if (p.endsWith('.scss') || p.endsWith('.css')) return 1;
+  return 0;
+}
+
+/**
+ * Group sorted plan files into migration units (component triads stay together).
+ * Build verification runs once per unit after all files in the unit are written.
+ */
+function groupPlanIntoMigrationUnits(planItems) {
+  const sorted = sortPlanByDependencies(planItems);
+  const units = [];
+  const consumed = new Set();
+
+  const takePath = (relPath) => {
+    const norm = relPath.replace(/\\/g, '/');
+    const found = sorted.find((item) => item.newPath.replace(/\\/g, '/') === norm);
+    if (found) {
+      consumed.add(norm);
+      return found;
+    }
+    return null;
+  };
+
+  for (const item of sorted) {
+    const pathKey = item.newPath.replace(/\\/g, '/');
+    if (consumed.has(pathKey)) continue;
+
+    // Angular component triad → one unit
+    if (/\.component\.(ts|html|scss|css)$/i.test(pathKey)) {
+      const base = pathKey.replace(/\.component\.(ts|html|scss|css)$/i, '.component');
+      const files = [];
+      for (const ext of ['.ts', '.html', '.scss']) {
+        const siblingPath = `${base}${ext}`;
+        let existing = takePath(siblingPath);
+        if (!existing && ext === '.scss') {
+          existing = takePath(`${base}.css`);
+        }
+        if (existing) {
+          files.push({ ...existing, newPath: siblingPath });
+        } else {
+          files.push({
+            newPath: siblingPath,
+            explanationOfSource: item.explanationOfSource || `Companion for ${base}`,
+            approximateSourceFilesToRead: item.approximateSourceFilesToRead || [],
+            dependencies: item.dependencies || [],
+            complexity: item.complexity || 'medium',
+            unit: base
+          });
+          consumed.add(siblingPath);
+        }
+      }
+      consumed.add(`${base}.css`);
+      units.push({ id: base, label: base, files });
+      continue;
+    }
+
+    // React component + optional scss
+    if (/\.(tsx|jsx)$/i.test(pathKey)) {
+      const base = pathKey.replace(/\.(tsx|jsx)$/i, '');
+      const files = [item];
+      consumed.add(pathKey);
+      const companion = takePath(`${base}.scss`) || takePath(`${base}.css`);
+      if (companion) {
+        files.push({ ...companion, newPath: `${base}.scss` });
+      }
+      units.push({ id: base, label: pathKey, files });
+      continue;
+    }
+
+    // Shared unit id from blueprint
+    if (item.unit) {
+      const unitKey = migrationUnitId(item);
+      const files = sorted.filter((candidate) => {
+        const cp = candidate.newPath.replace(/\\/g, '/');
+        return !consumed.has(cp) && migrationUnitId(candidate) === unitKey;
+      });
+      for (const f of files) consumed.add(f.newPath.replace(/\\/g, '/'));
+      files.sort((a, b) => triadSiblingOrder(a.newPath) - triadSiblingOrder(b.newPath));
+      units.push({ id: unitKey, label: unitKey, files: files.length ? files : [item] });
+      continue;
+    }
+
+    consumed.add(pathKey);
+    units.push({ id: pathKey, label: pathKey, files: [item] });
+  }
+
+  return units;
+}
+
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
   const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel, targetVersion } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
@@ -2255,7 +2823,10 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   if (targetLower.includes('angular')) {
     console.log(`[${sessionId}] Injecting Angular workspace templates...`);
     injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
-    injectAngularCoreSharedFiles(migrationWorkspacePath);
+    injectAngularCoreSharedFiles(migrationWorkspacePath, targetVersions.angular);
+    ensureAngularRuntimeFiles(migrationWorkspacePath);
+    ensureCnUtil(migrationWorkspacePath);
+    enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
   } else if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Injecting React workspace templates...`);
     injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
@@ -2267,17 +2838,18 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
   const sameFrameworkInstruction = `
-You are a code architect stripping down an Angular app to ONLY auth + dashboard.
+You are a code architect stripping down an app to ONLY auth + dashboard (same framework).
 
 RULES:
-- KEEP ONLY: login, register, forgot-password, dashboard, auth service, guards, interceptors, core app shell.
+- KEEP ONLY: login, register, forgot-password, dashboard, auth service/guards/interceptors, core app shell.
 - DELETE everything else: profile pages, CRUD tables, blog, about, settings, admin panels, demos.
-- Route login as default, dashboard after login, protect with auth guard.
-- Output ONLY raw JSON (no markdown, no backticks, no explanation).
-- JSON format: { "migrationPlan": [{ "newPath": "src/app/...", "explanationOfSource": "...", "approximateSourceFilesToRead": ["..."] }] }
-- Plan ONLY src/ files (components, services, styles). Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html).
-- For Angular components, use templateUrl + styleUrl (NOT inline templates).
+- Route login as default, dashboard after login, protect with auth guard / protected route.
+- Plan ONLY src/ files (components, services, styles). Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html, vite.config).
+- For Angular components, use templateUrl + styleUrl (NOT inline templates); plan full .ts + .html + .scss triads.
 - The app must compile and run after stripping.
+- Output ONLY raw JSON (no markdown, no backticks, no explanation).
+
+${INCREMENTAL_BLUEPRINT_PROMPT}
 `;
 
   const crossFrameworkInstruction = `
@@ -2300,6 +2872,12 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
+- ANGULAR_REQUIRED KIT (already injected — do NOT re-plan these paths):
+  src/app/shared/{animations,components,directives,models,pipes,utilities,validators},
+  src/app/core/interceptors/, src/app/store/, src/environments/.
+  Reuse breadcrumbs / confirmation-dialog / global-search / pipes / directives / validators from shared.
+  Path aliases: @app/*, @core/*, @env/*, @shared/*, @/*.
+  Do NOT delete or regenerate those kit files. Wire app.config / providers to use real interceptors from core/interceptors when needed.
 - Map lucide-react icons to plain inline SVG markup in Angular (NO @lucide/angular / lucide-angular / lucide-react packages). Every icon must be a real <svg xmlns=...>...</svg> with Lucide paths. For React target keep lucide-react.
 - For Angular: NEVER plan Lucide* imports, LucideIconModule, <lucide-*> tags, or <svg lucideXxx>. Plan inline SVG only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
@@ -2481,8 +3059,15 @@ ${enhancedPrompt}`
 
   console.log(`[${sessionId}] Blueprint built. Total files to convert: ${filteredPlan.length}`);
 
+  // Group into logical units (Angular triad / React+scss) and dependency order
+  const migrationUnits = groupPlanIntoMigrationUnits(filteredPlan);
+  console.log(
+    `[${sessionId}] Incremental units: ${migrationUnits.length} ` +
+    `(from ${filteredPlan.length} planned files). Build runs once per unit.`
+  );
+
   // -----------------------------------------------------------------------
-  // 4. AGENT STEP 2: Write each file one-by-one
+  // 4. AGENT STEP 2: Write each UNIT (small → large), build, fix, then next
   // -----------------------------------------------------------------------
   const fileWriterSystemInstruction = `
 You are an elite Senior Frontend Engineer executing a framework translation.
@@ -2533,37 +3118,46 @@ CRITICAL RULES:
 32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow best folder structure (Angular: app/core|shared|pages/{common,auth,admin}; React: components|features|hooks|lib|services) and high code quality.
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
+35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
+36. ANGULAR_REQUIRED: Shared kit under src/app/shared, core/interceptors, store, environments is ALREADY present. Do not recreate those files. Import from @app/shared/*, @app/core/interceptors, @app/store, @env/environment as needed. Auth/services under core may be expanded by you.
 `;
 
   const generatedFiles = {};
+  let npmInstallDone = false;
 
-  for (let i = 0; i < filteredPlan.length; i++) {
-    const fileTarget = filteredPlan[i];
-    console.log(`[${sessionId}] Writing file [${i + 1}/${filteredPlan.length}] -> ${fileTarget.newPath}`);
+  for (let unitIndex = 0; unitIndex < migrationUnits.length; unitIndex++) {
+    const unit = migrationUnits[unitIndex];
+    console.log(
+      `[${sessionId}] Unit [${unitIndex + 1}/${migrationUnits.length}] -> ${unit.label} ` +
+      `(${unit.files.length} file${unit.files.length > 1 ? 's' : ''})`
+    );
 
-    // Build context from only the files relevant to this target
-    let targetSpecificContext = '';
-    if (
-      fileTarget.approximateSourceFilesToRead &&
-      Array.isArray(fileTarget.approximateSourceFilesToRead)
-    ) {
-      for (const relPath of fileTarget.approximateSourceFilesToRead) {
-        if (filesMap[relPath]) {
-          targetSpecificContext += `\n--- SOURCE FILE: ${relPath} ---\n${filesMap[relPath]}\n`;
+    for (let fileIndex = 0; fileIndex < unit.files.length; fileIndex++) {
+      const fileTarget = unit.files[fileIndex];
+      console.log(`[${sessionId}]   Writing ${fileTarget.newPath}`);
+
+      let targetSpecificContext = '';
+      if (
+        fileTarget.approximateSourceFilesToRead &&
+        Array.isArray(fileTarget.approximateSourceFilesToRead)
+      ) {
+        for (const relPath of fileTarget.approximateSourceFilesToRead) {
+          if (filesMap[relPath]) {
+            targetSpecificContext += `\n--- SOURCE FILE: ${relPath} ---\n${filesMap[relPath]}\n`;
+          }
         }
       }
-    }
 
-    const componentDir = path.posix.dirname(fileTarget.newPath.replace(/\\/g, '/'));
-    let siblingContext = '';
-    for (const [generatedPath, generatedContent] of Object.entries(generatedFiles)) {
-      const generatedDir = path.posix.dirname(generatedPath.replace(/\\/g, '/'));
-      if (generatedDir === componentDir && generatedPath !== fileTarget.newPath) {
-        siblingContext += `\n--- ALREADY GENERATED SIBLING FILE: ${generatedPath} ---\n${generatedContent}\n`;
+      const componentDir = path.posix.dirname(fileTarget.newPath.replace(/\\/g, '/'));
+      let siblingContext = '';
+      for (const [generatedPath, generatedContent] of Object.entries(generatedFiles)) {
+        const generatedDir = path.posix.dirname(generatedPath.replace(/\\/g, '/'));
+        if (generatedDir === componentDir && generatedPath !== fileTarget.newPath) {
+          siblingContext += `\n--- ALREADY GENERATED SIBLING FILE: ${generatedPath} ---\n${generatedContent}\n`;
+        }
       }
-    }
 
-    const individualFileWriterPrompt = `
+      const individualFileWriterPrompt = `
 [GLOBAL TARGET LAYOUT BLUEPRINT MAP]
 ${fileTree}
 
@@ -2576,58 +3170,94 @@ ${enhancedPrompt}
 [ALREADY GENERATED FILES IN THIS COMPONENT FOLDER]
 ${siblingContext || 'None yet — you are the first file for this component.'}
 
+[INCREMENTAL UNIT]
+Unit ${unitIndex + 1}/${migrationUnits.length}: ${unit.label}
+Files in this unit: ${unit.files.map((f) => f.newPath).join(', ')}
+Completed units so far: ${unitIndex} — prefer compile-safe stubs for unfinished later units.
+
 [ASSIGNMENT DIRECTIONS]
 Create the complete code file content for: "${fileTarget.newPath}"
 Purpose/Details: ${fileTarget.explanationOfSource}
-${isSameFramework ? 'Keep the same framework (Angular). Strip down to essential auth + dashboard code.' : `Migration target framework: ${toTech}`}
+${isSameFramework ? 'Keep the same framework. Strip down to essential auth + dashboard code.' : `Migration target framework: ${toTech}`}
 Write ONLY this one file. No sibling file contents. No markdown fences.
 `;
 
-    let fileContent;
-    try {
-      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
-    } catch (err) {
-      console.error(`[${sessionId}] LLM call failed for ${fileTarget.newPath}:`, err.message);
-      // Retry once
-      await pause(10000);
-      fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
-    }
+      let fileContent;
+      try {
+        fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
+      } catch (err) {
+        console.error(`[${sessionId}] LLM call failed for ${fileTarget.newPath}:`, err.message);
+        await pause(10000);
+        fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
+      }
 
-    const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
-    if (!safePath) {
-      console.log(`[${sessionId}] Refusing unsafe write path: ${fileTarget.newPath}`);
-      continue;
-    }
+      const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
+      if (!safePath) {
+        console.log(`[${sessionId}] Refusing unsafe write path: ${fileTarget.newPath}`);
+        continue;
+      }
 
-    ensureDirectoryExists(path.dirname(safePath.full));
-    const trimmedContent = sanitizeGeneratedContent(safePath.relative, fileContent);
-    fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
-    generatedFiles[safePath.relative] = trimmedContent;
+      ensureDirectoryExists(path.dirname(safePath.full));
+      const trimmedContent = sanitizeGeneratedContent(safePath.relative, fileContent);
+      fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
+      generatedFiles[safePath.relative] = trimmedContent;
+
+      // Cool down between file LLM calls inside a multi-file unit
+      if (fileIndex < unit.files.length - 1) {
+        console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s...`);
+        await pause(RATE_LIMIT_PAUSE_MS);
+      }
+    }
 
     // -----------------------------------------------------------------------
-    // INCREMENTAL BUILD VERIFICATION: After each file, verify build compiles
-    // If build fails, ask AI to fix errors before moving to next file
+    // INCREMENTAL BUILD: after the whole unit is written — must pass to proceed
     // -----------------------------------------------------------------------
     if (targetLower.includes('angular') || targetLower.includes('react')) {
-      console.log(`[${sessionId}] Step ${i + 1}/${filteredPlan.length}: Verifying build after writing ${fileTarget.newPath}...`);
-      
+      console.log(
+        `[${sessionId}] Unit ${unitIndex + 1}/${migrationUnits.length}: Verifying build after ${unit.label}...`
+      );
+
       let stepBuildVerified = false;
-      // Skip npm install on incremental builds - node_modules exists from initial install
-      const skipInstall = i > 0;
       for (let buildAttempt = 1; buildAttempt <= MAX_BUILD_FIX_ATTEMPTS; buildAttempt++) {
-        const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, skipInstall);
+        const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, npmInstallDone);
         if (buildResult.success) {
+          npmInstallDone = true;
           stepBuildVerified = true;
-          console.log(`[${sessionId}] Step ${i + 1} build ✅ PASSED (attempt ${buildAttempt})`);
+          console.log(`[${sessionId}] Unit ${unitIndex + 1} build ✅ PASSED (attempt ${buildAttempt})`);
           break;
         }
-        
+        // Only skip install on later attempts when install actually succeeded
+        if (buildResult.installOk) {
+          npmInstallDone = true;
+        } else if (targetLower.includes('angular') && targetVersions?.angular) {
+          // Install failure is often a bad package pin — re-lock Material/CDK majors and retry
+          enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
+        }
+
         if (buildAttempt < MAX_BUILD_FIX_ATTEMPTS) {
-          console.log(`[${sessionId}] Step ${i + 1} build ❌ FAILED (attempt ${buildAttempt}/${MAX_BUILD_FIX_ATTEMPTS}). Asking AI to fix...`);
-          const fixes = await askAIToFixBuildErrors(sessionId, buildResult.errors, migrationWorkspacePath, aiProvider, aiModel, toTech);
+          const isInstallFailure = /npm install failed/i.test(buildResult.errors || '');
+          console.log(
+            `[${sessionId}] Unit ${unitIndex + 1} build ❌ FAILED ` +
+            `(attempt ${buildAttempt}/${MAX_BUILD_FIX_ATTEMPTS}). ` +
+            (isInstallFailure ? 'Re-checking package.json then retrying install...' : 'Asking AI to fix...')
+          );
+
+          if (isInstallFailure) {
+            // AI cannot rewrite package.json (protected) — skip LLM fix for install errors
+            continue;
+          }
+
+          const fixes = await askAIToFixBuildErrors(
+            sessionId,
+            buildResult.errors,
+            migrationWorkspacePath,
+            aiProvider,
+            aiModel,
+            toTech
+          );
           if (fixes.length === 0) {
-            console.warn(`[${sessionId}] AI returned no fixes for step ${i + 1}. Continuing to next step.`);
-            break;
+            console.warn(`[${sessionId}] AI returned no fixes for unit ${unitIndex + 1}.`);
+            continue;
           }
           for (const fix of fixes) {
             const fixPath = resolveSafeWritePath(migrationWorkspacePath, fix.relativePath);
@@ -2636,26 +3266,42 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
               continue;
             }
             ensureDirectoryExists(path.dirname(fixPath.full));
-            fs.writeFileSync(fixPath.full, sanitizeGeneratedContent(fix.relativePath, fix.content), 'utf-8');
+            const sanitized = sanitizeGeneratedContent(fix.relativePath, fix.content);
+            fs.writeFileSync(fixPath.full, sanitized, 'utf-8');
             console.log(`[${sessionId}] Fixed: ${fix.relativePath}`);
-            // Update generatedFiles with the fix
-            generatedFiles[fixPath.relative] = fix.content;
+            generatedFiles[fixPath.relative] = sanitized;
           }
-          // Re-run post-process repairs after AI fixes
           if (targetLower.includes('angular')) {
             repairAngularWorkspace(migrationWorkspacePath, {});
+            // repair may add npm deps (clsx, etc.) — force reinstall on next verify
+            npmInstallDone = false;
           } else if (targetLower.includes('react')) {
             repairReactWorkspace(migrationWorkspacePath, {});
+            npmInstallDone = false;
           }
         } else {
-          console.warn(`[${sessionId}] Step ${i + 1} build FAILED after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Continuing to next step.`);
+          const errTail = (buildResult.errors || '').slice(-2000);
+          const priorNote = unitIndex > 0
+            ? 'Earlier units compiled; '
+            : '';
+          throw new Error(
+            `Incremental migration stopped at unit ${unitIndex + 1}/${migrationUnits.length} ` +
+            `(${unit.label}): build still failing after ${MAX_BUILD_FIX_ATTEMPTS} fix attempts. ` +
+            `${priorNote}fix this unit before continuing.\n\nLast build errors:\n${errTail}`
+          );
         }
+      }
+
+      if (!stepBuildVerified) {
+        throw new Error(
+          `Incremental migration stopped at unit ${unitIndex + 1}/${migrationUnits.length} ` +
+          `(${unit.label}): build did not pass. Refusing to proceed to the next unit.`
+        );
       }
     }
 
-    // Rate-limit pause between files (not after the last one)
-    if (i < filteredPlan.length - 1) {
-      console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s...`);
+    if (unitIndex < migrationUnits.length - 1) {
+      console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s before next unit...`);
       await pause(RATE_LIMIT_PAUSE_MS);
     }
   }
@@ -2712,7 +3358,7 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
     console.log(`[${sessionId}] Re-injecting Angular templates to ensure correct config files...`);
     injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
-    injectAngularCoreSharedFiles(migrationWorkspacePath);
+    injectAngularCoreSharedFiles(migrationWorkspacePath, targetVersions.angular);
     normalizeAngularComponentFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running Angular post-generation repairs...`);
     repairAngularWorkspace(migrationWorkspacePath, {

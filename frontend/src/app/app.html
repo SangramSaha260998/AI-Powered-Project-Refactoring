@@ -1,7 +1,7 @@
 <div
   class="app-container"
   [loadingOverlay]="isLoading()"
-  [overlayText]="'Running AI migration pipeline...'"
+  [overlayText]="progressText()"
 >
   <button
     type="button"
@@ -160,20 +160,20 @@
       @if (statusMessage()) {
         <div class="status-banner" [class.success]="isSuccess()">
           <span class="status-text">{{ statusMessage() }}</span>
-          @if (retrySessions()) {
+          @if (readySessionId()) {
             <button
               class="retry-btn"
-              (click)="onRetryDownload()"
+              (click)="downloadReadySession()"
               [disabled]="isLoading()"
             >
               @if (isLoading()) {
                 <span class="spinner small"></span>
               }
-              Retry Download ↩️
+              Download ZIP ⬇️
             </button>
             <button
               class="retry-btn dismiss-btn"
-              (click)="dismissRetry()"
+              (click)="dismissReadyDownload()"
               title="Dismiss"
             >
               ✕

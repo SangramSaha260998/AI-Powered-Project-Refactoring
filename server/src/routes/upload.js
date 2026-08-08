@@ -42,13 +42,60 @@ function clearWorkFolders() {
 /**
  * In-memory map of session IDs to their final ZIP paths.
  * Populated when a migration completes successfully so the
- * GET /api/download/:sessionId endpoint can serve retries.
+ * GET /api/download/:sessionId endpoint can serve downloads.
  * @type {Map<string, string>}
  */
 const sessionDownloads = new Map();
 
-/** Sessions that failed (partial) — these cannot be retried. */
+/** Sessions that failed (partial) — these cannot be downloaded. */
 const sessionFailed = new Set();
+
+/**
+ * Live migration job status for async POST /migrate + GET /migrate/:id/status.
+ * @typedef {{
+ *   status: 'queued' | 'running' | 'completed' | 'failed',
+ *   message: string,
+ *   phase?: string,
+ *   unitIndex?: number,
+ *   unitTotal?: number,
+ *   error?: string,
+ *   startedAt: number,
+ *   updatedAt: number,
+ *   zipPath?: string,
+ *   zipFile?: string,
+ *   extractPath?: string,
+ *   convertedPath?: string,
+ * }} SessionStatus
+ * @type {Map<string, SessionStatus>}
+ */
+const sessionStatus = new Map();
+
+const SESSION_TTL_MS = 60 * 60 * 1000;
+
+function setSession(id, patch) {
+  const prev = sessionStatus.get(id) || {
+    status: 'queued',
+    message: 'Queued',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  const next = {
+    ...prev,
+    ...patch,
+    updatedAt: Date.now(),
+    startedAt: prev.startedAt || Date.now(),
+  };
+  sessionStatus.set(id, next);
+  return next;
+}
+
+function scheduleSessionExpiry(id) {
+  setTimeout(() => {
+    sessionDownloads.delete(id);
+    sessionFailed.delete(id);
+    sessionStatus.delete(id);
+  }, SESSION_TTL_MS);
+}
 
 const router = Router();
 
@@ -93,27 +140,27 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
       console.error('ZIP read error:', zipError);
       removeDirectoryRecursive(currentTargetExtractPath);
       removeFile(sourceZipPath);
-      
+
       const errorMsg = zipError.message || 'Unknown ZIP error';
       if (errorMsg.includes('Invalid filename')) {
-        return res.status(400).json({ 
-          error: 'The uploaded ZIP file contains entries with invalid filenames. Please re-create your ZIP file avoiding special characters in file/folder names (e.g., colons, backslashes, or absolute paths).' 
+        return res.status(400).json({
+          error: 'The uploaded ZIP file contains entries with invalid filenames. Please re-create your ZIP file avoiding special characters in file/folder names (e.g., colons, backslashes, or absolute paths).'
         });
       }
       return res.status(400).json({ error: 'Could not read the uploaded ZIP file. Ensure it is a valid, non-corrupted ZIP archive.' });
     }
-    
+
     try {
       zip.extractAllTo(currentTargetExtractPath, true);
     } catch (extractError) {
       console.error('Extraction error:', extractError);
       removeDirectoryRecursive(currentTargetExtractPath);
       removeFile(sourceZipPath);
-      return res.status(400).json({ 
-        error: 'Could not extract the ZIP file. The archive may contain invalid entries or be corrupted. Please re-create your ZIP file.' 
+      return res.status(400).json({
+        error: 'Could not extract the ZIP file. The archive may contain invalid entries or be corrupted. Please re-create your ZIP file.'
       });
     }
-    
+
     console.log(`Extracted to: ${currentTargetExtractPath}`);
 
     const validation = validateProjectFramework(currentTargetExtractPath, fromTech);
@@ -143,10 +190,118 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
 });
 
 /**
+ * GET /api/download/:sessionId
+ * Download a completed migration ZIP by its session ID.
+ */
+router.get('/download/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+
+  if (sessionFailed.has(sessionId)) {
+    const failed = sessionStatus.get(sessionId);
+    return res.status(410).json({
+      error: failed?.error
+        || `Session "${sessionId}" failed during migration. No download available. Please re-upload and try again.`,
+    });
+  }
+
+  const zipPath = sessionDownloads.get(sessionId) || sessionStatus.get(sessionId)?.zipPath;
+  if (!zipPath) {
+    const live = sessionStatus.get(sessionId);
+    if (live && (live.status === 'queued' || live.status === 'running')) {
+      return res.status(409).json({
+        error: 'Migration is still running. Please wait until it completes.',
+        status: live.status,
+        message: live.message,
+      });
+    }
+    return res.status(404).json({
+      error: `Session "${sessionId}" not found or already downloaded/cleaned up. Please re-upload and try again.`,
+    });
+  }
+
+  if (!fs.existsSync(zipPath)) {
+    sessionDownloads.delete(sessionId);
+    return res.status(410).json({
+      error: `Session "${sessionId}" ZIP file no longer exists on disk. Please re-upload and try again.`,
+    });
+  }
+
+  const zipFile = sessionStatus.get(sessionId)?.zipFile || null;
+  const extractPath = sessionStatus.get(sessionId)?.extractPath || path.join(EXTRACT_DIR, sessionId);
+  const convertedPath = sessionStatus.get(sessionId)?.convertedPath || path.join(EXTRACT_DIR, `${sessionId}-converted`);
+
+  res.download(zipPath, 'migrated_project.zip', (err) => {
+    if (err) {
+      if (err.code === 'ECONNABORTED' || err.message?.includes('aborted')) {
+        console.warn(`[${sessionId}] Download aborted (client disconnected). Keeping artifacts.`);
+      } else {
+        console.error(`[${sessionId}] Download error:`, err);
+      }
+      return;
+    }
+    console.log(`[${sessionId}] Download complete. Cleaning up...`);
+    cleanupSession(zipFile, extractPath, zipPath, convertedPath);
+    sessionDownloads.delete(sessionId);
+    sessionFailed.delete(sessionId);
+    sessionStatus.delete(sessionId);
+  });
+});
+
+/**
+ * GET /api/migrate/:sessionId/status
+ * Poll migration progress for an async job started by POST /migrate.
+ */
+router.get('/migrate/:sessionId/status', (req, res) => {
+  const { sessionId } = req.params;
+  const live = sessionStatus.get(sessionId);
+
+  if (!live) {
+    if (sessionFailed.has(sessionId)) {
+      return res.json({
+        sessionId,
+        status: 'failed',
+        message: 'Migration failed.',
+        error: 'Session failed and is no longer available.',
+      });
+    }
+    if (sessionDownloads.has(sessionId)) {
+      return res.json({
+        sessionId,
+        status: 'completed',
+        message: 'Migration complete. Ready to download.',
+        downloadUrl: `/api/download/${sessionId}`,
+      });
+    }
+    return res.status(404).json({ error: `Session "${sessionId}" not found.` });
+  }
+
+  const payload = {
+    sessionId,
+    status: live.status,
+    message: live.message,
+    phase: live.phase || null,
+    unitIndex: live.unitIndex ?? null,
+    unitTotal: live.unitTotal ?? null,
+    startedAt: live.startedAt,
+    updatedAt: live.updatedAt,
+    elapsedMs: Date.now() - live.startedAt,
+  };
+
+  if (live.status === 'completed') {
+    payload.downloadUrl = `/api/download/${sessionId}`;
+  }
+  if (live.status === 'failed') {
+    payload.error = live.error || 'Migration failed.';
+  }
+
+  return res.json(payload);
+});
+
+/**
  * POST /api/migrate
- * Full AI-powered migration pipeline.
- * Accepts a ZIP file and user prompt, runs the agentic migration loop,
- * and returns the migrated project as a downloadable ZIP.
+ * Starts the AI migration pipeline asynchronously.
+ * Returns 202 + sessionId immediately; poll GET /migrate/:sessionId/status,
+ * then download via GET /download/:sessionId when status is completed.
  *
  * Body fields:
  *   - zipFile (file, required): The uploaded ZIP of the source project
@@ -156,59 +311,9 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
  *   - aiProvider (string, optional): AI provider (e.g. 'openrouter', 'genai')
  *   - aiModel   (string, optional): AI model override
  *   - targetVersion (string, optional): Explicit target major version (e.g. '22', '19')
+ *   - sessionId (string, optional): Client-provided session id
  */
-/**
- * GET /api/download/:sessionId
- * Retry-download a completed migration ZIP by its session ID.
- * Only available if the migration completed successfully and has not been
- * cleaned up yet.
- */
-router.get('/download/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-
-  if (sessionFailed.has(sessionId)) {
-    return res.status(410).json({
-      error: 'Session "' + sessionId + '" failed during migration. No download available. Please re-upload and try again.',
-    });
-  }
-
-  const zipPath = sessionDownloads.get(sessionId);
-  if (!zipPath) {
-    return res.status(404).json({
-      error: 'Session "' + sessionId + '" not found or already downloaded/cleaned up. Please re-upload and try again.',
-    });
-  }
-
-  if (!fs.existsSync(zipPath)) {
-    sessionDownloads.delete(sessionId);
-    return res.status(410).json({
-      error: 'Session "' + sessionId + '" ZIP file no longer exists on disk. Please re-upload and try again.',
-    });
-  }
-
-  res.download(zipPath, 'migrated_project.zip', (err) => {
-    if (err) {
-      if (err.code === 'ECONNABORTED' || err.message?.includes('aborted')) {
-        console.warn(`[${sessionId}] Retry download aborted (client disconnected). Keeping artifacts.`);
-      } else {
-        console.error(`[${sessionId}] Retry download error:`, err);
-      }
-      return;
-    }
-    console.log(`[${sessionId}] Retry download complete. Cleaning up...`);
-    // Reuse the existing cleanupSession utility (it filters out null/falsy paths)
-    const extractPath = path.join(EXTRACT_DIR, sessionId);
-    const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
-    cleanupSession(null, extractPath, zipPath, convertedPath);
-    sessionDownloads.delete(sessionId);
-    sessionFailed.delete(sessionId);
-  });
-});
-
 router.post('/migrate', upload.single('zipFile'), async (req, res) => {
-  // Clear extracted/ folder before starting new migration
-  clearWorkFolders();
-
   const userPrompt = (req.body.prompt || '').trim();
   const zipFile = req.file;
   const fromTech = req.body.fromTech || 'Unknown';
@@ -231,8 +336,8 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
       error: `Unknown AI provider "${aiProvider}". Valid options: ${getProviderIds().join(', ')}.`,
     });
   }
-  // Use client-provided session ID for retry coordination, or generate one
-  const id = req.body.sessionId || Date.now().toString();
+
+  const id = req.body.sessionId || `mig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const extractPath = path.join(EXTRACT_DIR, id);
   const convertedPath = path.join(EXTRACT_DIR, `${id}-converted`);
   const outputZipPath = path.join(EXTRACT_DIR, `${id}-final.zip`);
@@ -245,40 +350,37 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     try {
       zip = new AdmZip(zipFile.path);
     } catch (zipError) {
-      // Handle ADM-ZIP errors (e.g., invalid filenames in the ZIP)
       removeDirectoryRecursive(preExtractPath);
       removeFile(zipFile?.path);
       sessionFailed.add(id);
-      
+
       const errorMsg = zipError.message || 'Unknown ZIP error';
       if (errorMsg.includes('Invalid filename')) {
         console.error(`[${id}] Pre-validation failed: ZIP contains invalid filenames.`, errorMsg);
-        return res.status(400).json({ 
-          error: 'The uploaded ZIP file contains entries with invalid filenames. Please re-create your ZIP file avoiding special characters in file/folder names (e.g., colons, backslashes, or absolute paths).' 
+        return res.status(400).json({
+          error: 'The uploaded ZIP file contains entries with invalid filenames. Please re-create your ZIP file avoiding special characters in file/folder names (e.g., colons, backslashes, or absolute paths).'
         });
       }
       console.error(`[${id}] Pre-validation failed: Could not read ZIP.`, zipError);
       return res.status(400).json({ error: 'Could not read the uploaded ZIP file. Ensure it is a valid, non-corrupted ZIP archive.' });
     }
-    
+
     try {
       zip.extractAllTo(preExtractPath, true);
     } catch (extractError) {
-      // If extraction fails due to invalid filenames, try with safe extraction
       removeDirectoryRecursive(preExtractPath);
       removeFile(zipFile?.path);
       sessionFailed.add(id);
       console.error(`[${id}] Pre-validation failed: Could not extract ZIP.`, extractError);
-      return res.status(400).json({ 
-        error: 'Could not extract the ZIP file. The archive may contain invalid entries or be corrupted. Please re-create your ZIP file.' 
+      return res.status(400).json({
+        error: 'Could not extract the ZIP file. The archive may contain invalid entries or be corrupted. Please re-create your ZIP file.'
       });
     }
-    
+
     const validation = validateProjectFramework(preExtractPath, fromTech);
     removeDirectoryRecursive(preExtractPath);
 
     if (!validation.valid) {
-      removeDirectoryRecursive(preExtractPath);
       removeFile(zipFile.path);
       sessionFailed.add(id);
       return res.status(400).json({ error: `Project validation failed: ${validation.reason}` });
@@ -291,62 +393,77 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     return res.status(400).json({ error: 'Could not validate the uploaded ZIP. Ensure it is a valid project archive.' });
   }
 
-  // Track if the client has disconnected so we can abort cleanup later
-  let clientDisconnected = false;
-  req.on('close', () => {
-    if (!res.writableFinished) {
-      clientDisconnected = true;
-      console.warn(`[${id}] Client disconnected during migration/download.`);
-    }
+  setSession(id, {
+    status: 'queued',
+    message: 'Upload validated. Migration queued...',
+    phase: 'queued',
+    zipFile: zipFile.path,
+    extractPath,
+    convertedPath,
+  });
+  scheduleSessionExpiry(id);
+
+  // Return immediately — do not hold the HTTP request open for the whole pipeline
+  res.status(202).json({
+    sessionId: id,
+    status: 'queued',
+    message: 'Migration started. Poll /api/migrate/:sessionId/status for progress.',
+    statusUrl: `/api/migrate/${id}/status`,
+    downloadUrl: `/api/download/${id}`,
   });
 
-  try {
-    const resultZipPath = await runMigrationPipeline(
-      zipFile.path,
-      userPrompt,
-      id,
-      { fromTech, toTech, aiProvider, aiModel: aiModel || undefined, targetVersion: targetVersion || undefined }
-    );
+  // Background job
+  setImmediate(async () => {
+    try {
+      setSession(id, {
+        status: 'running',
+        message: 'Starting migration pipeline...',
+        phase: 'starting',
+      });
 
-    // Register the completed session so GET /api/download/:sessionId can serve it
-    sessionDownloads.set(id, resultZipPath);
-    // Clean up old entries after 60 minutes to prevent memory leaks
-    setTimeout(() => {
-      sessionDownloads.delete(id);
-      sessionFailed.delete(id);
-    }, 60 * 60 * 1000);
-
-    if (clientDisconnected) {
-      console.warn(`[${id}] Client already disconnected. Keeping artifacts for retry download at GET /api/download/${id}.`);
-      return;
-    }
-
-    res.download(resultZipPath, 'migrated_project.zip', (err) => {
-      if (err) {
-        // ECONNABORTED is expected when the client disconnects or times out
-        if (err.code === 'ECONNABORTED' || err.message?.includes('aborted')) {
-          console.warn(`[${id}] Download aborted (client disconnected). Keeping artifacts for retry download at GET /api/download/${id}.`);
-        } else {
-          console.error(`[${id}] Download error:`, err);
+      const resultZipPath = await runMigrationPipeline(
+        zipFile.path,
+        userPrompt,
+        id,
+        {
+          fromTech,
+          toTech,
+          aiProvider,
+          aiModel: aiModel || undefined,
+          targetVersion: targetVersion || undefined,
+          onProgress: (progress) => {
+            setSession(id, {
+              status: 'running',
+              message: progress.message || 'Migrating...',
+              phase: progress.phase || 'running',
+              unitIndex: progress.unitIndex,
+              unitTotal: progress.unitTotal,
+            });
+          },
         }
-        return;
-      }
+      );
 
-      // Successful download → wipe uploaded ZIP + all extracted session folders/files
-      console.log(`[${id}] Download complete. Cleaning extracted session files...`);
-      cleanupSession(zipFile.path, extractPath, resultZipPath, convertedPath);
-      sessionDownloads.delete(id);
-      sessionFailed.delete(id);
-    });
-  } catch (error) {
-    sessionFailed.add(id);
-    console.error(`[${id}] Migration pipeline failed:`, error);
-    if (!clientDisconnected) {
-      res.status(500).json({ error: error.message || 'The Agentic processing loop failed.' });
+      sessionDownloads.set(id, resultZipPath);
+      setSession(id, {
+        status: 'completed',
+        message: 'Migration complete. Ready to download.',
+        phase: 'completed',
+        zipPath: resultZipPath,
+      });
+      console.log(`[${id}] Migration completed asynchronously. Download at GET /api/download/${id}`);
+    } catch (error) {
+      sessionFailed.add(id);
+      const errMsg = error?.message || 'The Agentic processing loop failed.';
+      setSession(id, {
+        status: 'failed',
+        message: 'Migration failed.',
+        phase: 'failed',
+        error: errMsg,
+      });
+      console.error(`[${id}] Migration pipeline failed:`, error);
+      cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
     }
-    // Still clean up on pipeline failure so disk does not fill with partial runs
-    cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
-  }
+  });
 });
 
 export default router;

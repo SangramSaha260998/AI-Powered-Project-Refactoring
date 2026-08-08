@@ -7,6 +7,7 @@ export class LoadingOverlayDirective implements OnChanges {
   @Input('loadingOverlay') isLoading = false;
   @Input() overlayText = 'Searching...';
   private overlayElement: HTMLElement | null = null;
+  private textNode: Text | null = null;
 
   constructor(
     private el: ElementRef,
@@ -21,10 +22,19 @@ export class LoadingOverlayDirective implements OnChanges {
         this.hideOverlay();
       }
     }
+
+    if (changes['overlayText'] && this.overlayElement && this.textNode) {
+      this.textNode.textContent = this.overlayText || '';
+    }
   }
 
   private showOverlay() {
-    if (this.overlayElement) return;
+    if (this.overlayElement) {
+      if (this.textNode) {
+        this.textNode.textContent = this.overlayText || '';
+      }
+      return;
+    }
 
     const host = this.el.nativeElement;
     this.renderer.setStyle(host, 'position', 'relative');
@@ -57,10 +67,14 @@ export class LoadingOverlayDirective implements OnChanges {
       this.renderer.appendChild(ldsRoller, div);
     }
 
-    // Loading text
-    const text = this.renderer.createText(this.overlayText);
+    // Loading text (kept as a node so progress updates can rewrite it)
+    this.textNode = this.renderer.createText(this.overlayText);
     const textDiv = this.renderer.createElement('div');
-    this.renderer.appendChild(textDiv, text);
+    this.renderer.setStyle(textDiv, 'maxWidth', 'min(520px, 90vw)');
+    this.renderer.setStyle(textDiv, 'textAlign', 'center');
+    this.renderer.setStyle(textDiv, 'padding', '0 12px');
+    this.renderer.setStyle(textDiv, 'lineHeight', '1.4');
+    this.renderer.appendChild(textDiv, this.textNode);
 
     // Append spinner parts
     this.renderer.appendChild(spinnerContainer, ldsRoller);
@@ -78,6 +92,7 @@ export class LoadingOverlayDirective implements OnChanges {
       this.renderer.removeStyle(host, 'position');
       this.renderer.removeChild(this.el.nativeElement, this.overlayElement);
       this.overlayElement = null;
+      this.textNode = null;
     }
   }
 
@@ -89,6 +104,7 @@ export class LoadingOverlayDirective implements OnChanges {
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 16px;
 }
 
 .lds-roller {

@@ -1,15 +1,34 @@
-import { Component, ElementRef, signal, viewChild } from '@angular/core';
+import { Component, ElementRef, OnDestroy, signal, viewChild } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { DecimalPipe } from '@angular/common';
-import { timeout } from 'rxjs';
+import { firstValueFrom, Subscription, timeout } from 'rxjs';
 import { LoadingOverlayDirective } from './directives';
 
 type ThemeMode = 'light' | 'dark';
 type ModelOption = { id: string; label: string };
 type VersionOption = { major: number; label: string; version: string };
+type MigrateStartResponse = {
+  sessionId: string;
+  status: string;
+  message?: string;
+  statusUrl?: string;
+  downloadUrl?: string;
+};
+type MigrateStatusResponse = {
+  sessionId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | string;
+  message?: string;
+  phase?: string | null;
+  unitIndex?: number | null;
+  unitTotal?: number | null;
+  error?: string;
+  downloadUrl?: string;
+  elapsedMs?: number;
+};
 
 const THEME_STORAGE_KEY = 'migration-studio-theme';
 const API_BASE = 'http://localhost:5000/api';
+const STATUS_POLL_MS = 2000;
 
 @Component({
   selector: 'app-root',
@@ -18,7 +37,7 @@ const API_BASE = 'http://localhost:5000/api';
   templateUrl: './app.html',
   styleUrl: './app.css',
 })
-export class App {
+export class App implements OnDestroy {
   private readonly fileInput = viewChild<ElementRef<HTMLInputElement>>('fileInput');
 
   // Your custom framework values dictionary
@@ -73,14 +92,19 @@ export class App {
   isSuccess = signal<boolean>(false);
   theme = signal<ThemeMode>('light');
   modelsLoading = signal<boolean>(false);
-  /** Tracks pending retry downloads: sessionId -> zipUrl */
-  retrySessions = signal<string | null>(null);
+  /** Live overlay / status text while migration runs */
+  progressText = signal<string>('Running AI migration pipeline...');
+  /** Completed session ready for manual download (rare edge case) */
+  readySessionId = signal<string | null>(null);
 
   /** Bumps when provider models are refreshed so the model select re-renders. */
   private modelsVersion = signal(0);
 
-  /** The server-generated session ID from the most recent migrate POST. */
+  /** Active migration session id */
   private lastSessionId: string | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private startSub: Subscription | null = null;
+  private settlingDownload = false;
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -100,6 +124,11 @@ export class App {
 
   constructor(private http: HttpClient) {
     this.applyTheme(this.resolveInitialTheme());
+  }
+
+  ngOnDestroy() {
+    this.stopPolling();
+    this.startSub?.unsubscribe();
   }
 
   private isDynamicProvider(provider: string): boolean {
@@ -289,6 +318,7 @@ Final app must compile and run: npm install → ng serve`;
       this.selectedFile.set(file);
       this.statusMessage.set('');
       this.isSuccess.set(false);
+      this.readySessionId.set(null);
     } else {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
@@ -309,6 +339,8 @@ Final app must compile and run: npm install → ng serve`;
     this.isDragging.set(false);
     this.isLoading.set(false);
     this.isSuccess.set(true);
+    this.readySessionId.set(null);
+    this.progressText.set('Running AI migration pipeline...');
     this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
 
     const input = this.fileInput()?.nativeElement;
@@ -317,6 +349,125 @@ Final app must compile and run: npm install → ng serve`;
     }
 
     this.clearMessage();
+  }
+
+  private stopPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  private formatElapsed(ms?: number): string {
+    if (!ms || ms < 0) return '';
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    if (min <= 0) return `${sec}s`;
+    return `${min}m ${sec.toString().padStart(2, '0')}s`;
+  }
+
+  private applyProgress(status: MigrateStatusResponse) {
+    const elapsed = this.formatElapsed(status.elapsedMs);
+    const unitBit =
+      status.unitIndex && status.unitTotal
+        ? ` (${status.unitIndex}/${status.unitTotal})`
+        : '';
+    const base = status.message || 'Migrating...';
+    const text = elapsed ? `${base}${unitBit} · ${elapsed}` : `${base}${unitBit}`;
+    this.progressText.set(text);
+    this.statusMessage.set(`⏳ ${text}`);
+  }
+
+  private triggerBlobDownload(blob: Blob, filename = 'migrated_project.zip') {
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  }
+
+  private async downloadCompletedSession(sessionId: string) {
+    this.progressText.set('Downloading migrated project...');
+    this.statusMessage.set('⏳ Downloading migrated project...');
+
+    try {
+      const blob = await firstValueFrom(
+        this.http
+          .get(`${API_BASE}/download/${sessionId}`, { responseType: 'blob' })
+          .pipe(timeout({ first: 5 * 60 * 1000 }))
+      );
+      this.triggerBlobDownload(blob);
+      this.lastSessionId = null;
+      this.clearUiAfterSuccess();
+    } catch (err: any) {
+      this.isLoading.set(false);
+      this.isSuccess.set(false);
+      this.readySessionId.set(sessionId);
+
+      let errorMessage = 'Migration finished, but download failed. You can try again.';
+      if (err?.error instanceof Blob) {
+        try {
+          const text = await err.error.text();
+          const parsed = JSON.parse(text);
+          errorMessage = parsed.error || errorMessage;
+        } catch {
+          errorMessage = err?.message || errorMessage;
+        }
+      } else {
+        errorMessage = err?.error?.error || err?.message || errorMessage;
+      }
+      this.statusMessage.set(`⚠️ ${errorMessage}`);
+    }
+  }
+
+  private startStatusPolling(sessionId: string) {
+    this.stopPolling();
+
+    const tick = async () => {
+      try {
+        const status = await firstValueFrom(
+          this.http
+            .get<MigrateStatusResponse>(`${API_BASE}/migrate/${sessionId}/status`)
+            .pipe(timeout({ first: 30_000 }))
+        );
+
+        if (status.status === 'queued' || status.status === 'running') {
+          this.applyProgress(status);
+          return;
+        }
+
+        this.stopPolling();
+
+        if (status.status === 'completed') {
+          if (this.settlingDownload) return;
+          this.settlingDownload = true;
+          this.progressText.set('Migration complete. Preparing download...');
+          try {
+            await this.downloadCompletedSession(sessionId);
+          } finally {
+            this.settlingDownload = false;
+          }
+          return;
+        }
+
+        // failed
+        this.isLoading.set(false);
+        this.isSuccess.set(false);
+        this.lastSessionId = null;
+        this.readySessionId.set(null);
+        this.statusMessage.set(`❌ ${status.error || status.message || 'Migration failed.'}`);
+      } catch (err: any) {
+        // Transient poll errors — keep waiting; do not abort the server job
+        console.warn('Status poll failed (will retry):', err?.message || err);
+      }
+    };
+
+    void tick();
+    this.pollTimer = setInterval(() => void tick(), STATUS_POLL_MS);
   }
 
   uploadProject() {
@@ -352,13 +503,18 @@ Final app must compile and run: npm install → ng serve`;
       return;
     }
 
+    this.stopPolling();
+    this.startSub?.unsubscribe();
+    this.settlingDownload = false;
+
     this.isLoading.set(true);
     this.isSuccess.set(false);
+    this.readySessionId.set(null);
+    this.progressText.set('Uploading project and starting migration...');
+    this.statusMessage.set('⏳ Uploading project and starting migration...');
 
-    // Generate a client-side session ID so we can retry the download if the
-    // initial request times out. The server will use this ID for its session paths.
-    this.lastSessionId = 'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-    this.retrySessions.set(null);
+    this.lastSessionId =
+      'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
     const formData = new FormData();
     formData.append('zipFile', file);
@@ -374,165 +530,63 @@ Final app must compile and run: npm install → ng serve`;
       formData.append('targetVersion', this.targetVersion());
     }
 
-    // Send payload to our Express migration engine (returns a downloadable ZIP blob)
-    // Migration can take 15-30 minutes (AI processing + build), so allow a 30-minute timeout
-    this.http
-      .post(`${API_BASE}/migrate`, formData, {
-        responseType: 'blob',
-        reportProgress: false,
-      })
-      .pipe(timeout({ first: 30 * 60 * 1000 })) // 30-minute timeout
+    // Async migrate: server returns 202 immediately, then we poll until done
+    this.startSub = this.http
+      .post<MigrateStartResponse>(`${API_BASE}/migrate`, formData)
+      .pipe(timeout({ first: 2 * 60 * 1000 })) // upload + validation only
       .subscribe({
-        next: (blob: Blob) => {
-          // Trigger browser download of the returned ZIP
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'migrated_project.zip';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          window.URL.revokeObjectURL(url);
-
-          // Clear retry state on success
-          this.retrySessions.set(null);
-          this.lastSessionId = null;
-
-          // Clear the form only after a successful API response + download trigger
-          this.clearUiAfterSuccess();
+        next: (res) => {
+          const sessionId = res.sessionId || this.lastSessionId!;
+          this.lastSessionId = sessionId;
+          this.progressText.set(res.message || 'Migration started...');
+          this.statusMessage.set(`⏳ ${res.message || 'Migration started...'}`);
+          this.startStatusPolling(sessionId);
         },
         error: async (err) => {
+          this.stopPolling();
           this.isLoading.set(false);
           this.isSuccess.set(false);
+          this.lastSessionId = null;
 
           let errorMessage = 'Unknown server error';
-          let isTimeoutError = false;
-
-          // Check for timeout errors
-          if (err?.name === 'TimeoutError' || err?.message?.includes('timed out') || err?.message?.includes('Timeout')) {
-            isTimeoutError = true;
-            errorMessage = 'Migration took too long. The AI processing is still running on the server. You can retry the download.';
-          } else if (err.error instanceof Blob) {
-            try {
-              const text = await err.error.text();
-              const parsed = JSON.parse(text);
-              errorMessage = parsed.error || errorMessage;
-            } catch {
-              errorMessage = err.message || errorMessage;
-            }
-          } else {
-            errorMessage = err?.error?.error || err?.message || errorMessage;
+          if (err?.error?.error) {
+            errorMessage = err.error.error;
+          } else if (err?.message) {
+            errorMessage = err.message;
           }
-
-          // Show retry option if we have a session ID
-          if (isTimeoutError && this.lastSessionId) {
-            this.retrySessions.set(this.lastSessionId);
-            this.statusMessage.set(`⏱️ ${errorMessage}`);
-          } else if (this.lastSessionId) {
-            // For non-timeout errors, show retry link anyway (server may still have artifacts)
-            this.retrySessions.set(this.lastSessionId);
-            this.statusMessage.set(`❌ ${errorMessage}`);
-          } else {
-            this.statusMessage.set(`❌ ${errorMessage}`);
-          }
-
+          this.statusMessage.set(`❌ ${errorMessage}`);
           console.error(err);
         },
       });
   }
 
   /**
-   * Retry downloading a completed migration by session ID.
-   * Called when the user clicks the "Retry Download" button.
+   * Manual download if auto-download failed after a completed migration.
    */
-  retryDownload() {
-    const sessionId = this.retrySessions();
+  downloadReadySession() {
+    const sessionId = this.readySessionId();
     if (!sessionId) return;
-
     this.isLoading.set(true);
-    this.statusMessage.set('⏳ Retrying download...');
-
-    this.http
-      .get(`${API_BASE}/download/${sessionId}`, {
-        responseType: 'blob',
-        reportProgress: false,
-      })
-      .pipe(timeout({ first: 5 * 60 * 1000 })) // 5-minute timeout for the download itself
-      .subscribe({
-        next: (blob: Blob) => {
-          // Trigger browser download
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'migrated_project.zip';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          window.URL.revokeObjectURL(url);
-
-          this.retrySessions.set(null);
-          this.lastSessionId = null;
-          this.isLoading.set(false);
-          this.isSuccess.set(true);
-          this.statusMessage.set('🎉 Migration downloaded successfully!');
-          this.clearMessage();
-        },
-        error: async (err) => {
-          this.isLoading.set(false);
-          this.isSuccess.set(false);
-
-          let errorMessage = 'Failed to retry download.';
-          if (err.error instanceof Blob) {
-            try {
-              const text = await err.error.text();
-              const parsed = JSON.parse(text);
-              errorMessage = parsed.error || errorMessage;
-            } catch {
-              errorMessage = err.message || errorMessage;
-            }
-          } else {
-            errorMessage = err?.error?.error || err?.message || errorMessage;
-          }
-
-          // If the session expired or was cleaned up, clear retry state
-          if (err?.status === 404 || err?.status === 410) {
-            this.retrySessions.set(null);
-            this.lastSessionId = null;
-            errorMessage += ' Please re-upload and start a new migration.';
-          }
-
-          this.statusMessage.set(`❌ ${errorMessage}`);
-          console.error('Retry download failed:', err);
-        },
-      });
+    void this.downloadCompletedSession(sessionId);
   }
 
-  /**
-   * Trigger retry download via retry button.
-   */
-  onRetryDownload() {
-    this.retryDownload();
-  }
-
-  /**
-   * Dismiss the retry prompt and clear the status message.
-   */
-  dismissRetry() {
-    this.retrySessions.set(null);
+  dismissReadyDownload() {
+    this.readySessionId.set(null);
     this.lastSessionId = null;
     this.statusMessage.set('');
   }
 
   /**
    * Clears transient status messages after a short delay.
-   * Does NOT clear retry prompts (those persist until actioned or dismissed).
+   * Does NOT clear while loading or when a ready download is pending.
    */
   clearMessage() {
-    if (this.retrySessions()) return; // Don't clear retry prompts
+    if (this.isLoading() || this.readySessionId()) return;
 
-    // Clear the status message after 3 seconds
     setTimeout(() => {
-      this.statusMessage.set('');
-    }, 3000);
+      if (!this.isLoading() && !this.readySessionId()) {
+        this.statusMessage.set('');
+      }
+    }, 4000);
   }
 }

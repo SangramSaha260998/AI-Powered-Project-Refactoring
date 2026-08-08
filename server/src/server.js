@@ -100,8 +100,9 @@ function startServer(port, retries = 1) {
     console.log(`Migration Engine listening on http://localhost:${port}`);
   });
 
-  // Increase server timeout for long-running migrations (default is 120s)
-  server.timeout = 30 * 60 * 1000; // 30 minutes (up from 20 min)
+  // Increase server timeout for long-running requests (downloads, etc.)
+  // Migrations themselves are async and return immediately (202).
+  server.timeout = 0; // no socket inactivity timeout
   server.keepAliveTimeout = 65 * 1000; // 65 seconds (must be > 60s for keepalive)
   server.headersTimeout = 66 * 1000; // Must be > keepAliveTimeout
 

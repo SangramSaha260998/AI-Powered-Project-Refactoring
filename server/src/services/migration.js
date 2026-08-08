@@ -2909,8 +2909,16 @@ function groupPlanIntoMigrationUnits(planItems) {
 }
 
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
-  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel, targetVersion } = options;
+  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel, targetVersion, onProgress } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
+  const report = (phase, message, extra = {}) => {
+    if (typeof onProgress !== 'function') return;
+    try {
+      onProgress({ phase, message, ...extra });
+    } catch {
+      /* ignore progress listener errors */
+    }
+  };
 
   // --- Resolve target versions ---
   // If an explicit targetVersion was provided via UI, inject it into the prompt
@@ -2941,6 +2949,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   // 1. Unpack original framework archive
   // -----------------------------------------------------------------------
+  report('extract', 'Extracting uploaded archive...');
   console.log(`[${sessionId}] Extracting archive...`);
   let zip;
   try {
@@ -3004,6 +3013,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   // 3. AGENT STEP 1: Generate migration blueprint
   // -----------------------------------------------------------------------
+  report('blueprint', 'Building migration blueprint...');
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
   const sameFrameworkInstruction = `
@@ -3259,6 +3269,7 @@ ${enhancedPrompt}`
   }
 
   console.log(`[${sessionId}] Blueprint built. Total files to convert: ${filteredPlan.length}`);
+  report('blueprint', `Blueprint ready — ${filteredPlan.length} file(s) planned.`);
 
   // Group into logical units (Angular triad / React+scss) and dependency order
   const migrationUnits = groupPlanIntoMigrationUnits(filteredPlan);
@@ -3329,6 +3340,11 @@ CRITICAL RULES:
 
   for (let unitIndex = 0; unitIndex < migrationUnits.length; unitIndex++) {
     const unit = migrationUnits[unitIndex];
+    report(
+      'unit',
+      `Converting unit ${unitIndex + 1}/${migrationUnits.length}: ${unit.label}`,
+      { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
+    );
     console.log(
       `[${sessionId}] Unit [${unitIndex + 1}/${migrationUnits.length}] -> ${unit.label} ` +
       `(${unit.files.length} file${unit.files.length > 1 ? 's' : ''})`
@@ -3426,6 +3442,11 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
           npmInstallDone = true;
           stepBuildVerified = true;
           console.log(`[${sessionId}] Unit ${unitIndex + 1} build ✅ PASSED (attempt ${buildAttempt})`);
+          report(
+            'unit',
+            `Unit ${unitIndex + 1}/${migrationUnits.length} compiled successfully`,
+            { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
+          );
           break;
         }
         // Only skip install on later attempts when install actually succeeded
@@ -3442,6 +3463,13 @@ Write ONLY this one file. No sibling file contents. No markdown fences.
             `[${sessionId}] Unit ${unitIndex + 1} build ❌ FAILED ` +
             `(attempt ${buildAttempt}/${MAX_BUILD_FIX_ATTEMPTS}). ` +
             (isInstallFailure ? 'Re-checking package.json then retrying install...' : 'Asking AI to fix...')
+          );
+          report(
+            'fix',
+            isInstallFailure
+              ? `Unit ${unitIndex + 1}/${migrationUnits.length}: fixing install...`
+              : `Unit ${unitIndex + 1}/${migrationUnits.length}: fixing build errors (attempt ${buildAttempt})...`,
+            { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
           );
 
           if (isInstallFailure) {
@@ -3694,6 +3722,7 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
   // Remove node_modules to keep ZIP small (user will run npm ci locally)
   removeNodeModules(migrationWorkspacePath);
 
+  report('package', 'Packaging migrated project ZIP...');
   console.log(`[${sessionId}] All target files built. Packaging archive...`);
 
   // -----------------------------------------------------------------------

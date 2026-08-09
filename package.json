@@ -11,5 +11,8 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "freebuff": "^0.0.142"
   }
 }

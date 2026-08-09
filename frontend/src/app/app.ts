@@ -26,7 +26,29 @@ type MigrateStatusResponse = {
   elapsedMs?: number;
 };
 
+type ProjectSession = {
+  sessionId: string;
+  projectName?: string;
+  fromTech?: string;
+  toTech?: string;
+  aiProvider?: string;
+  aiModel?: string;
+  updatedAt?: number;
+};
+
+type ProjectCheckResponse = {
+  exists: boolean;
+  sessionId?: string;
+  projectName?: string;
+  fromTech?: string;
+  toTech?: string;
+  aiProvider?: string;
+  aiModel?: string;
+  updatedAt?: number;
+};
+
 const THEME_STORAGE_KEY = 'migration-studio-theme';
+const SESSION_STORAGE_KEY = 'migration-studio-session';
 const API_BASE = 'http://localhost:5000/api';
 const STATUS_POLL_MS = 2000;
 
@@ -96,6 +118,12 @@ export class App implements OnDestroy {
   progressText = signal<string>('Running AI migration pipeline...');
   /** Completed session ready for manual download (rare edge case) */
   readySessionId = signal<string | null>(null);
+  /** Currently created project (persisted) — follow-up interface state */
+  activeProject = signal<ProjectSession | null>(null);
+  /** True while the first-load "is there a project?" check runs */
+  checkingProject = signal<boolean>(true);
+  /** Textarea content for the Submit Changes/Errors interface */
+  reworkPrompt = signal<string>('');
 
   /** Bumps when provider models are refreshed so the model select re-renders. */
   private modelsVersion = signal(0);
@@ -105,6 +133,8 @@ export class App implements OnDestroy {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private startSub: Subscription | null = null;
   private settlingDownload = false;
+  /** Which operation the current download belongs to (create vs rework) */
+  private lastMode: 'create' | 'rework' = 'create';
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -124,6 +154,7 @@ export class App implements OnDestroy {
 
   constructor(private http: HttpClient) {
     this.applyTheme(this.resolveInitialTheme());
+    void this.checkExistingProject();
   }
 
   ngOnDestroy() {
@@ -327,8 +358,14 @@ Final app must compile and run: npm install → ng serve`;
     }
   }
 
-  /** Reset form controls after a successful migration download. */
-  private clearUiAfterSuccess() {
+  /** Reset form controls + persist the created project after a successful migration download. */
+  private clearUiAfterSuccess(sessionId?: string) {
+    const from = this.fromTech();
+    const to = this.toTech();
+    const provider = this.aiProvider();
+    const model = this.aiModel();
+    const fileName = this.selectedFile()?.name;
+
     this.fromTech.set('');
     this.toTech.set('');
     this.targetVersion.set('');
@@ -341,11 +378,25 @@ Final app must compile and run: npm install → ng serve`;
     this.isSuccess.set(true);
     this.readySessionId.set(null);
     this.progressText.set('Running AI migration pipeline...');
-    this.statusMessage.set('🎉 Migration complete! ZIP downloaded successfully.');
+    this.statusMessage.set('🎉 Project created! ZIP downloaded. You can now submit changes or errors below.');
 
     const input = this.fileInput()?.nativeElement;
     if (input) {
       input.value = '';
+    }
+
+    if (sessionId) {
+      const session: ProjectSession = {
+        sessionId,
+        projectName: fileName?.replace(/\.zip$/i, '') || 'Migrated Project',
+        fromTech: from,
+        toTech: to,
+        aiProvider: provider,
+        aiModel: model,
+      };
+      this.activeProject.set(session);
+      this.writeStoredSession(session);
+      void this.refreshProjectMeta(sessionId);
     }
 
     this.clearMessage();
@@ -390,9 +441,11 @@ Final app must compile and run: npm install → ng serve`;
     window.URL.revokeObjectURL(url);
   }
 
-  private async downloadCompletedSession(sessionId: string) {
-    this.progressText.set('Downloading migrated project...');
-    this.statusMessage.set('⏳ Downloading migrated project...');
+  private async downloadCompletedSession(sessionId: string, mode: 'create' | 'rework' = 'create') {
+    this.progressText.set(mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...');
+    this.statusMessage.set(
+      `⏳ ${mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...'}`
+    );
 
     try {
       const blob = await firstValueFrom(
@@ -402,7 +455,18 @@ Final app must compile and run: npm install → ng serve`;
       );
       this.triggerBlobDownload(blob);
       this.lastSessionId = null;
-      this.clearUiAfterSuccess();
+      if (mode === 'rework') {
+        this.isLoading.set(false);
+        this.isSuccess.set(true);
+        this.readySessionId.set(null);
+        this.progressText.set('Running AI migration pipeline...');
+        this.reworkPrompt.set('');
+        this.statusMessage.set('✅ Changes applied! Updated ZIP downloaded successfully.');
+        void this.refreshProjectMeta(sessionId);
+        this.clearMessage();
+      } else {
+        this.clearUiAfterSuccess(sessionId);
+      }
     } catch (err: any) {
       this.isLoading.set(false);
       this.isSuccess.set(false);
@@ -424,7 +488,7 @@ Final app must compile and run: npm install → ng serve`;
     }
   }
 
-  private startStatusPolling(sessionId: string) {
+  private startStatusPolling(sessionId: string, mode: 'create' | 'rework' = 'create') {
     this.stopPolling();
 
     const tick = async () => {
@@ -445,9 +509,11 @@ Final app must compile and run: npm install → ng serve`;
         if (status.status === 'completed') {
           if (this.settlingDownload) return;
           this.settlingDownload = true;
-          this.progressText.set('Migration complete. Preparing download...');
+          this.progressText.set(
+            mode === 'rework' ? 'Changes applied. Preparing download...' : 'Migration complete. Preparing download...'
+          );
           try {
-            await this.downloadCompletedSession(sessionId);
+            await this.downloadCompletedSession(sessionId, mode);
           } finally {
             this.settlingDownload = false;
           }
@@ -530,6 +596,8 @@ Final app must compile and run: npm install → ng serve`;
       formData.append('targetVersion', this.targetVersion());
     }
 
+    this.lastMode = 'create';
+
     // Async migrate: server returns 202 immediately, then we poll until done
     this.startSub = this.http
       .post<MigrateStartResponse>(`${API_BASE}/migrate`, formData)
@@ -540,7 +608,7 @@ Final app must compile and run: npm install → ng serve`;
           this.lastSessionId = sessionId;
           this.progressText.set(res.message || 'Migration started...');
           this.statusMessage.set(`⏳ ${res.message || 'Migration started...'}`);
-          this.startStatusPolling(sessionId);
+          this.startStatusPolling(sessionId, 'create');
         },
         error: async (err) => {
           this.stopPolling();
@@ -561,13 +629,13 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   /**
-   * Manual download if auto-download failed after a completed migration.
+   * Manual download if auto-download failed after a completed migration/rework.
    */
   downloadReadySession() {
     const sessionId = this.readySessionId();
     if (!sessionId) return;
     this.isLoading.set(true);
-    void this.downloadCompletedSession(sessionId);
+    void this.downloadCompletedSession(sessionId, this.lastMode);
   }
 
   dismissReadyDownload() {
@@ -588,5 +656,221 @@ Final app must compile and run: npm install → ng serve`;
         this.statusMessage.set('');
       }
     }, 4000);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persisted project session (follow-up interface)
+  // ---------------------------------------------------------------------------
+
+  private readStoredSession(): ProjectSession | null {
+    try {
+      const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeStoredSession(session: ProjectSession) {
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+    } catch {
+      // Persistence is optional.
+    }
+  }
+
+  private clearStoredSession() {
+    try {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch {
+      // Ignore storage issues.
+    }
+  }
+
+  /** Returns a friendly provider label for display. */
+  providerLabel(id: string | undefined): string {
+    const found = this.aiProviders.find((p) => p.id === id);
+    return found ? found.label : id || '—';
+  }
+
+  /**
+   * First-load check: ask the server whether a previously-created project
+   * exists, then choose which interface to show (create vs follow-up).
+   * Falls back to the stored session if the server is unreachable.
+   */
+  private async checkExistingProject() {
+    try {
+      const stored = this.readStoredSession();
+      let res: ProjectCheckResponse | null = null;
+
+      if (stored?.sessionId) {
+        res = await firstValueFrom(
+          this.http
+            .get<ProjectCheckResponse>(`${API_BASE}/project/${stored.sessionId}`)
+            .pipe(timeout({ first: 15_000 }))
+        );
+        if (!res?.exists) {
+          this.clearStoredSession();
+          res = null;
+        }
+      }
+
+      if (!res) {
+        res = await firstValueFrom(
+          this.http
+            .get<ProjectCheckResponse>(`${API_BASE}/project/latest`)
+            .pipe(timeout({ first: 15_000 }))
+        );
+      }
+
+      if (res?.exists && res.sessionId) {
+        const session: ProjectSession = {
+          sessionId: res.sessionId,
+          projectName: res.projectName,
+          fromTech: res.fromTech,
+          toTech: res.toTech,
+          aiProvider: res.aiProvider,
+          aiModel: res.aiModel,
+          updatedAt: res.updatedAt,
+        };
+        this.activeProject.set(session);
+        this.writeStoredSession(session);
+      }
+    } catch (err) {
+      console.warn('Project existence check failed (server may be offline):', err);
+      const stored = this.readStoredSession();
+      if (stored?.sessionId) {
+        this.activeProject.set(stored);
+      }
+    } finally {
+      this.checkingProject.set(false);
+    }
+  }
+
+  /** Refresh project metadata (name, timestamps) from the server. */
+  private async refreshProjectMeta(sessionId: string) {
+    try {
+      const res = await firstValueFrom(
+        this.http
+          .get<ProjectCheckResponse>(`${API_BASE}/project/${sessionId}`)
+          .pipe(timeout({ first: 15_000 }))
+      );
+      if (res?.exists && res.sessionId) {
+        const session: ProjectSession = {
+          sessionId: res.sessionId,
+          projectName: res.projectName,
+          fromTech: res.fromTech,
+          toTech: res.toTech,
+          aiProvider: res.aiProvider,
+          aiModel: res.aiModel,
+          updatedAt: res.updatedAt,
+        };
+        this.activeProject.set(session);
+        this.writeStoredSession(session);
+      }
+    } catch {
+      // Keep the local copy when the refresh fails.
+    }
+  }
+
+  onReworkPromptChange(event: Event) {
+    const value = (event.target as HTMLTextAreaElement).value;
+    this.reworkPrompt.set(value);
+  }
+
+  /** Submit changes/errors to be applied to the existing project. */
+  submitChanges() {
+    const project = this.activeProject();
+    if (!project?.sessionId) return;
+
+    const changesText = this.reworkPrompt().trim();
+    if (!changesText) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Please describe the changes or errors you want to apply.');
+      this.clearMessage();
+      return;
+    }
+
+    this.stopPolling();
+    this.startSub?.unsubscribe();
+    this.settlingDownload = false;
+    this.lastMode = 'rework';
+
+    this.isLoading.set(true);
+    this.isSuccess.set(false);
+    this.readySessionId.set(null);
+    this.progressText.set('Applying changes to the existing project...');
+    this.statusMessage.set('⏳ Applying changes to the existing project...');
+
+    this.lastSessionId = project.sessionId;
+
+    this.startSub = this.http
+      .post<MigrateStartResponse>(`${API_BASE}/project/${project.sessionId}/rework`, {
+        prompt: changesText,
+        aiProvider: project.aiProvider || undefined,
+        aiModel: project.aiModel || undefined,
+      })
+      .pipe(timeout({ first: 2 * 60 * 1000 }))
+      .subscribe({
+        next: (res) => {
+          const sessionId = res.sessionId || this.lastSessionId!;
+          this.lastSessionId = sessionId;
+          this.progressText.set(res.message || 'Applying changes...');
+          this.statusMessage.set(`⏳ ${res.message || 'Applying changes...'}`);
+          this.startStatusPolling(sessionId, 'rework');
+        },
+        error: async (err) => {
+          this.stopPolling();
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+          this.lastSessionId = null;
+
+          let errorMessage = 'Unknown server error';
+          if (err?.error?.error) {
+            errorMessage = err.error.error;
+          } else if (err?.message) {
+            errorMessage = err.message;
+          }
+          this.statusMessage.set(`❌ ${errorMessage}`);
+          console.error(err);
+        },
+      });
+  }
+
+  /** Clear the current project on the server and reset to the create view. */
+  clearProject() {
+    const project = this.activeProject();
+    if (!project?.sessionId) return;
+
+    if (!confirm('Clear this project? The migrated project will be permanently deleted from the server.')) {
+      return;
+    }
+
+    this.isLoading.set(true);
+    this.isSuccess.set(false);
+    this.readySessionId.set(null);
+    this.progressText.set('Clearing project...');
+    this.statusMessage.set('⏳ Clearing project...');
+
+    this.http
+      .delete(`${API_BASE}/project/${project.sessionId}`)
+      .pipe(timeout({ first: 30_000 }))
+      .subscribe({
+        next: () => this.finishClearProject(),
+        error: () => this.finishClearProject(),
+      });
+  }
+
+  private finishClearProject() {
+    this.stopPolling();
+    this.isLoading.set(false);
+    this.isSuccess.set(true);
+    this.readySessionId.set(null);
+    this.lastSessionId = null;
+    this.reworkPrompt.set('');
+    this.activeProject.set(null);
+    this.clearStoredSession();
+    this.statusMessage.set('🗑️ Project cleared. You can create a new project.');
+    this.clearMessage();
   }
 }

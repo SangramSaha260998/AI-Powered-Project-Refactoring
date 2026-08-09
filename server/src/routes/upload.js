@@ -6,7 +6,7 @@ import { upload } from '../middleware/upload.js';
 import { validateProjectFramework } from '../services/validator.js';
 import { removeDirectoryRecursive, removeFile, ensureDirectoryExists } from '../utils/file.js';
 import { EXTRACT_DIR, UPLOAD_DIR, getProviderIds, PROVIDERS } from '../config/index.js';
-import { runMigrationPipeline, cleanupSession } from '../services/migration.js';
+import { runMigrationPipeline, runReworkPipeline, cleanupSession } from '../services/migration.js';
 
 // Ensure the extract and upload directories exist at startup
 ensureDirectoryExists(EXTRACT_DIR);
@@ -36,6 +36,59 @@ function clearWorkFolders() {
     } catch (err) {
       console.warn('[Cleanup] Failed to clear extracted/:', err.message);
     }
+  }
+}
+
+/**
+ * Validates a sessionId supplied via the URL so it cannot escape EXTRACT_DIR
+ * (e.g. "../../outside") via path.join. Only safe id-like strings pass.
+ */
+const SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+function isValidSessionId(id) {
+  return typeof id === 'string' && SESSION_ID_RE.test(id) && !id.includes('..');
+}
+
+/**
+ * Reads the project name from a converted workspace's package.json.
+ */
+function deriveProjectName(convertedPath, toTech) {
+  try {
+    const pkgPath = path.join(convertedPath, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      if (pkg && typeof pkg.name === 'string' && pkg.name.trim()) {
+        return pkg.name.trim();
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return `${toTech || 'Migrated'} Project`;
+}
+
+/**
+ * Persist lightweight project metadata to disk so a previously-created
+ * project survives server restarts and the UI can detect it on first load.
+ */
+function getProjectMetaPath(sessionId) {
+  return path.join(EXTRACT_DIR, `${sessionId}-project.json`);
+}
+
+function readProjectMeta(sessionId) {
+  try {
+    const raw = fs.readFileSync(getProjectMetaPath(sessionId), 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function writeProjectMeta(sessionId, meta) {
+  try {
+    fs.writeFileSync(getProjectMetaPath(sessionId), JSON.stringify(meta, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn(`[project] Failed to persist meta for ${sessionId}:`, err.message);
   }
 }
 
@@ -239,11 +292,13 @@ router.get('/download/:sessionId', (req, res) => {
       }
       return;
     }
-    console.log(`[${sessionId}] Download complete. Cleaning up...`);
-    cleanupSession(zipFile, extractPath, zipPath, convertedPath);
-    sessionDownloads.delete(sessionId);
-    sessionFailed.delete(sessionId);
-    sessionStatus.delete(sessionId);
+    console.log(`[${sessionId}] Download complete.`);
+    // Keep the converted project + final ZIP on disk so the user can submit
+    // follow-up changes/errors (rework) and re-download. Only the uploaded
+    // source ZIP and the source extract dir are removed. The whole project is
+    // cleared via DELETE /api/project/:sessionId.
+    if (zipFile) removeFile(zipFile);
+    if (extractPath && extractPath !== convertedPath) removeDirectoryRecursive(extractPath);
   });
 });
 
@@ -450,6 +505,16 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
         phase: 'completed',
         zipPath: resultZipPath,
       });
+      writeProjectMeta(id, {
+        sessionId: id,
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel,
+        projectName: deriveProjectName(convertedPath, toTech),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
       console.log(`[${id}] Migration completed asynchronously. Download at GET /api/download/${id}`);
     } catch (error) {
       sessionFailed.add(id);
@@ -464,6 +529,215 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
       cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
     }
   });
+});
+
+/**
+ * GET /api/project/latest
+ * Returns the most recently created project that still exists on disk,
+ * or { exists: false } when there is none. Lets the UI choose between the
+ * creation form and the follow-up (changes/errors) interface on first load.
+ */
+router.get('/project/latest', (req, res) => {
+  let latest = null;
+  let latestTime = 0;
+  let files = [];
+  try {
+    files = fs.readdirSync(EXTRACT_DIR);
+  } catch {
+    /* ignore */
+  }
+  for (const name of files) {
+    if (!name.endsWith('-project.json')) continue;
+    const sessionId = name.replace(/-project\.json$/, '');
+    const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+    if (!fs.existsSync(convertedPath)) continue;
+    const meta = readProjectMeta(sessionId);
+    if (!meta) continue;
+    const t = Number(meta.updatedAt) || Number(meta.createdAt) || 0;
+    if (t >= latestTime) {
+      latestTime = t;
+      latest = {
+        exists: true,
+        sessionId,
+        projectName: meta.projectName || sessionId,
+        fromTech: meta.fromTech || 'Unknown',
+        toTech: meta.toTech || 'Unknown',
+        aiProvider: meta.aiProvider || '',
+        aiModel: meta.aiModel || '',
+        createdAt: meta.createdAt || null,
+        updatedAt: meta.updatedAt || null,
+      };
+    }
+  }
+  res.json(latest || { exists: false });
+});
+
+/**
+ * GET /api/project/:sessionId
+ * Returns whether a specific project session still exists on disk.
+ */
+router.get('/project/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+  const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+  if (!fs.existsSync(convertedPath)) {
+    return res.json({ exists: false, sessionId });
+  }
+  const meta = readProjectMeta(sessionId) || {};
+  res.json({
+    exists: true,
+    sessionId,
+    projectName: meta.projectName || sessionId,
+    fromTech: meta.fromTech || 'Unknown',
+    toTech: meta.toTech || 'Unknown',
+    aiProvider: meta.aiProvider || '',
+    aiModel: meta.aiModel || '',
+    createdAt: meta.createdAt || null,
+    updatedAt: meta.updatedAt || null,
+  });
+});
+
+/**
+ * POST /api/project/:sessionId/rework
+ * Applies user-submitted changes / error fixes to an EXISTING converted
+ * project and produces a fresh ZIP. Async: returns 202 immediately, poll
+ * GET /api/migrate/:sessionId/status, then download.
+ *
+ * Body: { prompt: string, aiProvider?: string, aiModel?: string }
+ */
+router.post('/project/:sessionId/rework', (req, res) => {
+  const { sessionId } = req.params;
+  const reworkPrompt = (req.body.prompt || '').trim();
+  const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+  if (!reworkPrompt) {
+    return res.status(400).json({ error: 'Please describe the changes or errors you want to apply.' });
+  }
+  const live = sessionStatus.get(sessionId);
+  if (live && (live.status === 'queued' || live.status === 'running')) {
+    return res.status(409).json({
+      error: 'Another change request is already running for this project. Please wait for it to finish.',
+      status: live.status,
+      message: live.message,
+    });
+  }
+  if (!fs.existsSync(convertedPath)) {
+    return res.status(404).json({
+      error: `No existing project found for session "${sessionId}". Create a project first.`,
+    });
+  }
+
+  const meta = readProjectMeta(sessionId) || {};
+  const fromTech = meta.fromTech || 'Unknown';
+  const toTech = meta.toTech || 'Unknown';
+  const aiProvider = (req.body.aiProvider || meta.aiProvider || 'openrouter').trim();
+  const aiModel = req.body.aiModel || meta.aiModel || '';
+
+  setSession(sessionId, {
+    status: 'queued',
+    message: 'Change request queued...',
+    phase: 'queued',
+    zipFile: null,
+    extractPath: null,
+    convertedPath,
+  });
+  scheduleSessionExpiry(sessionId);
+
+  res.status(202).json({
+    sessionId,
+    status: 'queued',
+    message: 'Applying your changes to the existing project...',
+    statusUrl: `/api/migrate/${sessionId}/status`,
+    downloadUrl: `/api/download/${sessionId}`,
+  });
+
+  setImmediate(async () => {
+    try {
+      setSession(sessionId, {
+        status: 'running',
+        message: 'Applying your changes / fixing errors...',
+        phase: 'rework-start',
+        zipFile: null,
+        extractPath: null,
+      });
+
+      const resultZipPath = await runReworkPipeline(convertedPath, reworkPrompt, sessionId, {
+        toTech,
+        aiProvider,
+        aiModel,
+        onProgress: (progress) => {
+          setSession(sessionId, {
+            status: 'running',
+            message: progress.message || 'Applying changes...',
+            phase: progress.phase || 'rework',
+            zipFile: null,
+            extractPath: null,
+          });
+        },
+      });
+
+      sessionDownloads.set(sessionId, resultZipPath);
+      setSession(sessionId, {
+        status: 'completed',
+        message: 'Changes applied. Ready to download.',
+        phase: 'completed',
+        zipPath: resultZipPath,
+        zipFile: null,
+        extractPath: null,
+      });
+      writeProjectMeta(sessionId, {
+        ...meta,
+        updatedAt: Date.now(),
+        aiProvider,
+        aiModel,
+      });
+      console.log(`[${sessionId}] Rework completed. Download at GET /api/download/${sessionId}`);
+    } catch (error) {
+      sessionFailed.add(sessionId);
+      const errMsg = error?.message || 'The AI change-request loop failed.';
+      setSession(sessionId, {
+        status: 'failed',
+        message: 'Change request failed.',
+        phase: 'failed',
+        error: errMsg,
+        zipFile: null,
+        extractPath: null,
+      });
+      console.error(`[${sessionId}] Rework pipeline failed:`, error);
+    }
+  });
+});
+
+/**
+ * DELETE /api/project/:sessionId
+ * Permanently clears a project (converted dir, ZIPs, metadata, session state).
+ */
+router.delete('/project/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+  const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+  const finalZip = path.join(EXTRACT_DIR, `${sessionId}-final.zip`);
+  const reworkZip = path.join(EXTRACT_DIR, `${sessionId}-rework-final.zip`);
+  const metaPath = getProjectMetaPath(sessionId);
+
+  removeDirectoryRecursive(convertedPath);
+  removeFile(finalZip);
+  removeFile(reworkZip);
+  removeFile(metaPath);
+
+  sessionDownloads.delete(sessionId);
+  sessionFailed.delete(sessionId);
+  sessionStatus.delete(sessionId);
+
+  console.log(`[${sessionId}] Project cleared.`);
+  res.json({ message: 'Project cleared.', sessionId });
 });
 
 export default router;

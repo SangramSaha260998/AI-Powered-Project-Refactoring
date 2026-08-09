@@ -8,6 +8,7 @@ import {
   normalizeLucideSlug,
   resolveLucidePascalName
 } from './lucideInlineSvg.js';
+import { webAngularNpmDeps, WEB_ANGULAR_PATH_ALIASES } from '../config/webAngular.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
@@ -1324,7 +1325,8 @@ function repairAngularAppBootstrap(destPath) {
   const mainPath = path.join(destPath, 'src', 'main.ts');
   const routesPath = path.join(destPath, 'src', 'app', 'app.routes.ts');
 
-  // Restore a sane app.config.ts if corrupted
+  // Restore a sane app.config.ts ONLY when missing. The web_angular template
+  // ships a complete config (interceptors + NGXS + toastr) that must survive.
   const expectedConfig = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
 import { provideHttpClient } from '@angular/common/http';
 import { provideRouter } from '@angular/router';
@@ -1341,17 +1343,20 @@ export const appConfig: ApplicationConfig = {
 };
 `;
 
-  if (fs.existsSync(routesPath)) {
+  if (!fs.existsSync(appConfigPath)) {
+    ensureDirectoryExists(path.dirname(appConfigPath));
     fs.writeFileSync(appConfigPath, expectedConfig, 'utf-8');
-  } else {
-    // routes file missing — create empty routes and wire them
+    console.warn('[postprocess] Wrote missing app.config.ts');
+  }
+
+  if (!fs.existsSync(routesPath)) {
+    // routes file missing — create empty routes so the app still compiles
     ensureDirectoryExists(path.dirname(routesPath));
     fs.writeFileSync(
       routesPath,
       `import { Routes } from '@angular/router';\n\nexport const routes: Routes = [];\n`,
       'utf-8'
     );
-    fs.writeFileSync(appConfigPath, expectedConfig, 'utf-8');
   }
 
   if (fs.existsSync(appComponentPath)) {
@@ -1507,13 +1512,8 @@ function repairAngularRoutes(destPath) {
 function addAngularPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfigAppPath = path.join(destPath, 'tsconfig.app.json');
-  const pathAliases = {
-    '@/*': ['src/*'],
-    '@app/*': ['src/app/*'],
-    '@core/*': ['src/app/core/*'],
-    '@env/*': ['src/environments/*'],
-    '@shared/*': ['src/app/shared/*']
-  };
+  // web_angular template aliases (plus @/ as a convenience for cn() helpers)
+  const pathAliases = { ...WEB_ANGULAR_PATH_ALIASES };
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
   tsconfig.compilerOptions.baseUrl = './';
@@ -1525,20 +1525,29 @@ function addAngularPathAliases(destPath) {
   if (!libs.includes('dom.iterable')) {
     tsconfig.compilerOptions.lib = [...new Set([...libs, 'ES2022', 'dom', 'dom.iterable'])];
   }
-  tsconfig.compilerOptions.paths = {
-    ...(tsconfig.compilerOptions.paths || {}),
-    ...pathAliases
-  };
+  // Normalize existing path targets now that baseUrl is './' (e.g. "app/*" → "src/app/*")
+  const existingPaths = tsconfig.compilerOptions.paths || {};
+  const normalizedPaths = {};
+  for (const [key, targets] of Object.entries(existingPaths)) {
+    normalizedPaths[key] = (targets || []).map((t) =>
+      /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+    );
+  }
+  tsconfig.compilerOptions.paths = { ...normalizedPaths, ...pathAliases };
   writeJson(tsconfigPath, tsconfig);
 
   if (fs.existsSync(tsconfigAppPath)) {
     const appCfg = readJsonSafe(tsconfigAppPath) || {};
     appCfg.compilerOptions = appCfg.compilerOptions || {};
     appCfg.compilerOptions.baseUrl = './';
-    appCfg.compilerOptions.paths = {
-      ...(appCfg.compilerOptions.paths || {}),
-      ...pathAliases
-    };
+    const appPaths = appCfg.compilerOptions.paths || {};
+    const appNormalized = {};
+    for (const [key, targets] of Object.entries(appPaths)) {
+      appNormalized[key] = (targets || []).map((t) =>
+        /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+      );
+    }
+    appCfg.compilerOptions.paths = { ...appNormalized, ...pathAliases };
     writeJson(tsconfigAppPath, appCfg);
   }
 }
@@ -1624,24 +1633,11 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
       pkg.dependencies['@angular/animations'] = coreVer;
     }
 
-    // angular_required kit dependencies (Material, NGXS, loading-bar, bowser, …)
+    // web_angular template kit dependencies (Material, CDK, NGXS, toastr, …)
     // Always overwrite Material/CDK — never keep a core-patch pin like ^21.2.18 (ETARGET).
     const coreVer = String(pkg.dependencies['@angular/core'] || '^22.0.8').replace(/^\^/, '');
-    const major = parseInt(coreVer.split('.')[0], 10) || 22;
-    const materialVer = `^${major}.0.0`;
-    let ngxs = '^21.0.0';
-    if (major <= 18) ngxs = '^18.1.0';
-    else if (major === 19) ngxs = '^19.0.0';
-    else if (major === 20) ngxs = '^20.0.0';
-
-    const angularRequiredDeps = {
-      '@angular/cdk': materialVer,
-      '@angular/material': materialVer,
-      '@ngxs/store': ngxs,
-      '@ngx-loading-bar/core': '^7.0.0',
-      bowser: '^2.11.0'
-    };
-    for (const [name, version] of Object.entries(angularRequiredDeps)) {
+    const kit = webAngularNpmDeps(coreVer);
+    for (const [name, version] of Object.entries(kit.dependencies)) {
       pkg.dependencies[name] = version;
     }
 
@@ -2101,11 +2097,20 @@ function enforceTailwindScssWorkspace(destPath) {
       const aj = JSON.parse(fs.readFileSync(angularJsonPath, 'utf-8'));
       const project = aj?.projects && Object.values(aj.projects)[0];
       if (project?.architect?.build?.options) {
-        project.architect.build.options.styles = ['src/styles.scss'];
+        // Preserve existing style entries (material prebuilt theme, toastr.css, …)
+        const styles = Array.isArray(project.architect.build.options.styles)
+          ? [...project.architect.build.options.styles]
+          : [];
+        if (!styles.some((s) => /src\/styles\.scss$/.test(String(s)))) styles.push('src/styles.scss');
+        project.architect.build.options.styles = styles;
         project.architect.build.options.inlineStyleLanguage = 'scss';
       }
       if (project?.architect?.test?.options) {
-        project.architect.test.options.styles = ['src/styles.scss'];
+        const tstyles = Array.isArray(project.architect.test.options.styles)
+          ? [...project.architect.test.options.styles]
+          : [];
+        if (!tstyles.some((s) => /src\/styles\.scss$/.test(String(s)))) tstyles.push('src/styles.scss');
+        project.architect.test.options.styles = tstyles;
       }
       project.schematics = project.schematics || {};
       project.schematics['@schematics/angular:component'] = {
@@ -2119,19 +2124,21 @@ function enforceTailwindScssWorkspace(destPath) {
     }
   }
 
+  // The web_angular template already ships a full tailwind.config.js (and Angular
+  // auto-detects Tailwind v3). Only scaffold both configs when both are missing.
   if (!fs.existsSync(path.join(destPath, 'tailwind.config.js'))) {
     fs.writeFileSync(
       path.join(destPath, 'tailwind.config.js'),
       `/** @type {import('tailwindcss').Config} */\nmodule.exports = {\n  content: ['./src/**/*.{html,ts,scss}'],\n  theme: { extend: {} },\n  plugins: [],\n};\n`,
       'utf-8'
     );
-  }
-  if (!fs.existsSync(path.join(destPath, 'postcss.config.js'))) {
-    fs.writeFileSync(
-      path.join(destPath, 'postcss.config.js'),
-      `module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`,
-      'utf-8'
-    );
+    if (!fs.existsSync(path.join(destPath, 'postcss.config.js'))) {
+      fs.writeFileSync(
+        path.join(destPath, 'postcss.config.js'),
+        `module.exports = {\n  plugins: {\n    tailwindcss: {},\n    autoprefixer: {},\n  },\n};\n`,
+        'utf-8'
+      );
+    }
   }
 
   const stylesPath = path.join(destPath, 'src', 'styles.scss');

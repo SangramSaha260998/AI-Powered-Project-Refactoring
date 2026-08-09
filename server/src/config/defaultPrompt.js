@@ -46,30 +46,26 @@ prompt — obey THAT block for package.json and APIs. Do not invent a different 
   or a few \`@apply\` / nesting rules only when truly needed).
 - Global entry: Angular \`src/styles.scss\`; React \`src/index.scss\` (with \`@tailwind\` layers).
 
-### Angular best structure
+### Angular best structure (mirrors the web_angular template — keep it)
 \`\`\`
 src/
   main.ts
   index.html
   styles.scss
-  environments/     # from angular_required (do not delete)
+  environments/     # from web_angular template (keep)
   app/
     app.component.ts|html|scss
-    app.config.ts
+    app.config.ts   # from web_angular template (keep — wires interceptors, NGXS, toastr)
     app.routes.ts
-    config/         # appSettings (stub or real)
-    core/           # singleton services, guards, interceptors, auth
-      interceptors/ # from angular_required (do not regenerate)
-    shared/         # from angular_required: UI, pipes, directives, utils, validators
-    store/          # from angular_required (NGXS)
-    pages/          # one folder per feature (auth/, dashboard/, …)
-      common/       # for all common pages
-        not-found/
-        forbidden/
-      auth/         # for all auth pages means before login
-        login/
-      admin/        # for all other pages means after login
-        dashboard/
+    config/         # appSettings (keep from template)
+    core/           # auth, guards, http, interceptors, layouts, services (keep from template)
+    shared/         # components, directives, pipes, validators, utilities, models, animations (keep from template)
+    store/          # NGXS (keep from template)
+    pages/
+      common/       # not-found, forbidden (keep from template)
+      deeplink/     # redirects (keep from template)
+      auth/         # login, forgot-password, enter-otp, reset-password, create-new-password (functionalize)
+      admin/        # dashboard + any new features (functionalize / create)
 \`\`\`
 - One feature per folder. Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
 - \`styleUrl: './name.component.scss'\` (never \`.css\`).
@@ -77,10 +73,13 @@ src/
 - Clear names, small focused components, no dead code, no unused imports.
 - Strict typing; no \`any\` unless unavoidable. Public template API only
   (public/protected — never private in templates).
-- When targeting Angular, the workspace already includes the \`angular_required\` shared kit
-  (shared components/directives/pipes/validators/utilities, core interceptors, store, environments)
-  plus npm deps (\`@angular/material\`, \`@angular/cdk\`, \`@ngxs/store\`, \`@ngx-loading-bar/core\`, \`bowser\`).
-  Reuse those modules; do not delete or reinvent them.
+- When targeting Angular, the complete \`web_angular\` template project is already injected
+  (src/app/config, core, shared, store, pages/common, pages/deeplink, app.config.ts, environments,
+  public/scss design system) plus npm deps (\`@angular/material\`, \`@angular/cdk\`, \`@ngxs/store\`,
+  \`@ngxs/logger-plugin\`, \`ngx-toastr\`, \`ngx-cookie-service\`, \`@ngx-loading-bar/core\`, \`bowser\`,
+  \`moment\`, \`crypto-js\`). Reuse those modules; keep the same folder layout. Only the auth pages
+  (src/app/pages/auth/**) and dashboard (src/app/pages/admin/**) are functionalized from the source
+  project — everything else stays exactly as the template provides it.
 
 ### React best structure
 \`\`\`

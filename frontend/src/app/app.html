@@ -19,6 +19,98 @@
   </header>
 
   <main class="main-dashboard">
+    @if (checkingProject()) {
+      <section class="config-card checking-card">
+        <span class="checking-spinner"></span>
+        <p>Checking for an existing project...</p>
+      </section>
+    } @else if (activeProject()) {
+      <!-- ===================== FOLLOW-UP INTERFACE ===================== -->
+      <section class="config-card project-card">
+        <h3>📦 Existing Project</h3>
+        <div class="project-summary">
+          <div class="project-summary-item">
+            <span class="project-summary-label">Project</span>
+            <span class="project-summary-value">{{ activeProject()?.projectName }}</span>
+          </div>
+          <div class="project-summary-item">
+            <span class="project-summary-label">Migration</span>
+            <span class="project-summary-value">
+              {{ activeProject()?.fromTech }} ➜ {{ activeProject()?.toTech }}
+            </span>
+          </div>
+          <div class="project-summary-item">
+            <span class="project-summary-label">Provider</span>
+            <span class="project-summary-value">{{ providerLabel(activeProject()?.aiProvider) }}</span>
+          </div>
+          <div class="project-summary-item">
+            <span class="project-summary-label">Session</span>
+            <span class="project-summary-value session-id">{{ activeProject()?.sessionId }}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="prompt-card">
+        <h3>✍️ Submit Changes / Errors</h3>
+        <textarea
+          class="prompt-textarea rework-textarea"
+          [value]="reworkPrompt()"
+          (input)="onReworkPromptChange($event)"
+          rows="6"
+          placeholder="Describe the changes you need or paste the errors you are facing... e.g. 'Fix the login redirect — after login it goes to /dashboard but that route is missing' or 'The build fails with TS2307 in src/app/pages/admin/user-list'"
+        ></textarea>
+        <p class="prompt-hint">
+          The AI will apply your changes to the existing project and give you a new ZIP.
+        </p>
+      </section>
+
+      <section class="upload-card">
+        <div class="rework-actions">
+          <button
+            class="action-btn"
+            [disabled]="!reworkPrompt().trim() || isLoading()"
+            (click)="submitChanges()">
+            @if (isLoading()) {
+              <span class="spinner"></span> Applying Changes...
+            } @else {
+              Submit Changes/Errors 🚀
+            }
+          </button>
+          <button
+            class="action-btn clear-btn"
+            [disabled]="isLoading()"
+            (click)="clearProject()">
+            Clear project 🗑️
+          </button>
+        </div>
+
+        @if (statusMessage()) {
+          <div class="status-banner" [class.success]="isSuccess()">
+            <span class="status-text">{{ statusMessage() }}</span>
+            @if (readySessionId()) {
+              <button
+                class="retry-btn"
+                (click)="downloadReadySession()"
+                [disabled]="isLoading()"
+              >
+                @if (isLoading()) {
+                  <span class="spinner small"></span>
+                }
+                Download ZIP ⬇️
+              </button>
+              <button
+                class="retry-btn dismiss-btn"
+                (click)="dismissReadyDownload()"
+                title="Dismiss"
+              >
+                ✕
+              </button>
+            }
+          </div>
+        }
+      </section>
+    } @else {
+      <!-- ===================== CREATE INTERFACE ===================== -->
     <section class="config-card">
       <h3>1. Select Migration Path</h3>
       <div class="dropdown-group">
@@ -182,5 +274,6 @@
         </div>
       }
     </section>
+    }
   </main>
 </div>

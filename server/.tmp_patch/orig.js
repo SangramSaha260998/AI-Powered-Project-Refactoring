@@ -20,11 +20,13 @@ import {
   MAX_BUILD_FIX_ATTEMPTS
 } from '../config/index.js';
 import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
-import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../config/targetVersions.js';
+import { resolveTargetVersions, formatVersionMandate } from '../config/targetVersions.js';
 import {
-  webAngularNpmDeps,
-  isWebAngularProtectedPath
-} from '../config/webAngular.js';import { ensureDirectoryExists } from '../utils/file.js';
+  angularRequiredNpmDeps,
+  ANGULAR_REQUIRED_PATH_ALIASES,
+  isAngularRequiredProtectedPath
+} from '../config/angularRequired.js';
+import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
@@ -372,12 +374,8 @@ function extractPathsFromBuildErrors(buildErrors) {
 /**
  * Map AI-suggested fix paths onto real workspace files.
  * Common failure: AI writes src/admin/... while the real file is src/app/admin/...
- *
- * When `allowBasenameFallback` is false (rework edits), the resolver only maps
- * prefix-normalized exact paths — it never silently redirects to a different
- * existing file that merely shares the same basename.
  */
-function resolveFixWritePath(workspaceRoot, requestedPath, buildErrors = '', allowBasenameFallback = true) {
+function resolveFixWritePath(workspaceRoot, requestedPath, buildErrors = '') {
   if (!requestedPath || typeof requestedPath !== 'string') return null;
 
   let normalized = requestedPath
@@ -409,7 +407,7 @@ function resolveFixWritePath(workspaceRoot, requestedPath, buildErrors = '', all
   const errorMatch = errorPaths.find((p) => path.posix.basename(p) === base);
   if (errorMatch) {
     normalized = errorMatch;
-  } else if (allowBasenameFallback && !fs.existsSync(path.join(workspaceRoot, normalized))) {
+  } else if (!fs.existsSync(path.join(workspaceRoot, normalized))) {
     // Fall back to any existing file with the same basename under src/
     const srcRoot = path.join(workspaceRoot, 'src');
     if (fs.existsSync(srcRoot)) {
@@ -462,8 +460,8 @@ function resolveSafeWritePath(workspaceRoot, relativePath) {
     return null;
   }
 
-  // web_angular template kit — AI must not overwrite injected shared/core assets
-  if (isWebAngularProtectedPath(normalized)) {
+  // angular_required kit — AI must not overwrite injected shared/core assets
+  if (isAngularRequiredProtectedPath(normalized)) {
     return null;
   }
 
@@ -580,11 +578,6 @@ function findBaseSearchPath(extractPath) {
  * Core framework packages track stack.core exactly; Material/CDK use major-aligned ranges
  * (their patch lines often differ from @angular/core and pinning ^21.2.18 causes ETARGET).
  */
-/**
- * Final lock so package.json cannot drift to a different Angular major after
- * AI/postprocess. Rewrites @angular/* core packages to stack.core, the
- * web_angular kit deps to major-scaled ranges, and dev tooling to the stack.
- */
 function enforceAngularPackageVersions(destPath, stack) {
   if (!stack?.core) return;
   const pkgPath = path.join(destPath, 'package.json');
@@ -597,11 +590,6 @@ function enforceAngularPackageVersions(destPath, stack) {
   }
   pkg.dependencies = pkg.dependencies || {};
   pkg.devDependencies = pkg.devDependencies || {};
-  const major = parseInt(String(stack.core).split('.')[0], 10) || 22;
-
-  // Core framework packages — pinned EXACT to stack.core so npm never picks
-  // mismatched pairs (compiler-cli peers @angular/compiler with the exact same
-  // version, e.g. compiler-cli@22.1.1 requires compiler@22.1.1).
   const corePkgs = [
     '@angular/animations',
     '@angular/common',
@@ -609,60 +597,26 @@ function enforceAngularPackageVersions(destPath, stack) {
     '@angular/core',
     '@angular/forms',
     '@angular/platform-browser',
-    '@angular/platform-browser-dynamic',
     '@angular/router'
   ];
   for (const name of corePkgs) {
     if (pkg.dependencies[name] || name === '@angular/core') {
-      pkg.dependencies[name] = stack.core;
+      pkg.dependencies[name] = `^${stack.core}`;
     }
   }
-
-  // web_angular kit deps (major-scaled)
-  const kit = webAngularNpmDeps(stack.core);
-  for (const [name, version] of Object.entries(kit.dependencies)) {
+  // angular_required deps: Material/CDK = major only; others as configured
+  const requiredDeps = angularRequiredNpmDeps(stack.core);
+  for (const [name, version] of Object.entries(requiredDeps)) {
     pkg.dependencies[name] = version;
   }
-
-  // Runtime essentials from the template
-  if (stack.zone) pkg.dependencies['zone.js'] = stack.zone;
-  if (!pkg.dependencies.rxjs) pkg.dependencies.rxjs = '~7.8.0';
-  if (!pkg.dependencies.tslib) pkg.dependencies.tslib = '^2.3.0';
-  if (!pkg.dependencies['normalize.css']) pkg.dependencies['normalize.css'] = '^8.0.1';
-
-  // Tooling
-  if (stack.tooling) {
-    pkg.devDependencies['@angular-devkit/build-angular'] = `^${stack.tooling}`;
-    pkg.devDependencies['@angular/cli'] = `^${stack.tooling}`;
-  }
-  pkg.devDependencies['@angular/compiler-cli'] = stack.core;
+  pkg.devDependencies['@angular/compiler-cli'] = `^${stack.core}`;
+  pkg.devDependencies['@angular/build'] = `^${stack.tooling}`;
+  pkg.devDependencies['@angular/cli'] = `^${stack.tooling}`;
   if (stack.typescript) pkg.devDependencies.typescript = stack.typescript;
-  pkg.devDependencies['angular-eslint'] = `^${Math.max(major, 15)}.0.0`;
-
-  // typescript-eslint peer-caps TypeScript; template pins 8.33.1 (<5.9.0).
-  // Scale so the resolved TypeScript line is accepted by npm ci:
-  //   Angular <=19 (TS ~5.7)  -> 8.33.1 (template default) is fine
-  //   Angular 20/21 (TS ~5.9) -> >= 8.41.0 (peer <6.0.0)
-  //   Angular 22+ (TS ~6.0)   -> >= 8.60.0 (peer <6.1.0)
-  if (major >= 22) {
-    pkg.devDependencies['typescript-eslint'] = '^8.60.0';
-  } else if (major >= 20) {
-    pkg.devDependencies['typescript-eslint'] = '^8.41.0';
-  }
-
-  // Ensure template runtime deps that may have been dropped by postprocess
-  for (const name of ['moment', 'crypto-js', 'bowser']) {
-    if (!pkg.dependencies[name] && kit.dependencies[name]) {
-      pkg.dependencies[name] = kit.dependencies[name];
-    }
-  }
-
+  if (stack.zone) pkg.dependencies['zone.js'] = stack.zone;
   fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
-  console.log(
-    `[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source}); web_angular kit major-aligned`
-  );
+  console.log(`[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source}); Material/CDK major-aligned`);
 }
-
 
 function enforceReactPackageVersions(destPath, stack) {
   if (!stack?.react) return;
@@ -687,495 +641,505 @@ function enforceReactPackageVersions(destPath, stack) {
   console.log(`[versions] Locked React package.json to ^${stack.react} (source=${stack.source})`);
 }
 
-// ---------------------------------------------------------------------------
-// Angular workspace template injection (from server/web_angular)
-// ---------------------------------------------------------------------------
+function injectAngularWorkspaceTemplates(destPath, versionStack = null) {
+  // Keep all @angular/* packages on the same major line to avoid npm ERESOLVE conflicts.
+  // Default = latest stable; override when user prompt names a version.
+  const stack = versionStack || {
+    core: '22.0.8',
+    tooling: '22.0.7',
+    typescript: '~5.9.2',
+    zone: '~0.16.0'
+  };
+  const angularVersion = stack.core;
+  const angularToolingVersion = stack.tooling;
+  const requiredKitDeps = angularRequiredNpmDeps(angularVersion);
 
-const WEB_ANGULAR_TEMPLATE_DIR = path.resolve(__dirname, '..', '..', 'web_angular');
+  // 1. package.json - standalone bootstrap via @angular-devkit/build-angular
+  const packageJson = {
+    name: 'migrated-angular-project',
+    version: '0.0.0',
+    scripts: {
+      ng: 'ng',
+      start: 'ng serve --configuration preDevelopment',
+      build: 'ng build --configuration development',
+      'build:prod': 'ng build --configuration production',
+      'build:staging': 'ng build --configuration staging',
+      'build:uat': 'ng build --configuration uat',
+      'build:dev': 'ng build --configuration development',
+      watch: 'ng build --watch --configuration development',
+      test: 'ng test',
+      lint: 'ng lint'
+    },
+    dependencies: {
+      '@angular/animations': `^${angularVersion}`,
+      '@angular/cdk': requiredKitDeps['@angular/cdk'],
+      '@angular/common': `^${angularVersion}`,
+      '@angular/compiler': `^${angularVersion}`,
+      '@angular/core': `^${angularVersion}`,
+      '@angular/forms': `^${angularVersion}`,
+      '@angular/material': requiredKitDeps['@angular/material'],
+      '@angular/platform-browser': `^${angularVersion}`,
+      '@angular/router': `^${angularVersion}`,
+      '@ngxs/store': requiredKitDeps['@ngxs/store'],
+      '@ngx-loading-bar/core': requiredKitDeps['@ngx-loading-bar/core'],
+      bowser: requiredKitDeps.bowser,
+      clsx: '^2.1.1',
+      'tailwind-merge': '^2.5.0',
+      'class-variance-authority': '^0.7.0',
+      'normalize.css': '^8.0.1',
+      'rxjs': '~7.8.0',
+      'tslib': '^2.3.0',
+      'zone.js': stack.zone || '~0.16.0'
+    },
+    devDependencies: {
+      '@angular-devkit/build-angular': `^${angularToolingVersion}`,
+      '@angular/cli': `^${angularToolingVersion}`,
+      '@angular/compiler-cli': `^${angularVersion}`,
+      '@angular-eslint/builder': '^18.0.0',
+      '@angular-eslint/eslint-plugin': '^18.0.0',
+      '@angular-eslint/eslint-plugin-template': '^18.0.0',
+      '@angular-eslint/schematics': '^18.0.0',
+      '@angular-eslint/template-parser': '^18.0.0',
+      '@typescript-eslint/eslint-plugin': '^7.0.0',
+      '@typescript-eslint/parser': '^7.0.0',
+      'autoprefixer': '^10.4.20',
+      'eslint': '^8.57.0',
+      'postcss': '^8.4.49',
+      'sass': '^1.83.0',
+      'tailwindcss': '^3.4.17',
+      'typescript': stack.typescript || '~5.5.0'
+    },
+    // Optional peer dependencies - uncomment as needed:
+    // "peerDependencies": {
+    //   "ngx-toastr": "^18.0.0",
+    //   "highcharts-angular": "^4.0.0",
+    //   "@ngxs/store": "^3.8.0",
+    //   "@ngxs/logger-plugin": "^3.8.0"
+    // }
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'package.json'),
+    JSON.stringify(packageJson, null, 2)
+  );
 
-/** Folders never copied from the web_angular template. */
-const TEMPLATE_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.angular']);
-
-/**
- * Files never copied from the web_angular template.
- * package-lock.json pins the template's own Angular 19 versions — it must be
- * regenerated from the scaled package.json (npm ci errors otherwise).
- */
-const TEMPLATE_SKIP_FILES = new Set(['package-lock.json', 'bun.lock', 'bun.lockb', 'yarn.lock', 'pnpm-lock.yaml']);
-
-/**
- * Recursively copy the web_angular template into destPath.
- */
-function copyWebAngularTemplate(destPath) {
-  const src = WEB_ANGULAR_TEMPLATE_DIR;
-  if (!fs.existsSync(src)) {
-    throw new Error(
-      `web_angular template directory not found at ${src}. ` +
-        'The server/web_angular folder is required to create new Angular projects.'
-    );
-  }
-  ensureDirectoryExists(destPath);
-  const walk = (from, to) => {
-    ensureDirectoryExists(to);
-    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
-      if (TEMPLATE_SKIP_DIRS.has(entry.name) || TEMPLATE_SKIP_FILES.has(entry.name) || entry.name.startsWith('.')) continue;
-      const srcFull = path.join(from, entry.name);
-      const destFull = path.join(to, entry.name);
-      if (entry.isDirectory()) {
-        walk(srcFull, destFull);
-      } else {
-        ensureDirectoryExists(path.dirname(destFull));
-        fs.copyFileSync(srcFull, destFull);
+  // 2. angular.json - using @angular-devkit/build-angular:application
+  const angularJson = {
+    $schema: './node_modules/@angular/cli/lib/config/schema.json',
+    version: 1,
+    newProjectRoot: 'projects',
+    projects: {
+      'migrated-angular-project': {
+        projectType: 'application',
+        schematics: {
+          '@schematics/angular:component': {
+            style: 'scss',
+            skipTests: true
+          },
+          '@schematics/angular:pipe': {
+            skipTests: true,
+            standalone: true
+          },
+          '@schematics/angular:guard': {
+            skipTests: true
+          },
+          '@schematics/angular:service': {
+            skipTests: true
+          },
+          '@schematics/angular:directive': {
+            skipTests: true,
+            standalone: true
+          },
+          '@schematics/angular:interceptor': {
+            skipTests: true
+          }
+        },
+        root: '',
+        sourceRoot: 'src',
+        prefix: '',
+        architect: {
+          build: {
+            builder: '@angular-devkit/build-angular:application',
+            options: {
+              outputPath: 'dist/migrated-angular-project',
+              index: 'src/index.html',
+              browser: 'src/main.ts',
+              polyfills: ['zone.js'],
+              tsConfig: 'tsconfig.app.json',
+              inlineStyleLanguage: 'scss',
+              assets: [
+                {
+                  glob: '**/*',
+                  input: 'public'
+                },
+                {
+                  glob: '**/*',
+                  input: 'src/assets/',
+                  output: '/assets/'
+                }
+              ],
+              styles: [
+                'node_modules/normalize.css/normalize.css',
+                'src/styles.scss'
+              ],
+              stylePreprocessorOptions: {
+                includePaths: ['public/scss', 'public/scss/partials', 'public/scss/custom-styles']
+              },
+              allowedCommonJsDependencies: [
+                'bowser',
+                'moment',
+                'crypto-js',
+                'jquery'
+              ],
+              scripts: []
+            },
+            configurations: {
+              production: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all'
+              },
+              staging: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.staging.ts'
+                  }
+                ]
+              },
+              uat: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.uat.ts'
+                  }
+                ]
+              },
+              development: {
+                budgets: [
+                  { type: 'initial', maximumWarning: '2mb', maximumError: '4mb' },
+                  { type: 'anyComponentStyle', maximumWarning: '100kb', maximumError: '200kb' }
+                ],
+                outputHashing: 'all',
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.development.ts'
+                  }
+                ]
+              },
+              preDevelopment: {
+                optimization: false,
+                extractLicenses: false,
+                sourceMap: true,
+                fileReplacements: [
+                  {
+                    replace: 'src/environments/environment.ts',
+                    with: 'src/environments/environment.development.ts'
+                  }
+                ]
+              }
+            },
+            defaultConfiguration: 'development'
+          },
+          serve: {
+            builder: '@angular-devkit/build-angular:dev-server',
+            configurations: {
+              production: { buildTarget: 'migrated-angular-project:build:production' },
+              staging: { buildTarget: 'migrated-angular-project:build:staging' },
+              uat: { buildTarget: 'migrated-angular-project:build:uat' },
+              development: { buildTarget: 'migrated-angular-project:build:development' },
+              preDevelopment: { buildTarget: 'migrated-angular-project:build:preDevelopment' }
+            },
+            defaultConfiguration: 'preDevelopment',
+            options: { hmr: false }
+          },
+          'extract-i18n': {
+            builder: '@angular-devkit/build-angular:extract-i18n'
+          },
+          test: {
+            builder: '@angular-devkit/build-angular:karma',
+            options: {
+              polyfills: ['zone.js', 'zone.js/testing'],
+              tsConfig: 'tsconfig.spec.json',
+              inlineStyleLanguage: 'scss',
+              assets: [
+                {
+                  glob: '**/*',
+                  input: 'public'
+                },
+                {
+                  glob: '**/*',
+                  input: 'src/assets/',
+                  output: '/assets/'
+                }
+              ],
+              styles: [
+                'src/styles.scss'
+              ],
+              stylePreprocessorOptions: {
+                includePaths: ['public/scss', 'public/scss/partials']
+              },
+              scripts: []
+            }
+          },
+          lint: {
+            builder: '@angular-eslint/builder:lint',
+            options: {
+              lintFilePatterns: ['src/**/*.ts', 'src/**/*.html']
+            }
+          }
+        }
       }
+    },
+    cli: {
+      analytics: false
     }
   };
-  walk(src, destPath);
-  console.log(`[web_angular] Copied template → ${destPath}`);
-}
+  fs.writeFileSync(
+    path.join(destPath, 'angular.json'),
+    JSON.stringify(angularJson, null, 2)
+  );
 
-function toSafeProjectName(name, fallback = 'migrated-angular-project') {
-  const n = String(name || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/\.{2,}/g, '.')
-    .slice(0, 50);
-  return n || fallback;
-}
+  // 3. tsconfig.json
+  const tsConfig = {
+    compileOnSave: false,
+    compilerOptions: {
+      outDir: './dist/out-tsc',
+      forceConsistentCasingInFileNames: true,
+      strict: true,
+      noImplicitOverride: true,
+      noPropertyAccessFromIndexSignature: true,
+      noImplicitReturns: true,
+      noFallthroughCasesInSwitch: true,
+      skipLibCheck: true,
+      esModuleInterop: true,
+      experimentalDecorators: true,
+      moduleResolution: 'bundler',
+      importHelpers: true,
+      target: 'ES2022',
+      module: 'ES2022',
+      useDefineForClassFields: false,
+      lib: ['ES2022', 'dom', 'dom.iterable'],
+      baseUrl: './',
+      paths: {
+        ...ANGULAR_REQUIRED_PATH_ALIASES
+      }
+    },
+    angularCompilerOptions: {
+      enableI18nLegacyMessageIdFormat: false,
+      strictInjectionParameters: true,
+      strictInputAccessModifiers: true,
+      strictTemplates: true
+    }
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'tsconfig.json'),
+    JSON.stringify(tsConfig, null, 2)
+  );
 
-function humanizeProjectName(name) {
-  const n = toSafeProjectName(name, 'Migrated Angular Project');
-  return n
-    .replace(/[-_.]+/g, ' ')
-    .split(' ')
-    .filter(Boolean)
-    .map((w) => (w.length <= 2 ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)))
-    .join(' ');
-}
+  // 4. tsconfig.app.json — include all app sources so generated components always compile
+  const tsConfigApp = {
+    extends: './tsconfig.json',
+    compilerOptions: {
+      outDir: './out-tsc/app',
+      types: [],
+      baseUrl: './',
+      paths: {
+        ...ANGULAR_REQUIRED_PATH_ALIASES
+      }
+    },
+    files: ['src/main.ts'],
+    include: ['src/**/*.d.ts', 'src/**/*.ts'],
+    exclude: ['src/**/*.spec.ts']
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'tsconfig.app.json'),
+    JSON.stringify(tsConfigApp, null, 2)
+  );
 
-function lightenHex(hex, amount = 0.55) {
-  let h = String(hex || '').replace('#', '');
-  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
-  if (!/^[0-9a-fA-F]{6}$/.test(h)) return hex;
-  const num = parseInt(h, 16);
-  const r = (num >> 16) & 255;
-  const g = (num >> 8) & 255;
-  const b = num & 255;
-  const mix = (c) => Math.round(c + (255 - c) * amount);
-  const to2 = (c) => c.toString(16).padStart(2, '0');
-  return `#${to2(mix(r))}${to2(mix(g))}${to2(mix(b))}`;
-}
+  // 5. tsconfig.spec.json - fixed to remove non-existent src/test.ts
+  const tsConfigSpec = {
+    extends: './tsconfig.json',
+    compilerOptions: {
+      outDir: './out-tsc/spec',
+      types: ['jasmine']
+    },
+    include: ['src/**/*.spec.ts', 'src/**/*.d.ts']
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'tsconfig.spec.json'),
+    JSON.stringify(tsConfigSpec, null, 2)
+  );
 
-const NAMED_DESIGN_COLORS = {
-  blue: '#0788C0', sky: '#0EA5E9', cyan: '#06B6D4', teal: '#14B8A6',
-  emerald: '#10B981', green: '#22C55E', lime: '#84CC16', amber: '#F59E0B',
-  orange: '#F97316', red: '#EF4444', rose: '#F43F5E', pink: '#EC4899',
-  fuchsia: '#D946EF', purple: '#A855F7', violet: '#8B5CF6', indigo: '#6366F1',
-  slate: '#64748B', gray: '#6B7280', navy: '#1D2A54', gold: '#C9A227'
+  // 6. index.html scaffold
+  const indexHtml = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Migrated Angular Project</title>
+  <base href="/">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+</head>
+<body>
+  <app-root></app-root>
+</body>
+</html>
+`;
+  ensureDirectoryExists(path.join(destPath, 'src'));
+  fs.writeFileSync(path.join(destPath, 'src', 'index.html'), indexHtml);
+
+  // 7. app.config.ts - consolidated providers with interceptors and routing
+  // NOTE: The actual app.config.ts is now copied from angular_required/routes/
+  // This ensures consistency with the shared template files.
+  // We create a minimal fallback here in case angular_required is not available.
+  const appConfigTsPath = path.join(destPath, 'src', 'app', 'app.config.ts');
+  if (!fs.existsSync(appConfigTsPath)) {
+    const appConfigTs = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+import { provideHttpClient } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
+import { routes } from './app.routes';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideZoneChangeDetection({ eventCoalescing: true }),
+    provideRouter(routes),
+    provideAnimationsAsync(),
+    provideHttpClient(),
+  ],
 };
-
-/**
- * Extract base design colors from the user prompt. Returns
- * { primary, secondary, tertiary } hex values (template defaults when the
- * prompt does not name colors).
- */
-function extractDesignColors(userPrompt) {
-  const text = String(userPrompt || '');
-  const hexRe = /#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g;
-  const hexes = [...new Set([...text.matchAll(hexRe)].map((m) => '#' + m[1].toLowerCase()))];
-  const defaults = { primary: '#0788C0', secondary: '#1D2A54', tertiary: '#C1E1EF' };
-  const roles = ['primary', 'secondary', 'tertiary'];
-  const result = {};
-  const usedHex = new Set();
-  const usedName = new Set();
-
-  const hexOf = (v) => (v && v.startsWith('#')) ? v : NAMED_DESIGN_COLORS[v] || null;
-
-  // 1. Role-tagged mentions: "primary color blue", "secondary: #123456"
-  for (const role of roles) {
-    const re = new RegExp(
-      `\\b${role}\\b[^\\n]{0,45}?(?:color|colour)?[^\\n]{0,10}?(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\\b|(${Object.keys(NAMED_DESIGN_COLORS).join('|')}))`,
-      'i'
-    );
-    const m = text.match(re);
-    if (m) {
-      const value = m[1] ? m[1].toLowerCase() : m[2].toLowerCase();
-      const hex = hexOf(value);
-      if (hex) {
-        result[role] = hex;
-        usedHex.add(hex);
-        if (!m[1]) usedName.add(m[2].toLowerCase());
-      }
-    }
+`;
+    ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+    fs.writeFileSync(appConfigTsPath, appConfigTs);
   }
 
-  // 2. Bare hex codes fill remaining roles in order
-  for (const role of roles) {
-    if (result[role]) continue;
-    const next = hexes.find((h) => !usedHex.has(h));
-    if (next) {
-      result[role] = next;
-      usedHex.add(next);
-    }
+  // 8. main.ts - simplified, uses appConfig
+  const mainTs = `import { bootstrapApplication } from '@angular/platform-browser';
+import { AppComponent } from './app/app.component';
+import { appConfig } from './app/app.config';
+
+bootstrapApplication(AppComponent, appConfig)
+  .catch((err) => console.error(err));
+`;
+  fs.writeFileSync(path.join(destPath, 'src', 'main.ts'), mainTs);
+
+  // 9. styles.scss + Tailwind / PostCSS configs
+  const stylesScss = `@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global app styles — prefer Tailwind utilities in templates */
+`;
+  fs.writeFileSync(path.join(destPath, 'src', 'styles.scss'), stylesScss);
+
+  const tailwindConfig = `/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    './src/**/*.{html,ts,scss}',
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'tailwind.config.js'), tailwindConfig);
+
+  const postcssConfig = `module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'postcss.config.js'), postcssConfig);
+
+  // Remove legacy styles.css if a previous run left it behind
+  const legacyStylesCss = path.join(destPath, 'src', 'styles.css');
+  if (fs.existsSync(legacyStylesCss)) {
+    try { fs.unlinkSync(legacyStylesCss); } catch { /* ignore */ }
   }
 
-  // 3. Bare color-name words fill remaining roles
-  for (const role of roles) {
-    if (result[role]) continue;
-    const named = Object.keys(NAMED_DESIGN_COLORS).find(
-      (name) => !usedName.has(name) && new RegExp(`\\b${name}\\b`, 'i').test(text)
-    );
-    if (named) {
-      result[role] = NAMED_DESIGN_COLORS[named];
-      usedName.add(named);
-    }
-  }
+  // 10. .gitignore
+  const gitignore = `# Compiled output
+/dist
+/tmp
+/out-tsc
+/bazel-out
 
-  for (const role of roles) result[role] = result[role] || defaults[role];
-  return result;
-}
+# Node
+/node_modules
+npm-debug.log
+yarn-error.log
 
-/**
- * Extract a project name from the user prompt; falls back to the source
- * package.json name, then a safe default.
- */
-function extractProjectName(userPrompt, sourcePackageJson) {
-  const text = String(userPrompt || '');
-  const nameRe =
-    /(?:project|app)\s+(?:name|called|named|titled|is)\s*[:\-]?\s*['"]?([A-Za-z0-9][A-Za-z0-9 _\-.]{1,40})/i;
-  const nameItRe =
-    /(?:name|call)\s+(?:it|this|the\s+project|the\s+app)\s+['"]?([A-Za-z0-9][A-Za-z0-9 _\-.]{1,40})/i;
-  let name = null;
-  for (const re of [nameRe, nameItRe]) {
-    const m = text.match(re);
-    if (m) {
-      name = m[1].trim();
-      break;
-    }
-  }
-  if (name) return toSafeProjectName(name);
-  const srcName =
-    sourcePackageJson && typeof sourcePackageJson.name === 'string'
-      ? sourcePackageJson.name.trim()
-      : '';
-  if (srcName && !/^(angular|react|my-app|demo|test|app|project|frontend|web)$/i.test(srcName)) {
-    return toSafeProjectName(srcName);
-  }
-  return 'migrated-angular-project';
-}
+# IDEs and editors
+.idea/
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
 
-/**
- * Customize the copied template: project name, base design colors, titles.
- * Versions are locked separately by enforceAngularPackageVersions().
- */
-function applyAngularTemplateCustomizations(destPath, options) {
-  const { projectName = 'migrated-angular-project', designColors = {} } = options;
-  const humanName = humanizeProjectName(projectName);
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/*
 
-  // package.json: name (+ drop husky "prepare" so `npm ci` never needs a git repo)
-  const pkgPath = path.join(destPath, 'package.json');
-  if (fs.existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-      pkg.name = projectName;
-      if (pkg.scripts && typeof pkg.scripts.prepare === 'string') {
-        delete pkg.scripts.prepare;
-      }
-      fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
-    } catch {
-      /* ignore */
-    }
-  }
+# Miscellaneous
+/.angular/cache
+.sass-cache/
+/connect.lock
+/coverage
+/libpeerconnection.log
+testem.log
+/typings
+__screenshots__/
 
-  // angular.json: project key + outputPath + buildTargets
-  const angularJsonPath = path.join(destPath, 'angular.json');
-  if (fs.existsSync(angularJsonPath)) {
-    try {
-      const raw = fs.readFileSync(angularJsonPath, 'utf-8');
-      const normalized = raw.replace(/migrated-angular-project/g, projectName);
-      fs.writeFileSync(angularJsonPath, `${normalized}\n`, 'utf-8');
-    } catch {
-      /* ignore */
-    }
-  }
+# System files
+.DS_Store
+Thumbs.db
+`;
+  fs.writeFileSync(path.join(destPath, '.gitignore'), gitignore);
 
-  // index.html title + favicon references
-  const indexHtmlPath = path.join(destPath, 'src', 'index.html');
-  if (fs.existsSync(indexHtmlPath)) {
-    let html = fs.readFileSync(indexHtmlPath, 'utf-8');
-    html = html.replace(/<title>[^<]*<\/title>/, `<title>${humanName}</title>`);
-    html = html.replace(/demo-admin-favicon/g, `${projectName}-favicon`);
-    fs.writeFileSync(indexHtmlPath, html, 'utf-8');
-  }
-
-  // favicon copy
-  const faviconSrc = path.join(WEB_ANGULAR_TEMPLATE_DIR, 'public', 'favicon', 'demo-admin-favicon.svg');
-  const faviconDestDir = path.join(destPath, 'public', 'favicon');
-  if (fs.existsSync(faviconSrc)) {
-    ensureDirectoryExists(faviconDestDir);
-    fs.copyFileSync(faviconSrc, path.join(faviconDestDir, `${projectName}-favicon.svg`));
-    try {
-      fs.unlinkSync(path.join(faviconDestDir, 'demo-admin-favicon.svg'));
-    } catch {
-      /* ignore */
-    }
-  }
-
-  // app.component.ts title
-  const appTsPath = path.join(destPath, 'src', 'app', 'app.component.ts');
-  if (fs.existsSync(appTsPath)) {
-    let ts = fs.readFileSync(appTsPath, 'utf-8');
-    ts = ts.replace(
-      /public\s+title\s*=\s*['"][^'"]*['"]/,
-      `public title = '${humanName.replace(/'/g, "\\'")}';`
-    );
-    fs.writeFileSync(appTsPath, ts, 'utf-8');
-  }
-
-  // app.component.html loading-bar color → primary.
-  // Template uses a quoted TS string literal: [color]="'#0788C0'". Keep both
-  // the outer attribute quotes and the inner literal quotes when replacing.
-  const appHtmlPath = path.join(destPath, 'src', 'app', 'app.component.html');
-  if (fs.existsSync(appHtmlPath) && designColors.primary) {
-    let html = fs.readFileSync(appHtmlPath, 'utf-8');
-    html = html.replace(
-      /(\[color\]=\s*['"])(['"]?)(#?[0-9a-fA-F]{3,8})(['"]?)(['"])/,
-      (m, open, inner1, hex, inner2, close) =>
-        `${open}${inner1}${designColors.primary}${inner2}${close}`
-    );
-    fs.writeFileSync(appHtmlPath, html, 'utf-8');
-  }
-
-  // config/app-settings.config.ts appTitle
-  const settingsPath = path.join(destPath, 'src', 'app', 'config', 'app-settings.config.ts');
-  if (fs.existsSync(settingsPath)) {
-    let ts = fs.readFileSync(settingsPath, 'utf-8');
-    ts = ts.replace(
-      /appTitle\s*:\s*['"][^'"]*['"]/,
-      `appTitle: '${humanName.replace(/'/g, "\\'")}'`
-    );
-    fs.writeFileSync(settingsPath, ts, 'utf-8');
-  }
-
-  // tailwind.config.js base colors
-  const twPath = path.join(destPath, 'tailwind.config.js');
-  if (fs.existsSync(twPath) && (designColors.primary || designColors.secondary || designColors.tertiary)) {
-    let tw = fs.readFileSync(twPath, 'utf-8');
-    if (designColors.primary) {
-      tw = tw.replace(
-        /primary:\s*\{[^}]*\}/,
-        `primary: {\n        DEFAULT: '${designColors.primary}',\n        100: '${lightenHex(designColors.primary)}',\n      }`
-      );
-    }
-    if (designColors.secondary) {
-      tw = tw.replace(
-        /secondary:\s*\{[^}]*\}/,
-        `secondary: {\n        DEFAULT: '${designColors.secondary}',\n        100: '${lightenHex(designColors.secondary)}',\n      }`
-      );
-    }
-    if (designColors.tertiary) {
-      tw = tw.replace(
-        /tertiary:\s*\{[^}]*\}/,
-        `tertiary: {\n        DEFAULT: '${designColors.tertiary}',\n      }`
-      );
-    }
-    fs.writeFileSync(twPath, tw, 'utf-8');
-  }
-}
-
-/**
- * Copy the whole web_angular template into the migration workspace and apply
- * the only allowed customizations: target version, project name, base colors.
- * Every other template file (shared kit, core services, store, layouts, scss
- * design system, environments, configs) is kept as-is.
- */
-function injectAngularWorkspaceTemplates(destPath, versionStack = null, options = {}) {
-  const stack = versionStack || LATEST_ANGULAR;
-  const { projectName = 'migrated-angular-project', designColors = {} } = options;
-
-  copyWebAngularTemplate(destPath);
-  applyAngularTemplateCustomizations(destPath, { projectName, designColors });
-  enforceAngularPackageVersions(destPath, stack);
-
-  // Ensure the Angular app structure folders exist (template already provides them)
+  // 11. Ensure Angular app structure exists
   ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'interceptors'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'guards'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'core', 'services'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'components'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'pipes'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'shared', 'directives'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'common'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'auth'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'app', 'pages', 'admin'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'environments'));
   ensureDirectoryExists(path.join(destPath, 'public'));
   ensureDirectoryExists(path.join(destPath, 'public', 'scss'));
+
+  // 12-15. Environment files, routes, interceptors, store
+  // NOTE: These are now handled by injectAngularCoreSharedFiles() which copies
+  // from angular_required/ directory. This ensures consistency and avoids duplication.
+  // The files are copied AFTER this function runs in the migration pipeline.
 }
-
-/**
- * Restore pristine template root/config files after AI generation (pipeline
- * step 4b) so the delivered project always ships with the exact web_angular
- * tooling. Re-applies project name / colors / version customizations.
- * src/app/pages + src/app/core + src/app/shared + src/app/store are NEVER
- * touched here — the AI owns the feature pages, the template owns the kit.
- */
-function restoreAngularRootConfigs(destPath, stack, options = {}) {
-  const { projectName = 'migrated-angular-project', designColors = {} } = options;
-  const rootFiles = [
-    'package.json', 'angular.json', 'tsconfig.json', 'tsconfig.app.json',
-    'tsconfig.spec.json', 'tailwind.config.js', 'eslint.config.js', '.prettierrc',
-    '.gitignore', '.editorconfig', '.husky/pre-commit'
-  ];
-  for (const rel of rootFiles) {
-    const src = path.join(WEB_ANGULAR_TEMPLATE_DIR, rel);
-    if (!fs.existsSync(src)) continue;
-    const dest = path.join(destPath, rel);
-    ensureDirectoryExists(path.dirname(dest));
-    fs.copyFileSync(src, dest);
-  }
-  for (const rel of ['src/index.html', 'src/main.ts', 'src/styles.scss', 'src/app/app.config.ts']) {
-    const src = path.join(WEB_ANGULAR_TEMPLATE_DIR, rel);
-    if (!fs.existsSync(src)) continue;
-    const dest = path.join(destPath, rel);
-    ensureDirectoryExists(path.dirname(dest));
-    fs.copyFileSync(src, dest);
-  }
-  applyAngularTemplateCustomizations(destPath, { projectName, designColors });
-  enforceAngularPackageVersions(destPath, stack);
-  console.log('[web_angular] Restored pristine root config files + customizations');
-}
-
-// ---------------------------------------------------------------------------
-// Token-efficient source reading (only essential files for a web_angular app)
-// ---------------------------------------------------------------------------
-
-const ESSENTIAL_STOPLIST = new Set([
-  'list', 'form', 'edit', 'add', 'detail', 'view', 'index', 'route', 'routes',
-  'service', 'component', 'app', 'page', 'pages', 'home', 'login', 'dashboard',
-  'common', 'config', 'data', 'model', 'type', 'types', 'utils', 'util',
-  'helper', 'const', 'constants', 'styles', 'style', 'test', 'spec', 'main',
-  'shared', 'core', 'store', 'layout', 'auth'
-]);
-
-/**
- * Keep only the source files that are essential to functionalize a
- * web_angular-style app (auth + dashboard + shell + shared plumbing). Feature
- * pages that are NOT auth/dashboard related are dropped to save tokens.
- */
-function filterEssentialSourceFiles(filesMap, userPrompt = '') {
-  const promptLower = String(userPrompt || '').toLowerCase();
-  const result = {};
-  for (const [rel, content] of Object.entries(filesMap)) {
-    const n = rel.replace(/\\/g, '/');
-    if (isEssentialSourcePath(n, promptLower)) {
-      result[rel] = content;
-    }
-  }
-  // Never strip everything — fall back to the full map if the filter was too aggressive
-  if (Object.keys(result).length === 0) return filesMap;
-  return result;
-}
-
-function isEssentialSourcePath(n, promptLower) {
-  // Root-level config / tooling files (small, always useful)
-  if (!n.startsWith('src/')) return true;
-
-  // Assets are never source code
-  if (/^src\/assets\//.test(n)) return false;
-
-  // Entry points + global styles
-  if (/^src\/(main|app|index|styles|polyfills|test|environments)\b/.test(n)) return true;
-  if (n.includes('/environments/')) return true;
-
-  // Shared plumbing / framework folders (services, stores, guards, libs, …)
-  if (
-    /\/(core|shared|common|store|state|models?|types|interfaces|interceptors?|guards?|http|api|services?|lib|hooks?|utils?|helpers?|constants?|configs?|context|validators?|pipes?|directives?|animations?|data|assets|theme)\//.test(n)
-  ) {
-    return true;
-  }
-
-  // Auth + dashboard related features
-  if (
-    /\/(auth|login|register|signin|signup|sign-in|sign-up|forgot|reset|otp|password|credential|token|account|profile|logout)\//.test(n)
-  ) {
-    return true;
-  }
-  if (
-    /\/(dashboard|home|overview|analytics|shell|layout|sidebar|header|navbar|topbar|footer|sidenav)\//.test(n)
-  ) {
-    return true;
-  }
-
-  // Loose src-root files
-  if (!n.includes('/')) return true;
-
-  // Feature files whose basename is explicitly mentioned in the user prompt
-  const base = (n.split('/').pop() || '')
-    .replace(/\.(ts|tsx|js|jsx|html|scss|css|json)$/i, '')
-    .replace(/\.component$|\.service$|\.page$|\.view$/i, '')
-    .toLowerCase();
-  if (base.length > 3 && !ESSENTIAL_STOPLIST.has(base) && promptLower.includes(base)) {
-    return true;
-  }
-
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Final npm ci sanity check
-// ---------------------------------------------------------------------------
-
-/**
- * Verify the delivered project installs and builds from a clean `npm ci`
- * (the exact command a user will run on the downloaded ZIP). Regenerates the
- * lock file first when missing or out of sync, then runs `npm ci` + build.
- * Returns { ok: boolean, errors: string }.
- */
-async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
-  const isAngular = String(targetTech).toLowerCase().includes('angular');
-  const buildCmd = isAngular ? 'npx' : 'npm';
-  const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const lockPath = path.join(workspacePath, 'package-lock.json');
-    if (!fs.existsSync(lockPath)) {
-      console.log(`[${sessionId}] npm ci check: no package-lock.json — generating via npm install...`);
-      // NOTE: no --prefer-offline — stale cached packuments cause ETARGET for
-      // recently published versions (e.g. Angular 22 patch lines).
-      const gen = await runCommand('npm', ['install'], workspacePath, 300000);
-      if (gen.exitCode !== 0) {
-        return {
-          ok: false,
-          errors: `npm install (lock generation) failed:\n${(gen.stderr || gen.stdout || '').slice(-2000)}`
-        };
-      }
-    }
-
-    console.log(`[${sessionId}] npm ci check (attempt ${attempt}/2): npm ci ...`);
-    const ci = await runCommand('npm', ['ci'], workspacePath, 300000);
-    if (ci.exitCode !== 0) {
-      const errOut = (ci.stderr || ci.stdout || '').slice(-1500);
-      console.error(`[${sessionId}] npm ci failed (attempt ${attempt}):\n${errOut}`);
-      if (attempt === 1) {
-        // Out-of-sync lock (postprocess may have touched package.json) — regen + retry
-        const regen = await runCommand('npm', ['install'], workspacePath, 300000);
-        if (regen.exitCode !== 0) {
-          return {
-            ok: false,
-            errors: `npm ci failed, lock regeneration also failed:\n${errOut}\n${(regen.stderr || regen.stdout || '').slice(-1500)}`
-          };
-        }
-        continue;
-      }
-      return { ok: false, errors: `npm ci failed:\n${errOut}` };
-    }
-
-    console.log(`[${sessionId}] npm ci succeeded. Running ${buildCmd} ${buildArgs.join(' ')}...`);
-    const build = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
-    if (build.exitCode === 0) {
-      console.log(`[${sessionId}] npm ci + build ✅ PASSED`);
-      return { ok: true, errors: '' };
-    }
-    const buildErr = (build.stderr || build.stdout || '').slice(-2500);
-    console.error(`[${sessionId}] npm ci build failed:\n${buildErr}`);
-    return { ok: false, errors: `npm ci build failed:\n${buildErr}` };
-  }
-
-  return { ok: false, errors: 'npm ci verification exhausted retries.' };
-}
-
 
 // ---------------------------------------------------------------------------
 // React workspace template injection
@@ -1447,7 +1411,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 }
 
 // ---------------------------------------------------------------------------
-// Angular helpers (web_angular template kit)
+// Angular core/shared folder injection (from server/angular_required)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1461,64 +1425,382 @@ function writeFileIfMissing(filePath, content) {
 }
 
 /**
- * Ensure app.config.ts wires the web_angular interceptors + NGXS store.
- * The template ships a complete app.config.ts, so this only creates a file
- * when it is missing (never overwrites a working config).
+ * Companion stubs required by angular_required imports (@app/config, @core/services, …).
+ * AI may overwrite these with real implementations later.
  */
-function ensureAngularAppConfigUsesWebAngular(destPath) {
-  const appConfigPath = path.join(destPath, 'src', 'app', 'app.config.ts');
-  if (fs.existsSync(appConfigPath)) {
-    const existing = fs.readFileSync(appConfigPath, 'utf-8');
-    if (/provideStore\s*\(/.test(existing) && /withInterceptors\s*\(/.test(existing)) {
-      return;
+function ensureAngularRequiredCompanionStubs(destPath) {
+  const created = [];
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'config', 'index.ts'),
+      `export const appSettings = {
+  credentialsKey: 'credentials',
+  ajaxTimeout: 60000
+};
+`
+    )
+  ) {
+    created.push('src/app/config/index.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'common.service.ts'),
+      `import { Injectable } from '@angular/core';
+import { BehaviorSubject } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class CommonService {
+  public isRefreshingToken = false;
+  public tokenSubject = new BehaviorSubject<string | null>(null);
+  public accessControls$ = new BehaviorSubject<IACLResponse[]>([]);
+  public aclBroadcastChannel = typeof BroadcastChannel !== 'undefined'
+    ? new BroadcastChannel('acl')
+    : ({ onmessage: null } as unknown as BroadcastChannel);
+
+  setAccessControls(data: IACLResponse[], _broadcast = true): void {
+    this.accessControls$.next(data || []);
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/common.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'encryption.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class EncryptionService {
+  encryptUsingAES256(value: unknown): string {
+    try {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(value ?? {}))));
+    } catch {
+      return '';
     }
   }
 
-  const kitConfig = `import {
-  httpErrorInterceptorFn,
-  httpAuthHeaderInterceptorFn,
-  httpSuccessHandlerInterceptorFn,
-} from './core/interceptors';
-import { routes } from './app.routes';
-import { provideStore } from '@ngxs/store';
-import { provideToastr } from 'ngx-toastr';
-import { PreloadAllModules, provideRouter, withPreloading } from '@angular/router';
-import { environment } from '../environments/environment';
-import { withNgxsLoggerPlugin } from '@ngxs/logger-plugin';
-import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
-import { ApplicationConfig, importProvidersFrom, provideZoneChangeDetection } from '@angular/core';
-import { AppState } from './store';
+  decryptUsingAES256(value: string): unknown {
+    try {
+      return JSON.parse(decodeURIComponent(escape(atob(value))));
+    } catch {
+      return null;
+    }
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/encryption.service.ts');
+  }
 
-const STATES = [AppState];
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'crypto.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+/** Stub crypto used by angular_required HTTP success interceptor. */
+@Injectable({ providedIn: 'root' })
+export class CryptoService {
+  async encrypt(data: Record<string, unknown>): Promise<string> {
+    try {
+      return btoa(unescape(encodeURIComponent(JSON.stringify(data ?? {}))));
+    } catch {
+      return '';
+    }
+  }
+
+  async decrypt(payload: string): Promise<unknown> {
+    try {
+      return JSON.parse(decodeURIComponent(escape(atob(payload))));
+    } catch {
+      return null;
+    }
+  }
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/crypto.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'services', 'socket-io.service.ts'),
+      `import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class SocketIoService {
+  reconnectWithLatestToken(): void {}
+  disconnect(): void {}
+  clearConversationState(): void {}
+}
+`
+    )
+  ) {
+    created.push('src/app/core/services/socket-io.service.ts');
+  }
+
+  const servicesIndexPath = path.join(destPath, 'src', 'app', 'core', 'services', 'index.ts');
+  const servicesBarrel = `export { CommonService } from './common.service';
+export { EncryptionService } from './encryption.service';
+export { SocketIoService } from './socket-io.service';
+export { CryptoService } from './crypto.service';
+`;
+  if (!fs.existsSync(servicesIndexPath)) {
+    ensureDirectoryExists(path.dirname(servicesIndexPath));
+    fs.writeFileSync(servicesIndexPath, servicesBarrel, 'utf-8');
+    created.push('src/app/core/services/index.ts');
+  } else {
+    const existing = fs.readFileSync(servicesIndexPath, 'utf-8');
+    if (!existing.includes('CryptoService')) {
+      fs.writeFileSync(
+        servicesIndexPath,
+        `${existing.trimEnd()}\nexport { CryptoService } from './crypto.service';\n`,
+        'utf-8'
+      );
+      created.push('src/app/core/services/index.ts (CryptoService export)');
+    }
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'authentication', 'authentication.service.ts'),
+      `import { Injectable } from '@angular/core';
+import { Observable, of } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class AuthenticationService {
+  getToken(): string {
+    return '';
+  }
+
+  isAuthenticated(): boolean {
+    return false;
+  }
+
+  getRefreshToken(): Observable<{ response: { data: Omit<ITokenInfo, 'enc_email'> } }> {
+    return of({
+      response: {
+        data: {
+          access_token: '',
+          refresh_token: '',
+          refresh_token_expire_timestamp: ''
+        }
+      }
+    });
+  }
+
+  updateRefreshedToken(_data: Omit<ITokenInfo, 'enc_email'>): void {}
+
+  logout(): void {}
+}
+`
+    )
+  ) {
+    created.push('src/app/core/authentication/authentication.service.ts');
+  }
+
+  if (
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'app', 'core', 'authentication', 'index.ts'),
+      `export { AuthenticationService } from './authentication.service';
+`
+    )
+  ) {
+    created.push('src/app/core/authentication/index.ts');
+  }
+
+  if (created.length) {
+    console.log(`[angular_required] Companion stubs created: ${created.join(', ')}`);
+  }
+}
+
+/**
+ * Ensure package.json includes every npm dependency used by angular_required.
+ */
+function ensureAngularRequiredNpmDeps(destPath, angularCoreVersion) {
+  const pkgPath = path.join(destPath, 'package.json');
+  if (!fs.existsSync(pkgPath)) return;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  } catch {
+    return;
+  }
+  pkg.dependencies = pkg.dependencies || {};
+  const deps = angularRequiredNpmDeps(angularCoreVersion);
+  let added = 0;
+  for (const [name, version] of Object.entries(deps)) {
+    if (!pkg.dependencies[name]) {
+      pkg.dependencies[name] = version;
+      added += 1;
+    }
+  }
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
+  if (added) {
+    console.log(`[angular_required] Added ${added} npm dependency(ies) to package.json`);
+  }
+}
+
+/**
+ * Copies angular_required into the migrated Angular workspace and wires deps/aliases/stubs.
+ * Does NOT overwrite AI-generated app.routes.ts (template routes need layouts the AI creates).
+ */
+function injectAngularCoreSharedFiles(destPath, versionStack = null) {
+  const angularRequiredDir = path.resolve(__dirname, '..', '..', 'angular_required');
+
+  if (!fs.existsSync(angularRequiredDir)) {
+    console.warn(`[angular_required] Directory not found at ${angularRequiredDir}. Skipping.`);
+    return;
+  }
+
+  const angularCoreVersion = versionStack?.core || '22.0.8';
+
+  const sharedDestDir = path.resolve(destPath, 'src', 'app', 'shared');
+  ensureDirectoryExists(sharedDestDir);
+
+  const sharedDirs = ['animations', 'components', 'directives', 'models', 'pipes', 'utilities', 'validators'];
+  for (const dir of sharedDirs) {
+    const srcPath = path.join(angularRequiredDir, dir);
+    if (fs.existsSync(srcPath)) {
+      const destSubDir = path.join(sharedDestDir, dir);
+      ensureDirectoryExists(destSubDir);
+      fs.cpSync(srcPath, destSubDir, { recursive: true });
+    }
+  }
+  console.log(`[angular_required] Copied shared kit → ${path.relative(destPath, sharedDestDir)}`);
+
+  const interceptorsSrcDir = path.join(angularRequiredDir, 'interceptors');
+  const interceptorsDestDir = path.resolve(destPath, 'src', 'app', 'core', 'interceptors');
+  if (fs.existsSync(interceptorsSrcDir)) {
+    ensureDirectoryExists(interceptorsDestDir);
+    fs.cpSync(interceptorsSrcDir, interceptorsDestDir, { recursive: true });
+    console.log(`[angular_required] Copied interceptors → ${path.relative(destPath, interceptorsDestDir)}`);
+  }
+
+  const storeSrcDir = path.join(angularRequiredDir, 'store');
+  const storeDestDir = path.resolve(destPath, 'src', 'app', 'store');
+  if (fs.existsSync(storeSrcDir)) {
+    ensureDirectoryExists(storeDestDir);
+    fs.cpSync(storeSrcDir, storeDestDir, { recursive: true });
+    console.log(`[angular_required] Copied store → ${path.relative(destPath, storeDestDir)}`);
+  }
+
+  const envSrcDir = path.join(angularRequiredDir, 'environments');
+  const envDestDir = path.resolve(destPath, 'src', 'environments');
+  if (fs.existsSync(envSrcDir)) {
+    ensureDirectoryExists(envDestDir);
+    // Do not wipe AI-extended environment files on re-inject — only seed missing ones
+    for (const file of fs.readdirSync(envSrcDir)) {
+      const srcFile = path.join(envSrcDir, file);
+      const destFile = path.join(envDestDir, file);
+      if (!fs.statSync(srcFile).isFile()) continue;
+      if (!fs.existsSync(destFile)) {
+        fs.copyFileSync(srcFile, destFile);
+      }
+    }
+    console.log(`[angular_required] Seeded environments → ${path.relative(destPath, envDestDir)} (existing files preserved)`);
+  }
+
+  console.log(
+    `[angular_required] Skipping routes copy (AI owns app.routes.ts). ` +
+    `Reference template remains in angular_required/routes.`
+  );
+
+  ensureAngularRequiredCompanionStubs(destPath);
+  ensureAngularRequiredNpmDeps(destPath, angularCoreVersion);
+
+  for (const cfgName of ['tsconfig.json', 'tsconfig.app.json']) {
+    const cfgPath = path.join(destPath, cfgName);
+    if (!fs.existsSync(cfgPath)) continue;
+    try {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      cfg.compilerOptions = cfg.compilerOptions || {};
+      cfg.compilerOptions.baseUrl = './';
+      cfg.compilerOptions.paths = {
+        ...(cfg.compilerOptions.paths || {}),
+        ...ANGULAR_REQUIRED_PATH_ALIASES
+      };
+      fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf-8');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  console.log(`[angular_required] Injection complete (shared kit + npm deps + companion stubs).`);
+
+  ensureAngularAppConfigUsesRequiredKit(destPath);
+}
+
+/**
+ * Ensure app.config.ts registers angular_required interceptors + NGXS AppState.
+ * Only patches when the file is missing those providers (won't clobber a richer AI config).
+ */
+function ensureAngularAppConfigUsesRequiredKit(destPath) {
+  const appConfigPath = path.join(destPath, 'src', 'app', 'app.config.ts');
+  const kitConfig = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
+import { provideStore } from '@ngxs/store';
+import { routes } from './app.routes';
+import { AppState } from './store';
+import {
+  httpAuthHeaderInterceptorFn,
+  httpErrorInterceptorFn,
+  httpSuccessHandlerInterceptorFn
+} from './core/interceptors';
 
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZoneChangeDetection({ eventCoalescing: true }),
-    provideRouter(routes, withPreloading(PreloadAllModules)),
+    provideRouter(routes),
     provideAnimationsAsync(),
-    importProvidersFrom(),
     provideHttpClient(
       withInterceptors([
-        httpErrorInterceptorFn,
         httpAuthHeaderInterceptorFn,
-        httpSuccessHandlerInterceptorFn,
-      ]),
+        httpErrorInterceptorFn,
+        httpSuccessHandlerInterceptorFn
+      ])
     ),
-    provideToastr({
-      timeOut: 3000,
-      closeButton: true,
-      positionClass: 'toast-top-right',
-    }),
-    provideStore([...STATES], withNgxsLoggerPlugin({ disabled: environment.production })),
-  ],
+    provideStore([AppState])
+  ]
 };
 `;
-  ensureDirectoryExists(path.dirname(appConfigPath));
-  fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
-  console.log(`[web_angular] Wrote app.config.ts with interceptors + NGXS store + toastr`);
-}
 
+  if (!fs.existsSync(appConfigPath)) {
+    ensureDirectoryExists(path.dirname(appConfigPath));
+    fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
+    console.log(`[angular_required] Wrote app.config.ts with interceptors + NGXS store`);
+    return;
+  }
+
+  const existing = fs.readFileSync(appConfigPath, 'utf-8');
+  const hasStore = /provideStore\s*\(/.test(existing);
+  const hasInterceptors = /withInterceptors\s*\(/.test(existing) || /httpAuthHeaderInterceptorFn/.test(existing);
+  if (hasStore && hasInterceptors) return;
+
+  // Replace minimal scaffold configs; leave richer AI-authored configs alone
+  const looksMinimal =
+    /provideHttpClient\s*\(\s*\)/.test(existing) &&
+    !/provideStore/.test(existing) &&
+    existing.length < 1200;
+
+  if (looksMinimal || (!hasStore && !hasInterceptors && existing.length < 1200)) {
+    fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
+    console.log(`[angular_required] Upgraded app.config.ts with interceptors + NGXS store`);
+  } else {
+    console.log(
+      `[angular_required] app.config.ts already customized — left as-is ` +
+      `(store=${hasStore}, interceptors=${hasInterceptors})`
+    );
+  }
+}
 
 function ensureAngularRuntimeFiles(destPath) {
   const srcAppDir = path.join(destPath, 'src', 'app');
@@ -2133,15 +2415,7 @@ export {
   sanitizeHtmlContent,
   sanitizeCssContent,
   resolveSafeWritePath,
-  stripCodeFences,
-  // web_angular template helpers (exported for tests / tooling)
-  injectAngularWorkspaceTemplates,
-  restoreAngularRootConfigs,
-  enforceAngularPackageVersions,
-  extractProjectName,
-  extractDesignColors,
-  filterEssentialSourceFiles,
-  verifyNpmCiBuild
+  stripCodeFences
 };
 
 /**
@@ -2202,7 +2476,7 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
 
   if (shouldInstall) {
     console.log(`[${sessionId}] Build verification: running npm install...`);
-    const installResult = await runCommand('npm', ['install'], workspacePath, 300000);
+    const installResult = await runCommand('npm', ['install', '--prefer-offline'], workspacePath, 300000);
     if (installResult.exitCode !== 0) {
       const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
       console.error(`[${sessionId}] npm install failed:\n`, errOutput);
@@ -2706,46 +2980,10 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
     throw new Error('No readable source files found inside the uploaded ZIP.');
   }
 
-  // Token efficiency: keep only source files essential to build a
-  // web_angular-style app (auth + dashboard + shell + shared plumbing).
-  // Feature pages outside that scope are dropped so the AI context stays small.
-  const essentialFilesMap = filterEssentialSourceFiles(filesMap, userPrompt);
-  const droppedCount = Object.keys(filesMap).length - Object.keys(essentialFilesMap).length;
+  const fileTree = Object.keys(filesMap).map((f) => `- ${f}`).join('\n');
+  const filesContextSummary = buildFilesContext(filesMap);
 
-  const fileTree = Object.keys(essentialFilesMap).map((f) => `- ${f}`).join('\n');
-  const filesContextSummary = buildFilesContext(essentialFilesMap);
-
-  console.log(
-    `[${sessionId}] Read ${Object.keys(filesMap).length} source files; ` +
-      `kept ${Object.keys(essentialFilesMap).length} essential file(s) for the web_angular app (dropped ${droppedCount}).`
-  );
-
-  // Read the source package.json once (project name + dependency carry-over)
-  const sourcePackageJson = (() => {
-    const candidates = [
-      path.join(baseSearchPath, 'package.json'),
-      ...Object.keys(essentialFilesMap)
-        .filter((f) => f.replace(/\\/g, '/').endsWith('package.json'))
-        .map((f) => ({ rel: f, content: essentialFilesMap[f] }))
-    ];
-    if (fs.existsSync(candidates[0])) {
-      try {
-        return JSON.parse(fs.readFileSync(candidates[0], 'utf-8'));
-      } catch {
-        /* fall through */
-      }
-    }
-    for (const item of candidates.slice(1)) {
-      if (item && item.content) {
-        try {
-          return JSON.parse(item.content);
-        } catch {
-          /* continue */
-        }
-      }
-    }
-    return null;
-  })();
+  console.log(`[${sessionId}] Read ${Object.keys(filesMap).length} source files.`);
   const targetLower = (toTech || '').toLowerCase();
   if (targetLower.includes('angular')) {
     console.log(
@@ -2760,19 +2998,10 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   // 2b. Inject workspace templates for known target frameworks
   // -----------------------------------------------------------------------
-  let projectName = 'migrated-angular-project';
-  let designColors = {};
   if (targetLower.includes('angular')) {
-    projectName = extractProjectName(userPrompt, sourcePackageJson);
-    designColors = extractDesignColors(userPrompt);
-    console.log(
-      `[${sessionId}] Injecting web_angular workspace template ` +
-        `(project=${projectName}, colors=${JSON.stringify(designColors)})...`
-    );
-    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular, {
-      projectName,
-      designColors
-    });
+    console.log(`[${sessionId}] Injecting Angular workspace templates...`);
+    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
+    injectAngularCoreSharedFiles(migrationWorkspacePath, targetVersions.angular);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
     ensureCnUtil(migrationWorkspacePath);
     enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
@@ -2796,7 +3025,6 @@ RULES:
 - Route login as default, dashboard after login, protect with auth guard / protected route.
 - Plan ONLY src/ files (components, services, styles). Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html, vite.config).
 - For Angular components, use templateUrl + styleUrl (NOT inline templates); plan full .ts + .html + .scss triads.
-- The workspace is pre-injected from the complete web_angular template (src/app/config, src/app/core, src/app/shared, src/app/store, src/app/pages/common, src/app/pages/deeplink, src/app/app.config.ts). KEEP all template files untouched. FUNCTIONALIZE the template's auth pages (login, forgot-password, enter-otp, reset-password, create-new-password) and the dashboard from the source project's auth + dashboard code — plan the template's exact paths under src/app/pages/.
 - The app must compile and run after stripping.
 - Output ONLY raw JSON (no markdown, no backticks, no explanation).
 
@@ -2823,19 +3051,13 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
-- WEB_ANGULAR TEMPLATE (the complete reference project is ALREADY injected — do NOT re-plan or regenerate these paths):
-  src/app/config/, src/app/core/{authentication,guards,http,interceptors,layouts,resolvers,services},
-  src/app/shared/{animations,components,models,directives,pipes,utilities,validators},
-  src/app/store/, src/app/pages/common/, src/app/pages/deeplink/, src/app/app.config.ts.
-  Reuse breadcrumbs / confirmation-dialog / global-search / pipes / directives / validators / guards / http.service / store from the template.
-  Path aliases: @app/*, @core/*, @pages/*, @store/*, @env/*, @shared/*, @configs/* (and @/ → src/).
-  KEEP the template folder layout: src/app/pages/{auth,admin,common,deeplink}, core, shared, store, config.
-  FUNCTIONALIZE (plan + rewrite) ONLY the template's feature pages from the source project:
-    - Auth: src/app/pages/auth/auth/pages/{login,forgot-password,enter-otp,reset-password,create-new-password}/* (full .ts+.html+.scss triads)
-    - Dashboard: src/app/pages/admin/dashboard/pages/dashboard/dashboard.component.{ts,html,scss}
-    - Routes: src/app/pages/auth/auth.routes.ts, src/app/pages/admin/admin.routes.ts, src/app/app.routes.ts — extend, do not remove template guards/layouts.
-  Any NEW feature pages go under src/app/pages/admin/... following the same triad + folder pattern.
-- ENVIRONMENTS: src/environments/environment*.ts already include production, host, clientId, clientSecret, encryption. Extend with apiUrl/appTitle/theme in the SAME unit as the config that needs them.
+- ANGULAR_REQUIRED KIT (already injected — do NOT re-plan these paths):
+  src/app/shared/{animations,components,directives,models,pipes,utilities,validators},
+  src/app/core/interceptors/, src/app/store/.
+  Reuse breadcrumbs / confirmation-dialog / global-search / pipes / directives / validators from shared.
+  Path aliases: @app/*, @core/*, @env/*, @shared/*, @/*.
+  Do NOT delete or regenerate those kit files. Wire app.config / providers to use real interceptors from core/interceptors when needed.
+- ENVIRONMENTS: src/environments already has appTitle, theme, host, apiUrl, encryption. When a config unit needs more env keys, plan environment*.ts updates in the SAME unit as that config file.
 - Map lucide-react icons to plain inline SVG markup in Angular (NO @lucide/angular / lucide-angular / lucide-react packages). Every icon must be a real <svg xmlns=...>...</svg> with Lucide paths. For React target keep lucide-react.
 - For Angular: NEVER plan Lucide* imports, LucideIconModule, <lucide-*> tags, or <svg lucideXxx>. Plan inline SVG only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
@@ -3089,7 +3311,7 @@ CRITICAL RULES:
 13. Use WritableSignal (from signal()) when calling .set(); plain Signal is read-only.
 14. Getters are NOT callable in templates: use avatarClasses not avatarClasses(). Methods that need () must be real methods, not get accessors.
 15. Do not reference private fields in templates — use protected or public.
-16. Path aliases: @app/* → src/app/*, @core/* → src/app/core/*, @pages/* → src/app/pages/*, @store/* → src/app/store/*, @env/* → src/environments/*, @shared/* → src/app/shared/*, @configs/* → src/app/config/*, @/ → src/. Also emit the actual src/lib/*.ts files in the plan when a cn() helper is needed.
+16. Path alias @/ maps to src/ (e.g. import { cn } from '@/lib/utils'). Also emit the actual src/lib/*.ts files in the plan.
 17. Convert lucide-react icons to plain inline <svg>…</svg> in Angular (NO @lucide/angular, lucide-angular, or lucide-react in Angular package.json). NEVER use <Home />, <lucide-home>, or <svg lucideHome>. Do NOT import @radix-ng/* or other invented packages.
 18. app.component.ts must ONLY be the root shell component — never put ErrorHandler, provideHttpClient, or EnvironmentProviders inside a @Component.
 19. app.config.ts / routing providers belong in src/app/app.config.ts and src/app/app.routes.ts only.
@@ -3109,8 +3331,8 @@ CRITICAL RULES:
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
-36. WEB_ANGULAR TEMPLATE: The complete template kit under src/app/config, src/app/core, src/app/shared, src/app/store, src/app/pages/common, src/app/pages/deeplink and src/app/app.config.ts is ALREADY present and complete — never recreate or overwrite it. Import via @app/*, @core/*, @pages/*, @store/*, @env/*, @shared/*, @configs/*. Only src/app/pages/auth/* and src/app/pages/admin/* feature pages are yours to functionalize/create.
-37. ENVIRONMENTS: src/environments/environment*.ts already include production, host, clientId, clientSecret, encryption. Extend with apiUrl/appTitle/theme in the SAME unit as the config that needs them (do not cast missing keys).
+36. ANGULAR_REQUIRED: Shared kit under src/app/shared, core/interceptors, store is ALREADY present. Do not recreate those files. Import from @app/shared/*, @app/core/interceptors, @app/store, @env/environment as needed.
+37. ENVIRONMENTS: src/environments/environment*.ts already include production, host, apiUrl, appTitle, theme, encryption, plus an index signature. Prefer those keys. If you need another env key, UPDATE the environment*.ts files in the SAME unit (do not cast missing keys).
 `;
 
   const generatedFiles = {};
@@ -3138,8 +3360,8 @@ CRITICAL RULES:
         Array.isArray(fileTarget.approximateSourceFilesToRead)
       ) {
         for (const relPath of fileTarget.approximateSourceFilesToRead) {
-          if (essentialFilesMap[relPath]) {
-            targetSpecificContext += `\n--- SOURCE FILE: ${relPath} ---\n${essentialFilesMap[relPath]}\n`;
+          if (filesMap[relPath]) {
+            targetSpecificContext += `\n--- SOURCE FILE: ${relPath} ---\n${filesMap[relPath]}\n`;
           }
         }
       }
@@ -3392,9 +3614,34 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
     'vite.config.ts'
   ];
   
-  // For React/Angular, restore template config files AFTER AI generation to
-  // ensure correct tooling. The AI owns src/app feature pages only — the
-  // web_angular kit/config files are restored from the pristine template.
+  // For React/Angular, re-inject templates AFTER AI generation to ensure correct config files
+  // The AI may have overwritten our templates, so we restore them here
+  const sourcePackageJson = (() => {
+    const candidates = [
+      path.join(baseSearchPath, 'package.json'),
+      ...Object.keys(filesMap)
+        .filter((f) => f.replace(/\\/g, '/').endsWith('package.json'))
+        .map((f) => ({ rel: f, content: filesMap[f] }))
+    ];
+    if (fs.existsSync(candidates[0])) {
+      try {
+        return JSON.parse(fs.readFileSync(candidates[0], 'utf-8'));
+      } catch {
+        /* fall through */
+      }
+    }
+    for (const item of candidates.slice(1)) {
+      if (item && item.content) {
+        try {
+          return JSON.parse(item.content);
+        } catch {
+          /* continue */
+        }
+      }
+    }
+    return null;
+  })();
+
   if (targetLower.includes('react')) {
     console.log(`[${sessionId}] Re-injecting React templates to ensure correct config files...`);
     injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
@@ -3403,19 +3650,14 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
     repairReactWorkspace(migrationWorkspacePath, { sourcePackageJson });
     enforceReactPackageVersions(migrationWorkspacePath, targetVersions.react);
   } else if (targetLower.includes('angular')) {
-    console.log(
-      `[${sessionId}] Restoring web_angular template config files (AI kept ownership of src/app feature pages)...`
-    );
-    restoreAngularRootConfigs(migrationWorkspacePath, targetVersions.angular, {
-      projectName,
-      designColors
-    });
+    console.log(`[${sessionId}] Re-injecting Angular templates to ensure correct config files...`);
+    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular);
     ensureAngularRuntimeFiles(migrationWorkspacePath);
-    ensureAngularAppConfigUsesWebAngular(migrationWorkspacePath);
+    injectAngularCoreSharedFiles(migrationWorkspacePath, targetVersions.angular);
     normalizeAngularComponentFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running Angular post-generation repairs...`);
     repairAngularWorkspace(migrationWorkspacePath, {
-      sourceFilesMap: essentialFilesMap,
+      sourceFilesMap: filesMap,
       sourcePackageJson
     });
     // Final lock: AI / postprocess must not drift away from resolved version
@@ -3477,12 +3719,6 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
     console.warn(`[${sessionId}] Final build verification failed after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Delivering anyway.`);
   }
 
-  // npm ci sanity check — the delivered project must install + build after only `npm ci`
-  const npmCiCheck = await verifyNpmCiBuild(migrationWorkspacePath, toTech, sessionId);
-  if (!npmCiCheck.ok) {
-    console.warn(`[${sessionId}] npm ci sanity check failed:\n${npmCiCheck.errors.slice(-1500)}`);
-  }
-
   // Remove node_modules to keep ZIP small (user will run npm ci locally)
   removeNodeModules(migrationWorkspacePath);
 
@@ -3498,187 +3734,6 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
 
   console.log(`[${sessionId}] Final ZIP written to ${outputZipPath}`);
 
-  return outputZipPath;
-}
-
-// ---------------------------------------------------------------------------
-// Rework: apply user changes / error fixes to an existing converted project
-// ---------------------------------------------------------------------------
-
-/**
- * Ask the AI to produce a change plan (JSON) for applying user-submitted
- * changes / error fixes to an existing converted project.
- * Returns an array of { relativePath, content, delete? } edits.
- */
-async function askAIForChangePlan(sessionId, workspacePath, reworkPrompt, aiProvider, aiModel, targetTech) {
-  const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
-  const filesContext = buildFilesContext(currentFiles);
-
-  const changePrompt = `You are updating an EXISTING migrated ${targetTech} project to implement the user's requested changes and/or fix the reported errors.
-
-The changes/errors reported by the user:
-${reworkPrompt}
-
-CURRENT PROJECT FILES:
-${filesContext}
-
-IMPORTANT RULES:
-- Output a JSON object with key "files" containing an array of objects:
-  [{"path": "src/path/file.ts", "content": "full file content"}]
-- path MUST be an exact workspace-relative path that already exists in the project (e.g. src/app/pages/... NOT src/pages).
-- If a file must be deleted, output {"path": "src/...", "delete": true}.
-- Only include files that need to be changed to satisfy the user's request or fix the errors.
-- Each file must be COMPLETE valid TypeScript/HTML/SCSS/JSX/TSX (not a diff, not truncated, no dangling commas).
-- Do NOT include package.json, angular.json, tsconfig.json, or any root config files.
-- Preserve the existing framework structure, imports, and conventions.
-- Make the MINIMUM changes needed. Do not rewrite unrelated files.
-- For Angular: application code lives under src/app/; use templateUrl/styleUrl, standalone components, Tailwind classes.
-- Output ONLY valid JSON, no markdown fences.`;
-
-  const systemInstruction = `You are an expert ${targetTech} developer. Apply the user's requested changes to an existing migrated project. Output ONLY a valid JSON object with a "files" array.`;
-
-  try {
-    const response = await callLLM(systemInstruction, changePrompt, true, aiProvider, aiModel);
-    let parsed;
-    try {
-      let cleaned = response.trim();
-      if (/^```/.test(cleaned)) {
-        cleaned = cleaned.replace(/^```[\w+-]*\s*\n?/, '');
-        cleaned = cleaned.replace(/\n?```\s*$/, '');
-      }
-      parsed = JSON.parse(cleaned);
-    } catch {
-      console.warn(`[${sessionId}] AI change-plan response was not valid JSON, skipping auto-apply.`);
-      return [];
-    }
-
-    const files = parsed.files || parsed;
-    if (!Array.isArray(files)) return [];
-
-    return files
-      .filter((f) => f && typeof f.path === 'string' && (typeof f.content === 'string' || f.delete === true))
-      .map((f) => ({
-        relativePath: String(f.path).replace(/^(?:migrated-(?:angular|react)-project\/)+/i, '').replace(/^\.?\//, ''),
-        content: typeof f.content === 'string' ? f.content : '',
-        delete: f.delete === true,
-      }));
-  } catch (err) {
-    console.error(`[${sessionId}] AI change-plan call failed:`, err.message);
-    return [];
-  }
-}
-
-/**
- * Apply user-submitted changes / error fixes to an EXISTING converted project
- * (workspace on disk) and produce a new ZIP.
- *
- * @param {string} workspacePath - Existing converted project directory
- * @param {string} reworkPrompt  - User's requested changes / reported errors
- * @param {string} sessionId     - Session id (kept stable across reworks)
- * @param {object} options       - { toTech, aiProvider, aiModel, onProgress }
- * @returns {Promise<string>}    - Path to the new final ZIP
- */
-export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, options = {}) {
-  const { toTech = 'Unknown', aiProvider = 'openrouter', aiModel, onProgress } = options;
-  const report = (phase, message, extra = {}) => {
-    if (typeof onProgress !== 'function') return;
-    try {
-      onProgress({ phase, message, ...extra });
-    } catch {
-      /* ignore progress listener errors */
-    }
-  };
-
-  if (!fs.existsSync(workspacePath)) {
-    throw new Error(`Existing project workspace not found: ${workspacePath}`);
-  }
-
-  report('rework', 'Reading existing project files...');
-  console.log(`[${sessionId}] Rework: reading existing project at ${workspacePath}...`);
-
-  const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
-  if (Object.keys(currentFiles).length === 0) {
-    throw new Error('No readable source files found in the existing project.');
-  }
-
-  // 1. Ask the AI for the change plan
-  report('rework', 'Asking AI to apply your changes / fix errors...');
-  const edits = await askAIForChangePlan(sessionId, workspacePath, reworkPrompt, aiProvider, aiModel, toTech);
-
-  if (edits.length === 0) {
-    throw new Error('The AI did not return any file changes. Please rephrase your changes/errors and try again.');
-  }
-
-  // 2. Apply edits (create/overwrite/delete) safely inside the workspace
-  let applied = 0;
-  for (const edit of edits) {
-    if (edit.delete) {
-      const safePath = resolveSafeWritePath(workspacePath, edit.relativePath);
-      if (!safePath) {
-        console.warn(`[${sessionId}] Skipping unsafe delete path: ${edit.relativePath}`);
-        continue;
-      }
-      if (fs.existsSync(safePath.full)) {
-        fs.unlinkSync(safePath.full);
-        console.log(`[${sessionId}] Deleted: ${safePath.relative}`);
-        applied++;
-      }
-      continue;
-    }
-
-    // Exact-path resolution only: never silently redirect an edit to a
-    // different existing file that merely shares the same basename.
-    const fixPath = resolveFixWritePath(workspacePath, edit.relativePath, '', false);
-    if (!fixPath) {
-      console.warn(`[${sessionId}] Skipping unsafe/unresolved edit path: ${edit.relativePath}`);
-      continue;
-    }
-    if (fixPath.relative.replace(/\\/g, '/') !== edit.relativePath.replace(/\\/g, '/').replace(/^\.?\//, '')) {
-      console.log(`[${sessionId}] Remapped edit path ${edit.relativePath} → ${fixPath.relative}`);
-    }
-    ensureDirectoryExists(path.dirname(fixPath.full));
-    fs.writeFileSync(fixPath.full, sanitizeGeneratedContent(fixPath.relative, edit.content), 'utf-8');
-    console.log(`[${sessionId}] Updated: ${fixPath.relative}`);
-    applied++;
-  }
-
-  if (applied === 0) {
-    throw new Error('No file changes could be applied. Please rephrase your changes/errors and try again.');
-  }
-
-  // 3. Post-process repairs after AI edits
-  report('rework', 'Running post-process repairs...');
-  if (String(toTech).toLowerCase().includes('angular')) {
-    repairAngularWorkspace(workspacePath, {});
-  } else if (String(toTech).toLowerCase().includes('react')) {
-    repairReactWorkspace(workspacePath, {});
-  }
-
-  // 4. Verify build + fix loop
-  report('rework', 'Verifying the updated project still builds...');
-  const buildCheck = await verifyAndFixBuild(sessionId, workspacePath, toTech, aiProvider, aiModel);
-  if (!buildCheck.verified) {
-    console.warn(`[${sessionId}] Rework: final build verification failed after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Delivering anyway.`);
-  }
-
-  // 5. npm ci sanity check
-  const npmCiCheck = await verifyNpmCiBuild(workspacePath, toTech, sessionId);
-  if (!npmCiCheck.ok) {
-    console.warn(`[${sessionId}] Rework: npm ci sanity check failed:\n${npmCiCheck.errors.slice(-1500)}`);
-  }
-
-  // 6. Remove node_modules to keep ZIP small
-  removeNodeModules(workspacePath);
-
-  // 7. Package the updated project into a new ZIP
-  report('package', 'Packaging updated project ZIP...');
-  console.log(`[${sessionId}] Rework: packaging updated project...`);
-  const outputZipPath = path.join(EXTRACT_DIR, `${sessionId}-rework-final.zip`);
-  const finalZip = new AdmZip();
-  finalZip.addLocalFolder(workspacePath);
-  finalZip.writeZip(outputZipPath);
-
-  console.log(`[${sessionId}] Rework final ZIP written to ${outputZipPath}`);
   return outputZipPath;
 }
 

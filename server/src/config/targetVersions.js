@@ -11,7 +11,8 @@ export const LATEST_ANGULAR = {
   major: 22,
   core: '22.0.8',
   tooling: '22.0.7',
-  typescript: '~5.9.2',
+  // Angular 22 (devkit/compiler-cli) peer-requires TypeScript >=6.0 <6.1
+  typescript: '~6.0.0',
   zone: '~0.16.0'
 };
 
@@ -192,7 +193,7 @@ function resolveAngularStack(parsed) {
     major: parsed.major,
     core: parsed.full || `${parsed.major}.0.0`,
     tooling: parsed.full || `${parsed.major}.0.0`,
-    typescript: parsed.major >= 22 ? '~5.9.2' : parsed.major >= 20 ? '~5.9.2' : '~5.7.2',
+    typescript: parsed.major >= 22 ? '~6.0.0' : parsed.major >= 20 ? '~5.9.2' : '~5.7.2',
     zone: parsed.major >= 22 ? '~0.16.0' : parsed.major >= 19 ? '~0.15.0' : '~0.14.10'
   };
   return {
@@ -276,7 +277,7 @@ export function formatVersionMandate(resolved) {
         (angular.source === 'user-prompt'
           ? ` (requested in user prompt: ${angular.requested})`
           : ' (latest stable — user did not specify a version)'),
-      `  package.json must use @angular/* ^${angular.core}, @angular/cli|^build ^${angular.tooling}, typescript ${angular.typescript}, zone.js ${angular.zone}`
+      `  package.json must use @angular/* ${angular.core} (exact, same patch line across all core packages), @angular/cli|@angular-devkit/build-angular ^${angular.tooling}, typescript ${angular.typescript}, zone.js ${angular.zone}`
     );
   }
   if (target === 'react' || target === 'unknown') {

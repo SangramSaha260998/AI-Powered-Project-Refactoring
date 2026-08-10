@@ -525,7 +525,33 @@ Final app must compile and run: npm install → ng serve`;
         this.isSuccess.set(false);
         this.lastSessionId = null;
         this.readySessionId.set(null);
-        this.statusMessage.set(`❌ ${status.error || status.message || 'Migration failed.'}`);
+        const errMsg = status.error || status.message || 'Migration failed.';
+
+        // The server KEEPS whatever was generated even when the migration
+        // errors out — it is only deleted via the "Clear Extracted Folder"
+        // button. Try to download whatever was generated; only if a project
+        // actually exists on disk, register it so the follow-up interface
+        // (changes/errors) can be used to fix it.
+        this.progressText.set('Migration had errors — downloading the generated project...');
+        this.settlingDownload = true;
+        try {
+          const downloaded = await this.downloadPartialProject(sessionId, errMsg);
+          if (downloaded && mode === 'create') {
+            const session: ProjectSession = {
+              sessionId,
+              projectName: this.selectedFile()?.name?.replace(/\.zip$/i, '') || 'Migrated Project',
+              fromTech: this.fromTech(),
+              toTech: this.toTech(),
+              aiProvider: this.aiProvider(),
+              aiModel: this.aiModel(),
+            };
+            this.activeProject.set(session);
+            this.writeStoredSession(session);
+            void this.refreshProjectMeta(sessionId);
+          }
+        } finally {
+          this.settlingDownload = false;
+        }
       } catch (err: any) {
         // Transient poll errors — keep waiting; do not abort the server job
         console.warn('Status poll failed (will retry):', err?.message || err);
@@ -629,6 +655,44 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   /**
+   * Download whatever the server kept on disk after a failed migration/rework.
+   * Returns true when a project ZIP was actually downloaded. The server never
+   * deletes generated projects on error — only the explicit "Clear Extracted
+   * Folder" button removes them.
+   */
+  private async downloadPartialProject(sessionId: string, errMsg: string): Promise<boolean> {
+    try {
+      const blob = await firstValueFrom(
+        this.http
+          .get(`${API_BASE}/download/${sessionId}`, { responseType: 'blob' })
+          .pipe(timeout({ first: 5 * 60 * 1000 }))
+      );
+      this.triggerBlobDownload(blob);
+      this.isSuccess.set(true);
+      this.progressText.set('Running AI migration pipeline...');
+      this.statusMessage.set(
+        `⚠️ ${errMsg} — the generated project was still downloaded. Fix the errors below and submit again.`
+      );
+      return true;
+    } catch (err: any) {
+      this.isSuccess.set(false);
+      let reason = 'no generated project is available to download';
+      if (err?.error instanceof Blob) {
+        try {
+          const text = await err.error.text();
+          reason = JSON.parse(text).error || reason;
+        } catch {
+          reason = err?.message || reason;
+        }
+      } else {
+        reason = err?.error?.error || err?.message || reason;
+      }
+      this.statusMessage.set(`❌ ${errMsg} — ${reason}`);
+      return false;
+    }
+  }
+
+  /**
    * Manual download if auto-download failed after a completed migration/rework.
    */
   downloadReadySession() {
@@ -642,6 +706,52 @@ Final app must compile and run: npm install → ng serve`;
     this.readySessionId.set(null);
     this.lastSessionId = null;
     this.statusMessage.set('');
+  }
+
+  /**
+   * Re-download the latest ZIP of the current (active) project at any time.
+   * Does NOT clear the rework textarea or any UI state — the extracted folder
+   * and created project stay on disk until the user clicks "Clear Extracted Folder".
+   */
+  downloadLatestZip() {
+    const project = this.activeProject();
+    if (!project?.sessionId || this.isLoading()) return;
+
+    this.isLoading.set(true);
+    this.isSuccess.set(false);
+    this.readySessionId.set(null);
+    this.progressText.set('Preparing your project ZIP...');
+    this.statusMessage.set('⏳ Preparing your project ZIP...');
+
+    firstValueFrom(
+      this.http
+        .get(`${API_BASE}/download/${project.sessionId}`, { responseType: 'blob' })
+        .pipe(timeout({ first: 5 * 60 * 1000 }))
+    )
+      .then((blob) => {
+        this.triggerBlobDownload(blob);
+        this.isLoading.set(false);
+        this.isSuccess.set(true);
+        this.progressText.set('Running AI migration pipeline...');
+        this.statusMessage.set('✅ Latest project ZIP downloaded.');
+        this.clearMessage();
+      })
+      .catch(async (err: any) => {
+        this.isLoading.set(false);
+        this.isSuccess.set(false);
+        let errorMessage = 'Download failed. Please try again.';
+        if (err?.error instanceof Blob) {
+          try {
+            const text = await err.error.text();
+            errorMessage = JSON.parse(text).error || errorMessage;
+          } catch {
+            errorMessage = err?.message || errorMessage;
+          }
+        } else {
+          errorMessage = err?.error?.error || err?.message || errorMessage;
+        }
+        this.statusMessage.set(`⚠️ ${errorMessage}`);
+      });
   }
 
   /**
@@ -842,7 +952,7 @@ Final app must compile and run: npm install → ng serve`;
     const project = this.activeProject();
     if (!project?.sessionId) return;
 
-    if (!confirm('Clear this project? The migrated project will be permanently deleted from the server.')) {
+    if (!confirm('Clear the extracted folder? The created project will be permanently deleted from the server.')) {
       return;
     }
 
@@ -870,7 +980,7 @@ Final app must compile and run: npm install → ng serve`;
     this.reworkPrompt.set('');
     this.activeProject.set(null);
     this.clearStoredSession();
-    this.statusMessage.set('🗑️ Project cleared. You can create a new project.');
+    this.statusMessage.set('🗑️ Extracted folder cleared. You can create a new project.');
     this.clearMessage();
   }
 }

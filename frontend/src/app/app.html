@@ -67,6 +67,15 @@
       <section class="upload-card">
         <div class="rework-actions">
           <button
+            type="button"
+            class="action-btn download-action-btn"
+            [disabled]="isLoading()"
+            (click)="downloadLatestZip()"
+            title="Download the created project ZIP again"
+          >
+            ⬇️ Download Project ZIP
+          </button>
+          <button
             class="action-btn"
             [disabled]="!reworkPrompt().trim() || isLoading()"
             (click)="submitChanges()">
@@ -80,7 +89,7 @@
             class="action-btn clear-btn"
             [disabled]="isLoading()"
             (click)="clearProject()">
-            Clear project 🗑️
+            Clear Extracted Folder 🗑️
           </button>
         </div>
 

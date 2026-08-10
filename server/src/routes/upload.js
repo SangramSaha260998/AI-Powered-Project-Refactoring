@@ -6,36 +6,51 @@ import { upload } from '../middleware/upload.js';
 import { validateProjectFramework } from '../services/validator.js';
 import { removeDirectoryRecursive, removeFile, ensureDirectoryExists } from '../utils/file.js';
 import { EXTRACT_DIR, UPLOAD_DIR, getProviderIds, PROVIDERS } from '../config/index.js';
-import { runMigrationPipeline, runReworkPipeline, cleanupSession } from '../services/migration.js';
+import { runMigrationPipeline, runReworkPipeline } from '../services/migration.js';
 
 // Ensure the extract and upload directories exist at startup
 ensureDirectoryExists(EXTRACT_DIR);
 ensureDirectoryExists(UPLOAD_DIR);
 
 /**
- * Clear all contents of the extracted/ folder.
+ * Clear leftover contents of the extracted/ folder.
  * Called before each new extraction to ensure a clean slate.
+ *
+ * IMPORTANT: a live created project is NEVER auto-deleted. Any folder/file
+ * belonging to a session that has a persisted {sessionId}-project.json meta
+ * file (extracted source, converted project, final ZIPs) is kept on disk.
+ * Those artifacts can only be removed via DELETE /api/project/:sessionId
+ * (the "Clear Extracted Folder" button in the UI).
  * Note: uploads/ is NOT cleared here because multer saves the file there
  * before this function runs. Individual upload files are cleaned up after processing.
  */
 function clearWorkFolders() {
   // Clear extracted folder only (uploads/ is cleaned up individually after processing)
-  if (fs.existsSync(EXTRACT_DIR)) {
-    try {
-      const items = fs.readdirSync(EXTRACT_DIR);
-      for (const item of items) {
-        const fullPath = path.join(EXTRACT_DIR, item);
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          fs.rmSync(fullPath, { recursive: true, force: true });
-        } else {
-          fs.unlinkSync(fullPath);
-        }
+  if (!fs.existsSync(EXTRACT_DIR)) return;
+  try {
+    // Sessions with a persisted project meta file are "live" created projects.
+    const liveSessions = new Set(
+      fs.readdirSync(EXTRACT_DIR)
+        .filter((name) => name.endsWith('-project.json'))
+        .map((name) => name.replace(/-project\.json$/, ''))
+    );
+    const items = fs.readdirSync(EXTRACT_DIR);
+    for (const item of items) {
+      const isLive =
+        liveSessions.has(item) ||
+        [...liveSessions].some((id) => item.startsWith(`${id}-`));
+      if (isLive) continue;
+      const fullPath = path.join(EXTRACT_DIR, item);
+      const stat = fs.statSync(fullPath);
+      if (stat.isDirectory()) {
+        fs.rmSync(fullPath, { recursive: true, force: true });
+      } else {
+        fs.unlinkSync(fullPath);
       }
-      console.log('[Cleanup] Cleared extracted/ folder');
-    } catch (err) {
-      console.warn('[Cleanup] Failed to clear extracted/:', err.message);
     }
+    console.log('[Cleanup] Cleared extracted/ folder (created projects kept)');
+  } catch (err) {
+    console.warn('[Cleanup] Failed to clear extracted/:', err.message);
   }
 }
 
@@ -100,7 +115,11 @@ function writeProjectMeta(sessionId, meta) {
  */
 const sessionDownloads = new Map();
 
-/** Sessions that failed (partial) — these cannot be downloaded. */
+/**
+ * Sessions whose last migration/rework attempt failed. The generated project
+ * stays on disk and can still be downloaded as long as the converted folder
+ * exists — only the explicit "Clear" action deletes it.
+ */
 const sessionFailed = new Set();
 
 /**
@@ -244,44 +263,65 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
 
 /**
  * GET /api/download/:sessionId
- * Download a completed migration ZIP by its session ID.
+ * Download the ZIP of a created project by its session ID. Works for
+ * completed AND failed sessions alike, as long as the generated project
+ * still exists on disk (it is only removed via the "Clear" action).
  */
 router.get('/download/:sessionId', (req, res) => {
   const { sessionId } = req.params;
 
-  if (sessionFailed.has(sessionId)) {
+  const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+
+  // A failed session is only non-downloadable when the migration never
+  // produced a converted project. If the generated project exists on disk it
+  // is served — the server NEVER deletes generated projects on error; only the
+  // explicit "Clear Extracted Folder" action removes them.
+  if (sessionFailed.has(sessionId) && !fs.existsSync(convertedPath)) {
     const failed = sessionStatus.get(sessionId);
     return res.status(410).json({
       error: failed?.error
-        || `Session "${sessionId}" failed during migration. No download available. Please re-upload and try again.`,
+        || `Session "${sessionId}" failed during migration and no project was generated. Please re-upload and try again.`,
     });
   }
 
-  const zipPath = sessionDownloads.get(sessionId) || sessionStatus.get(sessionId)?.zipPath;
-  if (!zipPath) {
-    const live = sessionStatus.get(sessionId);
-    if (live && (live.status === 'queued' || live.status === 'running')) {
-      return res.status(409).json({
-        error: 'Migration is still running. Please wait until it completes.',
-        status: live.status,
-        message: live.message,
-      });
+  const live = sessionStatus.get(sessionId);
+  if (live && (live.status === 'queued' || live.status === 'running')) {
+    return res.status(409).json({
+      error: 'Migration is still running. Please wait until it completes.',
+      status: live.status,
+      message: live.message,
+    });
+  }
+
+  let zipPath = sessionDownloads.get(sessionId) || live?.zipPath || null;
+
+  // The in-memory session data expires after SESSION_TTL_MS, but the created
+  // project stays on disk until the user clears it. If the cached ZIP path is
+  // missing (or its file is gone), re-package the converted project on demand
+  // so "Download Latest ZIP" keeps working as long as the project exists.
+  if (!zipPath || !fs.existsSync(zipPath)) {
+    if (fs.existsSync(convertedPath)) {
+      try {
+        const rebuilt = path.join(EXTRACT_DIR, `${sessionId}-final.zip`);
+        const finalZip = new AdmZip();
+        finalZip.addLocalFolder(convertedPath);
+        finalZip.writeZip(rebuilt);
+        zipPath = rebuilt;
+        sessionDownloads.set(sessionId, rebuilt);
+        console.log(`[${sessionId}] Regenerated ZIP on demand from converted project → ${rebuilt}`);
+      } catch (err) {
+        console.error(`[${sessionId}] Failed to regenerate ZIP on demand:`, err);
+      }
     }
+  }
+
+  if (!zipPath || !fs.existsSync(zipPath)) {
     return res.status(404).json({
       error: `Session "${sessionId}" not found or already downloaded/cleaned up. Please re-upload and try again.`,
     });
   }
 
-  if (!fs.existsSync(zipPath)) {
-    sessionDownloads.delete(sessionId);
-    return res.status(410).json({
-      error: `Session "${sessionId}" ZIP file no longer exists on disk. Please re-upload and try again.`,
-    });
-  }
-
   const zipFile = sessionStatus.get(sessionId)?.zipFile || null;
-  const extractPath = sessionStatus.get(sessionId)?.extractPath || path.join(EXTRACT_DIR, sessionId);
-  const convertedPath = sessionStatus.get(sessionId)?.convertedPath || path.join(EXTRACT_DIR, `${sessionId}-converted`);
 
   res.download(zipPath, 'migrated_project.zip', (err) => {
     if (err) {
@@ -293,12 +333,13 @@ router.get('/download/:sessionId', (req, res) => {
       return;
     }
     console.log(`[${sessionId}] Download complete.`);
-    // Keep the converted project + final ZIP on disk so the user can submit
-    // follow-up changes/errors (rework) and re-download. Only the uploaded
-    // source ZIP and the source extract dir are removed. The whole project is
-    // cleared via DELETE /api/project/:sessionId.
+    // The created project is NEVER auto-deleted: the extracted source folder,
+    // converted project and final ZIPs all stay on disk so the user can
+    // re-download the file and submit follow-up changes/errors at any time.
+    // Only the temporary uploaded source ZIP is removed here. Everything is
+    // cleared exclusively via DELETE /api/project/:sessionId — the
+    // "Clear Extracted Folder" button in the UI.
     if (zipFile) removeFile(zipFile);
-    if (extractPath && extractPath !== convertedPath) removeDirectoryRecursive(extractPath);
   });
 });
 
@@ -526,7 +567,29 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
         error: errMsg,
       });
       console.error(`[${id}] Migration pipeline failed:`, error);
-      cleanupSession(zipFile?.path, extractPath, outputZipPath, convertedPath);
+
+      // NEVER auto-delete the generated project on error. Whatever the AI
+      // produced so far stays on disk (extracted source + converted project +
+      // any ZIPs) so the user can download it, inspect it, or fix it through
+      // the changes/errors interface. Only the temporary uploaded source ZIP
+      // is removed here. Everything else is cleared exclusively via
+      // DELETE /api/project/:sessionId — the "Clear Extracted Folder" button.
+      if (zipFile?.path) removeFile(zipFile.path);
+
+      // Persist project meta so the (possibly partial) project is recognized
+      // as live: it survives the startup/upload cleanup, shows in
+      // /api/project/latest, and keeps supporting downloads + rework.
+      writeProjectMeta(id, {
+        sessionId: id,
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel,
+        projectName: deriveProjectName(convertedPath, toTech),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        migrationError: errMsg,
+      });
     }
   });
 });
@@ -722,11 +785,14 @@ router.delete('/project/:sessionId', (req, res) => {
   if (!isValidSessionId(sessionId)) {
     return res.status(400).json({ error: 'Invalid session id.' });
   }
+  const extractPath = path.join(EXTRACT_DIR, sessionId);
   const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
   const finalZip = path.join(EXTRACT_DIR, `${sessionId}-final.zip`);
   const reworkZip = path.join(EXTRACT_DIR, `${sessionId}-rework-final.zip`);
   const metaPath = getProjectMetaPath(sessionId);
 
+  // Full cleanup: extracted source folder + converted project + all ZIPs + meta
+  removeDirectoryRecursive(extractPath);
   removeDirectoryRecursive(convertedPath);
   removeFile(finalZip);
   removeFile(reworkZip);

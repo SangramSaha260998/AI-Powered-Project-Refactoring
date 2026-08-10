@@ -550,6 +550,27 @@
   color: var(--text-muted);
 }
 
+.download-action-btn {
+  background: var(--bg-muted);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.download-action-btn:hover:not(:disabled) {
+  background: var(--bg-muted-hover);
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .download-action-btn:hover:not(:disabled) {
+    background: var(--bg-muted-hover);
+    border-color: var(--border-focus);
+    color: var(--text-primary);
+  }
+}
+
 .rework-textarea {
   min-height: 150px;
 }

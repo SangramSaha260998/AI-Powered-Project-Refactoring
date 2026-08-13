@@ -1,0 +1,105 @@
+/* 
+ * *Grid system global classes
+ */
+.page-container {
+  @apply px-4;
+  @apply mx-auto;
+}
+.row {
+  @apply flex;
+  @apply flex-wrap;
+  @apply -mx-4;
+}
+.row-justify-start {
+  @apply justify-start;
+}
+.row-justify-center {
+  @apply justify-center;
+}
+.row-justify-end {
+  @apply justify-end;
+}
+.row-justify-around {
+  @apply justify-around;
+}
+.row-justify-between {
+  @apply justify-between;
+}
+.row-align-start {
+  @apply items-start;
+}
+.row-align-center {
+  @apply items-center;
+}
+.row-align-end {
+  @apply items-end;
+}
+.col-1,
+.col-2,
+.col-3,
+.col-4,
+.col-5,
+.col-6,
+.col-7,
+.col-8,
+.col-9,
+.col-10,
+.col-11,
+.col-12 {
+  @apply px-4;
+  @apply w-full;
+  @apply relative;
+}
+.col-1 {
+  @apply w-1/12;
+}
+.col-2 {
+  @apply w-1/6;
+}
+.col-3 {
+  @apply w-1/4;
+}
+.col-4 {
+  @apply w-1/3;
+}
+.col-5 {
+  @apply w-5/12;
+}
+.col-6 {
+  @apply w-1/2;
+}
+.col-7 {
+  @apply w-7/12;
+}
+.col-8 {
+  @apply w-8/12;
+}
+.col-9 {
+  @apply w-9/12;
+}
+.col-10 {
+  @apply w-10/12;
+}
+.col-11 {
+  @apply w-11/12;
+}
+.col-12 {
+  @apply w-full;
+}
+
+/* Responsive */
+@media (min-width: 768px) {
+  .page-container {
+    @apply w-[750px];
+  }
+}
+@media (min-width: 992px) {
+  .page-container {
+    @apply w-[970px];
+  }
+}
+@media (min-width: 1200px) {
+  .page-container {
+    @apply w-[1170px];
+  }
+}

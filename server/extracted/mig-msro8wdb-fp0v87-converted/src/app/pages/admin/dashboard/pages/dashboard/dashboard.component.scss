@@ -1,0 +1,74 @@
+@use 'mixins' as *;
+
+.dashboard-wrapper {
+  @apply p-8;
+  @include flex-all(flex, stretch, flex-start);
+  @apply flex-col gap-y-8;
+}
+
+.dashboard-welcome {
+  @apply w-full rounded-[16px] p-8;
+  @apply bg-gradient-to-r from-primary to-primary-100;
+  @include flex-all(flex, center, flex-start);
+  @apply gap-x-6;
+  @include transition;
+
+  .welcome-logo {
+    @apply shrink-0;
+    img {
+      @apply h-16 w-auto drop-shadow-md;
+    }
+  }
+
+  .welcome-text {
+    h1 {
+      @apply font-primary font-semibold text-[28px] leading-9 text-white mb-2;
+    }
+    p {
+      @apply font-primary font-normal text-base leading-6 text-white opacity-90;
+    }
+  }
+}
+
+.dashboard-cards {
+  @apply w-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6;
+
+  .dash-card {
+    @apply bg-white rounded-[12px] p-6;
+    @apply border border-[#EEF5F9];
+    @include flex-all(flex, flex-start);
+    @apply gap-x-4;
+    box-shadow: 0 4px 16px 0 rgba(7, 136, 192, 0.08);
+    @include transition;
+
+    &:hover {
+      @apply -translate-y-1 border-primary;
+      box-shadow: 0 8px 24px 0 rgba(7, 136, 192, 0.16);
+    }
+
+    .card-icon {
+      @apply size-12 shrink-0 rounded-[10px] bg-[#EEF5F9] text-primary;
+      @apply text-[26px];
+      @include flex-all(flex, center, center);
+    }
+
+    .card-body {
+      @apply min-w-0;
+      h2 {
+        @apply font-primary font-semibold text-lg leading-6 text-secondary mb-1 truncate;
+      }
+      p {
+        @apply font-primary font-normal text-sm leading-5 text-secondary opacity-70 truncate;
+      }
+    }
+  }
+}
+
+@media only screen and (max-width: 767px) {
+  .dashboard-wrapper {
+    @apply p-4;
+  }
+  .dashboard-welcome {
+    @apply flex-col items-start gap-y-4;
+  }
+}

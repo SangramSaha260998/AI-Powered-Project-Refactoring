@@ -651,7 +651,7 @@ function enforceAngularPackageVersions(destPath, stack) {
   }
 
   // Ensure template runtime deps that may have been dropped by postprocess
-  for (const name of ['moment', 'crypto-js', 'bowser']) {
+  for (const name of ['moment', 'crypto-js', 'bowser', 'lru-cache']) {
     if (!pkg.dependencies[name] && kit.dependencies[name]) {
       pkg.dependencies[name] = kit.dependencies[name];
     }

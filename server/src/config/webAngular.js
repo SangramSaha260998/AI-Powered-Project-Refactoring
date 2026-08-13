@@ -58,7 +58,10 @@ export function webAngularNpmDeps(angularCoreVersion = '22.0.8') {
       '@ngx-loading-bar/core': loadingBar,
       bowser: '^2.11.0',
       moment: '^2.30.1',
-      'crypto-js': '^4.2.0'
+      'crypto-js': '^4.2.0',
+      // lmdb (used by @angular-devkit/build-angular) requires lru-cache
+      // as a peer dep; pinning v10 avoids 'LRUCache is not a constructor'
+      'lru-cache': '^10.0.3'
     }
   };
 }

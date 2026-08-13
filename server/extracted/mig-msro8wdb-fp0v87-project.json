@@ -1,0 +1,11 @@
+{
+  "sessionId": "mig-msro8wdb-fp0v87",
+  "fromTech": "React",
+  "toTech": "Angular",
+  "aiProvider": "openrouter",
+  "aiModel": "liquid/lfm-2.5-2.6b:free",
+  "projectName": "tanstack_start_ts",
+  "createdAt": 1786636077687,
+  "updatedAt": 1786636077687,
+  "migrationError": "Incremental migration stopped at unit 1/1 (src/app/app.component): build still failing after 3 fix attempts. fix this unit before continuing.\n\nLast build errors:\n\u001b[1m\u001b[31mAn unhandled exception occurred: Unexpected end of input\nSee \"C:\\Users\\palbu\\AppData\\Local\\Temp\\ng-gUafFc\\angular-errors.log\" for further details.\u001b[39m\u001b[22m\n"
+}

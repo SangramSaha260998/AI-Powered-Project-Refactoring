@@ -1,0 +1,37 @@
+<section class="dashboard-wrapper">
+  <div class="dashboard-welcome">
+    <figure class="welcome-logo">
+      <img src="./images/demo-admin-logo.svg" alt="Demo Admin" />
+    </figure>
+    <div class="welcome-text">
+      <h1>Welcome{{ loginDetails?.name ? ', ' + loginDetails?.name : '' }} 👋</h1>
+      <p>
+        This is your Home Level Dashboard. Use the sidebar to navigate through the application.
+      </p>
+    </div>
+  </div>
+
+  <div class="dashboard-cards">
+    <div class="dash-card">
+      <span class="card-icon material-icons">verified_user</span>
+      <div class="card-body">
+        <h2>{{ loginDetails?.rolename || 'Role' }}</h2>
+        <p>Logged in as {{ loginDetails?.name || 'User' }}</p>
+      </div>
+    </div>
+    <div class="dash-card">
+      <span class="card-icon material-icons">account_circle</span>
+      <div class="card-body">
+        <h2>{{ loginDetails?.username || 'Username' }}</h2>
+        <p>Your account username</p>
+      </div>
+    </div>
+    <div class="dash-card">
+      <span class="card-icon material-icons">mail_outline</span>
+      <div class="card-body">
+        <h2>{{ loginDetails?.email || 'Email' }}</h2>
+        <p>Your registered email address</p>
+      </div>
+    </div>
+  </div>
+</section>

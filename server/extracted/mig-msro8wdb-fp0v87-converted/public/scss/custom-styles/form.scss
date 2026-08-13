@@ -1,0 +1,273 @@
+@use 'utilities';
+@use 'mixins' as *;
+@use 'variables' as *;
+
+/*
+ * *Global Form style
+ * @designer: Sure Das
+ */
+.form-group {
+  @apply w-full relative pb-4 mb-2;
+  label {
+    @apply text-md leading-tight font-normal text-secondary font-primary;
+    @apply inline-block mb-2.5 capitalize;
+    sup {
+      @apply text-red text-lg leading-none;
+      @apply top-px mb-0.5;
+    }
+  }
+}
+
+.formcontrol {
+  @apply relative bg-white border border-solid border-gray-500;
+  @apply h-[50px] w-full rounded-[10px] py-3 pl-[18px] pr-[18px];
+  @apply text-md leading-[1.1] font-normal font-primary text-secondary;
+  @include transition;
+  &::-webkit-input-placeholder {
+    @include input-placeholder;
+  }
+  &::-moz-placeholder {
+    @include input-placeholder;
+  }
+  &::-ms-input-placeholder {
+    @include input-placeholder;
+  }
+  &::-ms-input-placeholder {
+    @include input-placeholder;
+  }
+  &::placeholder {
+    @include input-placeholder;
+  }
+  &::-webkit-autofill {
+    @include input-placeholder;
+    @include autofill;
+  }
+  &::-webkit-autofill:focus {
+    @include input-placeholder;
+    @include autofill;
+  }
+  &:disabled,
+  &.disabled {
+    @apply bg-[#ddd] opacity-50 pointer-events-none cursor-not-allowed #{!important};
+  }
+  &:read-only {
+    @apply bg-[#F8F8F8] text-[#797979] border-[#F8F8F8] pointer-events-none cursor-not-allowed;
+  }
+}
+.textarea-wrapper {
+  @apply h-[160px];
+}
+.formcontrol-textarea {
+  @apply relative bg-white border border-solid border-gray-500;
+  @apply size-full rounded-[10px] pt-4 pb-3 pl-[18px] pr-[18px] resize-none;
+  @apply text-md leading-[1.1] font-normal font-primary text-secondary;
+  @include transition;
+  &::-webkit-input-placeholder {
+    @include input-placeholder;
+  }
+  &::-moz-placeholder {
+    @include input-placeholder;
+  }
+  &::-ms-input-placeholder {
+    @include input-placeholder;
+  }
+  &::-ms-input-placeholder {
+    @include input-placeholder;
+  }
+  &::placeholder {
+    @include input-placeholder;
+  }
+  &::-webkit-autofill {
+    @include input-placeholder;
+    @include autofill;
+  }
+  &::-webkit-autofill:focus {
+    @include input-placeholder;
+    @include autofill;
+  }
+  &:disabled,
+  &.disabled {
+    @apply bg-[#ddd] opacity-50 cursor-not-allowed;
+  }
+  &:read-only {
+    @apply bg-[#F8F8F8] text-[#797979] border-[#F8F8F8] cursor-not-allowed;
+  }
+}
+.formcontrol:focus,
+.formcontrol-textarea:focus {
+  @apply border-gray;
+  @include property('outline', none !important);
+}
+// a {
+//   svg {
+//     @apply w-[29px];
+//     @apply h-5;
+//     @apply fill-primary;
+//     @apply absolute;
+//     @apply right-6;
+//     @apply top-1/2;
+//     @apply -translate-y-1/2;
+//     @apply cursor-pointer;
+//   }
+// }
+.password-validation-message {
+  @apply mt-4 py-2.5 pl-6 pr-2.5 bg-white absolute z-10 max-w-[320px] w-full;
+  @include property('box-shadow', 0px 10px 10px 0px #cfcfd959 !important);
+  @include rounded(10);
+  &::after {
+    @apply empty-content absolute -top-3.5 left-0 right-0 w-8 h-10 bg-white mx-auto;
+    clip-path: polygon(50% 9%, 26% 37%, 71% 37%);
+  }
+  .error-item {
+    @include flex-all(flex, center);
+    @apply gap-x-1.5;
+    span {
+      svg {
+        @apply size-2.5;
+      }
+      &.icon-tick {
+        svg {
+          @apply fill-green-100;
+        }
+      }
+      &.icon-cross {
+        svg {
+          @apply fill-red-100;
+        }
+      }
+    }
+    p {
+      @apply font-normal text-xs leading-[19px] text-primary;
+      @include flex-all(flex, center);
+      &.text-valid {
+        @apply text-green-100;
+      }
+    }
+  }
+}
+/* 
+ * *error style
+ */
+.invalid-control {
+  .formcontrol,
+  .formcontrol-textarea,
+  .custom-upload-area {
+    @apply border-red;
+    &:focus {
+      @apply border-red;
+    }
+  }
+}
+.error-message {
+  @apply absolute w-full h-auto right-0 -bottom-1 text-right;
+  p {
+    @apply text-md leading-none text-red font-light font-primary mb-0;
+  }
+}
+
+/* Toggle Switch */
+.switch {
+  @apply relative inline-block w-[51px] h-[31px];
+  @apply mb-0 #{!important};
+  input {
+    @apply opacity-0 size-0;
+  }
+}
+.slider {
+  @apply absolute cursor-pointer inset-0;
+  @apply bg-red;
+  @include transition;
+  &::before {
+    @apply empty-content absolute size-[27px] left-0.5 bottom-0.5 bg-white;
+    @include transition;
+  }
+  &.round {
+    @apply rounded-[34px];
+    &:before {
+      @apply rounded-full;
+    }
+  }
+}
+input:checked + .slider {
+  @apply bg-[#0786be];
+}
+input:checked + .slider:before {
+  -webkit-transform: translateX(20px);
+  -ms-transform: translateX(20px);
+  transform: translateX(20px);
+}
+
+/* Custom Upload File Styles */
+.custom-upload-area {
+  @apply border border-dashed border-gray-500 rounded-lg py-6 px-6 mt-[18px] mb-12 flex-col cursor-pointer bg-white relative;
+  @include flex-all(flex, center, center);
+  @include transition;
+  input {
+    @apply absolute inset-0 cursor-pointer opacity-0;
+  }
+  .upload-block {
+    @include flex-all(flex, center, center);
+    @apply flex-col;
+  }
+  svg {
+    @apply size-[29px] fill-primary mb-4;
+  }
+  h6 {
+    @apply font-primary text-secondary text-md leading-[1.1] font-medium mb-3.5;
+    span {
+      @apply font-normal;
+    }
+  }
+  p {
+    @apply font-primary text-gray text-xs leading-none font-normal;
+  }
+  .btn {
+    @apply px-4 h-9 mb-3.5;
+    @apply text-xl font-secondary font-normal rounded-[10px];
+  }
+  &.disabled {
+    @apply cursor-default pointer-events-none;
+    @include property('background-color', rgba(209, 223, 231, 0.5));
+    input {
+      @apply cursor-default;
+    }
+    .upload-block {
+      @apply opacity-40;
+    }
+  }
+}
+
+/* Custom Upload File Small Styles */
+.custom-upload-area-small {
+  @apply border border-dashed border-gray-500 rounded-lg py-6 px-7 mt-[18px] mb-[2.6rem] flex-row-reverse gap-x-5 cursor-pointer bg-[#F8FCFF] relative;
+  @include flex-all(flex, center, flex-end);
+  @include transition;
+  input {
+    @apply absolute inset-0 cursor-pointer opacity-0;
+  }
+  .upload-block {
+    @include flex-all(flex, flex-start, center);
+    @apply flex-col;
+  }
+
+  h6 {
+    @apply font-primary text-secondary text-md leading-[1.1] font-medium mb-2;
+    span {
+      @apply font-normal;
+    }
+  }
+  p {
+    @apply font-primary text-gray text-xs leading-4 font-normal;
+  }
+  .btn {
+    @apply px-4 h-9;
+    @apply text-xl font-secondary font-normal rounded-[10px];
+  }
+  &.disable,
+  &.disabled {
+    @apply pointer-events-none;
+    input {
+      @apply pointer-events-none cursor-default;
+    }
+  }
+}

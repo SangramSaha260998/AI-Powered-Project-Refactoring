@@ -293,53 +293,63 @@ router.get('/download/:sessionId', (req, res) => {
     });
   }
 
-  let zipPath = sessionDownloads.get(sessionId) || live?.zipPath || null;
-
-  // The in-memory session data expires after SESSION_TTL_MS, but the created
-  // project stays on disk until the user clears it. If the cached ZIP path is
-  // missing (or its file is gone), re-package the converted project on demand
-  // so "Download Latest ZIP" keeps working as long as the project exists.
-  if (!zipPath || !fs.existsSync(zipPath)) {
-    if (fs.existsSync(convertedPath)) {
-      try {
-        const rebuilt = path.join(EXTRACT_DIR, `${sessionId}-final.zip`);
-        const finalZip = new AdmZip();
-        finalZip.addLocalFolder(convertedPath);
-        finalZip.writeZip(rebuilt);
-        zipPath = rebuilt;
-        sessionDownloads.set(sessionId, rebuilt);
-        console.log(`[${sessionId}] Regenerated ZIP on demand from converted project → ${rebuilt}`);
-      } catch (err) {
-        console.error(`[${sessionId}] Failed to regenerate ZIP on demand:`, err);
-      }
-    }
-  }
-
-  if (!zipPath || !fs.existsSync(zipPath)) {
+  if (!fs.existsSync(convertedPath)) {
     return res.status(404).json({
       error: `Session "${sessionId}" not found or already downloaded/cleaned up. Please re-upload and try again.`,
     });
   }
 
-  const zipFile = sessionStatus.get(sessionId)?.zipFile || null;
+  // Always create a fresh ZIP on demand, excluding node_modules.
+  // The temp ZIP is auto-deleted after the download finishes to save disk space.
+  const tempZipPath = path.join(EXTRACT_DIR, `${sessionId}-download.zip`);
 
-  res.download(zipPath, 'migrated_project.zip', (err) => {
+  try {
+    console.log(`[${sessionId}] Creating download ZIP (excluding node_modules)...`);
+    const zip = new AdmZip();
+
+    // Recursively add files, skipping node_modules directories
+    function addFolderToZip(dirPath, zipInstance, basePath) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name === 'node_modules') continue;
+        const fullPath = path.join(dirPath, entry.name);
+        const relPath = basePath ? `${basePath}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          addFolderToZip(fullPath, zipInstance, relPath);
+        } else {
+          zipInstance.addLocalFile(fullPath, path.dirname(relPath));
+        }
+      }
+    }
+
+    addFolderToZip(convertedPath, zip, '');
+    zip.writeZip(tempZipPath);
+    console.log(`[${sessionId}] Fresh ZIP created → ${tempZipPath}`);
+  } catch (err) {
+    console.error(`[${sessionId}] Failed to create download ZIP:`, err);
+    return res.status(500).json({ error: 'Failed to create project ZIP. Please try again.' });
+  }
+
+  res.download(tempZipPath, 'migrated_project.zip', (err) => {
+    // Always clean up the temp ZIP after download finishes (or fails)
+    try {
+      if (fs.existsSync(tempZipPath)) {
+        fs.unlinkSync(tempZipPath);
+        console.log(`[${sessionId}] Temp download ZIP deleted → ${tempZipPath}`);
+      }
+    } catch (cleanupErr) {
+      console.warn(`[${sessionId}] Failed to delete temp ZIP:`, cleanupErr.message);
+    }
+
     if (err) {
       if (err.code === 'ECONNABORTED' || err.message?.includes('aborted')) {
-        console.warn(`[${sessionId}] Download aborted (client disconnected). Keeping artifacts.`);
+        console.warn(`[${sessionId}] Download aborted (client disconnected).`);
       } else {
         console.error(`[${sessionId}] Download error:`, err);
       }
-      return;
+    } else {
+      console.log(`[${sessionId}] Download complete.`);
     }
-    console.log(`[${sessionId}] Download complete.`);
-    // The created project is NEVER auto-deleted: the extracted source folder,
-    // converted project and final ZIPs all stay on disk so the user can
-    // re-download the file and submit follow-up changes/errors at any time.
-    // Only the temporary uploaded source ZIP is removed here. Everything is
-    // cleared exclusively via DELETE /api/project/:sessionId — the
-    // "Clear Extracted Folder" button in the UI.
-    if (zipFile) removeFile(zipFile);
   });
 });
 
@@ -498,6 +508,19 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
     convertedPath,
   });
   scheduleSessionExpiry(id);
+
+  // Persist project meta EARLY so the project survives clearWorkFolders()
+  // even if the migration fails or the server restarts before completion.
+  writeProjectMeta(id, {
+    sessionId: id,
+    fromTech,
+    toTech,
+    aiProvider,
+    aiModel,
+    projectName: deriveProjectName(convertedPath, toTech),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
 
   // Return immediately — do not hold the HTTP request open for the whole pipeline
   res.status(202).json({

@@ -1,0 +1,99 @@
+<div class="auth-formbox">
+  <div class="auth-left-block">
+    <img src="/images/demo-admin-illustration.svg" alt="Demo Admin dashboard illustration" />
+  </div>
+  <div class="auth-form-block">
+    <form [formGroup]="loginForm" (ngSubmit)="onSubmitLoginForm()">
+      <div class="auth-logo-block">
+        <figure>
+          <img src="./images/demo-admin-logo.svg" width="327" height="96" alt="Demo Admin" />
+        </figure>
+      </div>
+      <h1>
+        Welcome to
+        <span class="qa-text">Demo</span>
+        <span class="qa-guard">Admin</span>
+      </h1>
+      <p class="login-content">Login to your account</p>
+      <div class="auth-form-group">
+        <label for="username">Username</label>
+        <div
+          class="auth-formcontrol-wrapper"
+          [ngClass]="{ 'auth-invalid-control': hasFormControlError('username') }">
+          <input
+            id="username"
+            type="username"
+            class="auth-formcontrol"
+            placeholder="Enter your username"
+            autocomplete="off"
+            formControlName="username"
+            noSpace />
+        </div>
+        @if (hasFormControlError('username')) {
+          @if (formControl['username'].hasError('required')) {
+            <div [@fadeAnimation] class="auth-error-message">
+              <p>Please enter your username</p>
+            </div>
+          }
+        }
+      </div>
+      <div class="auth-form-group !mb-3">
+        <label for="password-field">Password</label>
+        <div
+          class="auth-formcontrol-wrapper"
+          [ngClass]="{ 'auth-invalid-control': hasFormControlError('password') }">
+          <input
+            id="password-field"
+            [type]="showType ? 'text' : 'password'"
+            class="auth-formcontrol !pr-20"
+            placeholder="Password"
+            autocomplete="off"
+            formControlName="password" />
+          <a [attr.role]="'none'" class="icon-block" (click)="showPassword($event)">
+            @if (showType) {
+              <svg class="icon-eye">
+                <use xlink:href="./scss/icons.svg#icon-eye-open"></use>
+              </svg>
+            } @else {
+              <svg class="icon-eye-close">
+                <use xlink:href="./scss/icons.svg#icon-eye-close"></use>
+              </svg>
+            }
+          </a>
+        </div>
+        @if (hasFormControlError('password')) {
+          @if (formControl['password'].hasError('required')) {
+            <div [@fadeAnimation] class="auth-error-message">
+              <p>Please enter your password</p>
+            </div>
+          }
+          @if (formControl['password'].hasError('minlength')) {
+            <div [@fadeAnimation] class="auth-error-message">
+              <p>Password minimum 8 characters</p>
+            </div>
+          }
+        }
+      </div>
+      <div class="auth-checkbox">
+        <label for="remember-me" class="customCheckbox">
+          Remember me
+          <input id="remember-me" type="checkbox" checked="checked" formControlName="rememberMe" />
+          <span class="checkmark"></span>
+        </label>
+        <a class="back-to-link" routerLink="/forgot-password">Forgot Password?</a>
+      </div>
+      <button type="submit" class="auth-btn">Login</button>
+      <!-- <p class="register-content">
+        No Account ?
+        <a>Register</a>
+      </p> -->
+      <div class="termsprivacy-block">
+        <a>Term & Service</a>
+        <a>Privacy Policy</a>
+      </div>
+    </form>
+    <!-- <p class="copyright-para">
+      &copy; {{ currentYear() }} Demo Admin. All Rights Reserved.
+    </p> -->
+  </div>
+</div>

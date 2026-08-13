@@ -1,0 +1,50 @@
+<section class="dialog-wrapper">
+  <header class="dialog-close-block">
+    <a [attr.role]="'none'" (click)="closeDialog()">
+      <svg class="icon-sidebar-cross">
+        <use xlink:href="./scss/icons.svg#icon-cross-bold"></use>
+      </svg>
+      <!-- <div class="dialog-content"> -->
+      <!-- <p [innerHTML]="title"></p> -->
+      <!-- </div> -->
+    </a>
+  </header>
+  <main>
+    <!-- <div class="warning-icon">
+      <img [src]="photoIcon" alt="" />
+    </div> -->
+    <div class="dialog-content">
+      <p class="title" [innerHTML]="heading"></p>
+      <p [innerHTML]="message"></p>
+    </div>
+  </main>
+  <footer class="dialog-actions">
+    @if (showCancelButton) {
+      <button
+        type="button"
+        [ngClass]="{
+          'btn-red': dialogType === 'warning' && sameButtonColor,
+          'btn-primary': dialogType === 'normal' && sameButtonColor,
+        }"
+        class="btn btn-close-outline"
+        (click)="onCancelDialogFn()">
+        {{ cancelButtonText }}
+      </button>
+    }
+    @if (showConfirmButton) {
+      <button
+        [ngClass]="{
+          'btn-red': dialogType === 'warning',
+          'btn-primary': dialogType === 'normal',
+        }"
+        type="button"
+        class="btn"
+        (click)="onConfirmDialogFn()">
+        {{ confirmButtonText }}
+      </button>
+    }
+    @if (cancelButtonShow) {
+      <button type="button" class="btn cancel-btn" (click)="closeDialog()">Cancel</button>
+    }
+  </footer>
+</section>

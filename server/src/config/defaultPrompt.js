@@ -2,24 +2,103 @@
  * Default / master prompts appended after the user's migration prompt.
  *
  * Priority order the AI must obey:
- *   1. USER PROMPT (titles, colors, scope, branding, copy) — highest
- *   2. Direction-specific rules below (anti-hallucination + structure)
- *   3. Source code — only as material to convert; never invent missing APIs
+ *   1. EXTRACTED BRANDING from uploaded project source files (name, colors, fonts, title)
+ *   2. USER PROMPT (titles, colors, scope, branding, copy) — highest
+ *   3. Direction-specific rules below (anti-hallucination + structure)
+ *   4. Source code — only as material to convert; never invent missing APIs
  */
 
 /** Shared preamble for every migration direction. */
 export const NO_HALLUCINATION_PREAMBLE = `
+## EXTRACT BRANDING FROM UPLOADED PROJECT — HIGHEST PRIORITY
+
+**MANDATORY**: Before writing ANY code, READ the uploaded source files and EXTRACT:
+
+### Project Name — EXTRACT FROM THESE FILES:
+1. **package.json** → \`name\` field (e.g., \"my-cool-app\")
+2. **index.html** → \`<title>\` tag (e.g., \"My Cool App\")
+3. **Root component meta tags**:
+   - React: \`__root.tsx\` → title in \`head()\` config
+   - Angular: \`app.component.ts\` → meta tags
+4. **HTML meta tags**: og:title, twitter:title, description
+5. **README.md** → first heading
+
+Use the EXTRACTED name (humanized with spaces) for:
+- \`<title>\` in index.html
+- \`appTitle\` in app-settings.config.ts
+- \`public title\` in app.component.ts
+- Package name in package.json (lowercase, hyphenated)
+
+**DO NOT** use hardcoded defaults like \"Angular Project\" or \"Tanstack Start TS\"
+
+### Design Colors — EXTRACT FROM THESE FILES:
+1. **tailwind.config.js/ts** → theme.colors (primary, secondary, accent, etc.)
+2. **CSS/SCSS variables** → look for:
+   - --primary, --color-primary, --bg-primary
+   - --secondary, --color-secondary
+   - --accent, --color-accent
+   - oklch(), hsl(), rgb(), hex values
+3. **React CSS variables** → styles.css :root section
+4. **SCSS variables** → $primary, $secondary, $color-*
+5. **Inline styles** in components
+
+Use the EXTRACTED colors for:
+- \`tailwind.config.js\` → theme.colors.primary, secondary, tertiary
+- \`app.component.html\` → loading bar [color]
+- Any other color references
+
+**DO NOT** use hardcoded defaults like \"#0788C0\" — use the EXTRACTED colors
+
+Example extraction from React styles.css:\n  --primary: oklch(0.6 0.22 22);  /* This is a red color */\n  --secondary: oklch(0.96 0.02 20);  /* This is a light color */\n  Convert to hex: #E63946 (primary red), #F5F0EB (secondary light)
+
+### Fonts — EXTRACT FROM THESE FILES:
+1. **index.html** → Google Fonts \`<link>\` tag
+2. **CSS/SCSS** → font-family declarations
+3. **tailwind.config.js** → theme.fontFamily
+4. **Inline styles** in components
+
+Use the EXTRACTED fonts in the new project's:
+- index.html Google Fonts link
+- tailwind.config.js fontFamily settings
+
+Example extraction:\n  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />\n  → Use Inter as the primary font
+
+### Design Tokens & Variables — EXTRACT FROM THESE FILES:
+1. **CSS/SCSS files** → CSS custom properties (--radius, --spacing, etc.)
+2. **tailwind.config.js** → theme.extend section
+3. **Theme configuration files** if any
+4. **SCSS partials** → _variables.scss, _mixins.scss
+
+Apply these to the new project where applicable.
+
+---
+
+## AFTER EXTRACTION: Apply to new project
+
+1. Update \`package.json\` → name field
+2. Update \`index.html\` → title, fonts
+3. Update \`tailwind.config.js\` → colors, fonts
+4. Update \`app.component.ts\` → title
+5. Update \`app.component.html\` → loading bar color
+6. Update \`app-settings.config.ts\` → appTitle
+
+**NEVER skip extraction** — always read source files first.
+
+---
+
 ## USER PROMPT FIRST — NO HALLUCINATION (applied automatically)
 
 1. Follow the USER's migration prompt exactly. Their titles, colors, themes,
    branding, copy, and scope overrides are highest priority.
-2. Do NOT invent npm packages, exports, modules, components, props, hooks,
+2. EXTRACTED BRANDING from uploaded source files takes precedence over defaults
+   but can be overridden by explicit user prompt instructions.
+3. Do NOT invent npm packages, exports, modules, components, props, hooks,
    decorators, or APIs that do not exist in the real target framework / npm.
-3. Do NOT invent files, routes, or features the user did not ask for and that
+4. Do NOT invent files, routes, or features the user did not ask for and that
    are not present in (or required to convert) the source project.
-4. If something in the source has no clean equivalent, rewrite it with plain
+5. If something in the source has no clean equivalent, rewrite it with plain
    target-framework primitives — never fake a package or module name.
-5. Output must compile and run after npm install → ng serve / npm start.
+6. Output must compile and run after npm install → ng serve / npm start.
    No dangling imports, placeholders like "// TODO implement", or truncated files.
 
 ## TARGET VERSIONS (applied automatically — all conversions)
@@ -107,6 +186,13 @@ src/
  */
 export const ANGULAR_TO_ANGULAR_PROMPT = `
 ## ANGULAR → ANGULAR STRIP-DOWN (applied automatically)
+
+### BRANDING EXTRACTION (MANDATORY)
+Before stripping down, READ the uploaded Angular project and extract:
+- Project name from package.json, index.html <title>, meta tags
+- Colors from tailwind.config.js, CSS variables, SCSS variables
+- Fonts from Google Fonts links, font-family declarations
+Apply these to the new project — do NOT use defaults.
 
 STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
 
@@ -245,6 +331,27 @@ export const ANGULAR_TO_REACT_PROMPT = `
  */
 export const REACT_TO_ANGULAR_PROMPT = `
 ## REACT → ANGULAR ANTI-HALLUCINATION RULES (applied automatically)
+
+### BRANDING EXTRACTION (MANDATORY — read uploaded source files)
+
+Before generating code, READ the uploaded React project files and extract:
+
+1. **Project Name**: From package.json name, index.html <title>, or meta tags
+   → Apply to: index.html <title>, app-settings.config.ts appTitle,
+   app.component.ts title, package.json name
+
+2. **Colors**: From tailwind.config.js theme.colors or CSS variables
+   → Apply to: tailwind.config.js (primary, secondary, tertiary colors),
+   app.component.html loading bar [color]
+
+3. **Fonts**: From index.html Google Fonts link or CSS font-family
+   → Apply to: index.html Google Fonts link, tailwind.config.js fontFamily
+
+4. **Title/Branding text**: From meta tags, og:title, component titles
+   → Apply to: All page titles and branding locations
+
+Do NOT use default blue (#0788C0) or any hardcoded colors — use the EXTRACTED colors.
+Do NOT use default project names — use the EXTRACTED name.
 
 ### Truthfulness
 - NEVER invent npm packages (e.g. @radix-ng/*) or exports that are not real.
@@ -407,6 +514,7 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
 \`\`\`
 
 ### Rules:
+- **FIRST STEP**: Extract branding (name, colors, fonts) from uploaded project source files
 - Prefer stubs/minimal wiring so each completed UNIT can compile before later units exist
   (e.g. routes may temporarily omit pages not yet migrated; expand routes when those units land)
 - "dependencies" lists plan \`newPath\` values (or unit ids) that must exist before this file

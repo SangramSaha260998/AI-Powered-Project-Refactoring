@@ -6,8 +6,15 @@ import { Directive, ElementRef, Input, Renderer2, OnChanges, SimpleChanges } fro
 export class LoadingOverlayDirective implements OnChanges {
   @Input('loadingOverlay') isLoading = false;
   @Input() overlayText = 'Searching...';
+  @Input() progressPercent: number = -1; // -1 = indeterminate, 0-100 = determinate
+  @Input() currentStep: string = '';
+  @Input() totalSteps: number = 0;
+  @Input() currentStepIndex: number = 0;
   private overlayElement: HTMLElement | null = null;
   private textNode: Text | null = null;
+  private progressBar: HTMLElement | null = null;
+  private progressFill: HTMLElement | null = null;
+  private stepIndicator: HTMLElement | null = null;
 
   constructor(
     private el: ElementRef,
@@ -25,6 +32,10 @@ export class LoadingOverlayDirective implements OnChanges {
 
     if (changes['overlayText'] && this.overlayElement && this.textNode) {
       this.textNode.textContent = this.overlayText || '';
+    }
+
+    if ((changes['progressPercent'] || changes['currentStep'] || changes['currentStepIndex']) && this.overlayElement) {
+      this.updateProgress();
     }
   }
 
@@ -76,9 +87,44 @@ export class LoadingOverlayDirective implements OnChanges {
     this.renderer.setStyle(textDiv, 'lineHeight', '1.4');
     this.renderer.appendChild(textDiv, this.textNode);
 
+    // Progress bar container
+    this.progressBar = this.renderer.createElement('div');
+    this.renderer.addClass(this.progressBar, 'progress-bar-container');
+    this.renderer.setStyle(this.progressBar, 'width', '100%');
+    this.renderer.setStyle(this.progressBar, 'maxWidth', '300px');
+    this.renderer.setStyle(this.progressBar, 'height', '6px');
+    this.renderer.setStyle(this.progressBar, 'background', 'rgba(255,255,255,0.2)');
+    this.renderer.setStyle(this.progressBar, 'borderRadius', '3px');
+    this.renderer.setStyle(this.progressBar, 'overflow', 'hidden');
+    this.renderer.setStyle(this.progressBar, 'marginTop', '16px');
+    this.renderer.setStyle(this.progressBar, 'margin', '16px auto 0');
+
+    // Progress fill bar
+    this.progressFill = this.renderer.createElement('div');
+    this.renderer.addClass(this.progressFill, 'progress-fill');
+    this.renderer.setStyle(this.progressFill, 'height', '100%');
+    this.renderer.setStyle(this.progressFill, 'background', 'var(--spinner-color)');
+    this.renderer.setStyle(this.progressFill, 'borderRadius', '3px');
+    this.renderer.setStyle(this.progressFill, 'transition', 'width 0.3s ease-in-out');
+    this.renderer.setStyle(this.progressFill, 'width', '0%');
+    this.renderer.appendChild(this.progressBar, this.progressFill);
+
+    // Step indicator
+    this.stepIndicator = this.renderer.createElement('div');
+    this.renderer.addClass(this.stepIndicator, 'step-indicator');
+    this.renderer.setStyle(this.stepIndicator, 'marginTop', '12px');
+    this.renderer.setStyle(this.stepIndicator, 'fontSize', '13px');
+    this.renderer.setStyle(this.stepIndicator, 'opacity', '0.8');
+    this.renderer.setStyle(this.stepIndicator, 'letterSpacing', '0.5px');
+    if (this.currentStep && this.stepIndicator) {
+      this.stepIndicator.textContent = this.currentStep;
+    }
+
     // Append spinner parts
     this.renderer.appendChild(spinnerContainer, ldsRoller);
     this.renderer.appendChild(spinnerContainer, textDiv);
+    this.renderer.appendChild(spinnerContainer, this.progressBar);
+    this.renderer.appendChild(spinnerContainer, this.stepIndicator);
     this.renderer.appendChild(this.overlayElement, spinnerContainer);
     this.renderer.appendChild(host, this.overlayElement);
 
@@ -96,9 +142,38 @@ export class LoadingOverlayDirective implements OnChanges {
     }
   }
 
+  private updateProgress() {
+    if (!this.progressFill || !this.stepIndicator) return;
+
+    // Update progress bar
+    if (this.progressPercent >= 0 && this.progressPercent <= 100) {
+      this.renderer.setStyle(this.progressFill, 'width', `${this.progressPercent}%`);
+    } else {
+      // Indeterminate - show animated stripe
+      this.renderer.setStyle(this.progressFill, 'width', '100%');
+      this.renderer.setStyle(this.progressFill, 'background', 'linear-gradient(90deg, var(--spinner-color) 0%, transparent 50%, var(--spinner-color) 100%)');
+      this.renderer.setStyle(this.progressFill, 'backgroundSize', '200% 100%');
+      this.renderer.setStyle(this.progressFill, 'animation', 'progress-stripe 1.5s linear infinite');
+    }
+
+    // Update step indicator
+    if (this.stepIndicator) {
+      if (this.totalSteps > 0 && this.currentStepIndex > 0) {
+        this.stepIndicator.textContent = `Step ${this.currentStepIndex} of ${this.totalSteps}: ${this.currentStep}`;
+      } else if (this.currentStep) {
+        this.stepIndicator.textContent = this.currentStep;
+      }
+    }
+  }
+
   private injectStyles() {
     const style = this.renderer.createElement('style');
     style.textContent = `
+@keyframes progress-stripe {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 .spinner {
   display: flex;
   flex-direction: column;

@@ -1,0 +1,1503 @@
+@use 'utilities';
+@use '_mixins' as *;
+@use '_variables' as *;
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.no-spacing {
+  @apply m-0;
+  @apply p-0;
+}
+.font-basic {
+  @apply text-base leading-[1.1] font-primary font-normal text-secondary;
+}
+* {
+  @extend .no-spacing;
+  @apply font-primary;
+}
+html {
+  @apply overflow-x-hidden;
+  &::-webkit-scrollbar {
+    @apply w-[15px];
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl bg-gray-300;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply rounded-xl bg-secondary;
+  }
+}
+
+body {
+  @extend .font-basic;
+  @apply antialiased;
+  @apply overflow-x-hidden;
+  @apply box-border;
+  @apply tracking-normal #{!important};
+  &::-webkit-scrollbar {
+    @apply w-[15px];
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl bg-gray-300;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply rounded-xl bg-secondary;
+  }
+}
+body.not-scrollable {
+  @apply overflow-hidden #{!important};
+}
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  @extend .font-basic;
+  @extend .no-spacing;
+  @apply tracking-normal #{!important};
+  @include property('word-break', break-word);
+}
+p {
+  @extend .font-basic;
+  @extend .no-spacing;
+  @include property('word-break', break-word);
+}
+ol,
+ul {
+  @apply list-none;
+  @extend .no-spacing;
+}
+a,
+a:hover {
+  @apply no-underline font-primary;
+}
+button {
+  @apply outline-none font-primary;
+  @include property('background-color', none);
+}
+input {
+  @apply filter-none #{!important};
+  @apply font-primary;
+}
+mat-typography .mat-typography p,
+.mat-typography h1,
+.mat-typography h2,
+.mat-typography h3,
+.mat-typography h4,
+.mat-typography h5,
+.mat-typography h6 {
+  @extend .no-spacing;
+  @apply font-primary leading-[1.1] font-normal;
+}
+input:focus {
+  @apply outline-none #{!important};
+  @apply shadow-none #{!important};
+}
+
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  @apply appearance-none;
+}
+
+/* Typography Styles */
+.mat-h4,
+.mat-body-1,
+.mat-typography .mat-h4,
+.mat-typography .mat-body-1,
+.mat-typography h4 {
+  @apply m-0 #{!important};
+}
+
+/*
+ * *Custom Button Layout Style
+ */
+.admin-layout-container.sidebar-collapse .sidebar-expanded {
+  @include width-height('width', 80);
+}
+
+.admin-layout-container.sidebar-collapse .main-header {
+  @include spacing('margin-left', 81);
+}
+
+.admin-layout-container.sidebar-collapse .admin-content-wrapper {
+  @apply w-[calc(100%-76px)];
+  @include spacing('margin-left', 80);
+}
+
+.admin-layout-container.sidebar-collapse {
+  .sidebar-nav {
+    @apply px-2.5;
+  }
+}
+
+.admin-layout-container.sidebar-collapse .sidebar-menu {
+  @apply px-1.5;
+}
+
+.admin-layout-container.sidebar-collapse .main-sidebar .sidebar-header {
+  @apply px-1;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list {
+  @include property('max-width', 70px);
+  &.active {
+    &:before {
+      @apply -left-[18px];
+    }
+  }
+}
+.admin-layout-container.sidebar-collapse .nav-list img.icon-menu {
+  @apply mx-0;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list svg.toggle-icon {
+  @apply hidden;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list-item p {
+  @apply w-0 #{!important};
+  @apply hidden #{!important};
+  // @apply invisible;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list .nav-list-item {
+  @apply pr-2.5 pl-2;
+  @apply justify-center;
+  span {
+    @apply w-4;
+  }
+}
+.admin-layout-container.sidebar-collapse .nav-list.active .nav-list-item {
+  @apply mb-0 #{!important};
+}
+.admin-layout-container.sidebar-collapse .submenu-treeview {
+  @apply hidden;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list:hover svg {
+  @apply fill-primary;
+}
+
+.admin-layout-container.sidebar-collapse .nav-list:hover .overlay-block {
+  @apply block;
+}
+
+.admin-layout-container.sidebar-collapse .main-sidebar .sidebar-header {
+  @apply justify-center;
+}
+
+.admin-layout-container.sidebar-collapse .sidebar-brand {
+  @apply hidden;
+}
+
+.admin-layout-container.sidebar-collapse .sidebar-footer {
+  @apply hidden;
+}
+
+.admin-layout-container.sidebar-collapse .btn-floating-filter {
+  @apply left-[45px];
+}
+.admin-layout-container.sidebar-collapse .question-floating-filter {
+  @apply left-[21px];
+}
+.admin-layout-container.sidebar-collapse .breadcrumbs-area {
+  @apply left-28;
+}
+
+/* Custom Select Styles */
+.custom-select {
+  @apply w-full;
+  .mat-mdc-form-field-subscript-wrapper {
+    @apply hidden;
+  }
+  .mat-mdc-select-placeholder {
+    @apply font-primary text-md leading-none font-normal text-gray #{!important};
+  }
+  .mat-mdc-select-min-line {
+    @apply font-primary text-md leading-5 font-normal text-secondary text-ellipsis;
+    @include truncate(1);
+    @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+  }
+  .mat-mdc-select-value-text {
+    @include truncate(1);
+    @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+  }
+  .mat-mdc-form-field-infix {
+    @apply py-0 #{!important};
+    @apply min-h-[50px] w-full #{!important};
+  }
+  .mdc-notched-outline {
+    @include property('border-radius', 10px);
+  }
+
+  .mdc-text-field--focused {
+    .mdc-notched-outline__leading,
+    .mdc-notched-outline__notch,
+    .mdc-notched-outline__trailing {
+      @apply border-gray #{!important};
+      @apply shadow-none;
+    }
+  }
+  .mdc-notched-outline__leading {
+    @include property('border-top-left-radius', 10px);
+    @include property('border-bottom-left-radius', 10px);
+  }
+
+  .mdc-notched-outline__trailing {
+    @include property('border-top-right-radius', 10px);
+    @include property('border-bottom-right-radius', 10px);
+  }
+
+  .mat-mdc-text-field-wrapper {
+    @apply h-[50px] bg-white rounded-[10px];
+    @apply pl-4 pr-[30px] #{!important};
+  }
+
+  .mdc-notched-outline__leading,
+  .mdc-notched-outline__notch,
+  .mdc-notched-outline__trailing {
+    @apply border border-gray-500 #{!important};
+  }
+
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__leading,
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__notch,
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__trailing {
+    @apply border-gray-500 #{!important};
+  }
+  .mat-mdc-select-trigger {
+    @apply h-[50px];
+  }
+  .mat-mdc-select-arrow {
+    &:before {
+      @include background-image('down-arrow-image.svg', no-repeat, $size: 12px);
+      @apply empty-content size-3 top-1/2 -translate-y-[24%] -right-3.5 absolute;
+      @include transition;
+    }
+    svg {
+      @apply hidden;
+    }
+  }
+  &.disabled,
+  &.mat-form-field-disabled {
+    @apply pointer-events-none cursor-default;
+    .mat-mdc-text-field-wrapper {
+      @apply bg-[#ddd] opacity-50;
+    }
+    .mat-mdc-select-arrow {
+      &:before {
+        @include background-image('down-arrow-disable.svg', no-repeat, $size: 12px);
+      }
+    }
+  }
+
+  &.invalid-control {
+    .mdc-notched-outline__leading,
+    .mdc-notched-outline__notch,
+    .mdc-notched-outline__trailing {
+      @apply border border-red #{!important};
+    }
+    &:hover {
+      .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__leading,
+      .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__notch,
+      .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__trailing {
+        @apply border-red #{!important};
+      }
+    }
+  }
+}
+
+.custom-select-panel {
+  @apply border border-gray border-t-gray-300 -mt-2;
+  @apply pt-1 rounded-bl-[10px] rounded-br-[10px] bg-white #{!important};
+  @include property('box-shadow', 0 2px 3px 0px rgba(0, 0, 0, 0.2) !important);
+  &::-webkit-scrollbar {
+    @apply w-2.5;
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply bg-secondary rounded-xl;
+  }
+  .mat-mdc-option {
+    @include property('min-height', 32px, !important);
+    @apply pr-3 pl-3.5 py-2.5;
+
+    &.mat-mdc-option.mat-mdc-option-active {
+      @apply bg-transparent border border-transparent;
+    }
+    &.mat-mdc-option.mdc-list-item--selected {
+      @apply bg-[#F6FCFF] #{!important};
+      @apply border border-transparent;
+      span {
+        @apply font-medium #{!important};
+      }
+    }
+    span {
+      @apply text-md leading-none font-normal font-primary #{!important};
+      @apply text-secondary;
+      @include property('word-break', break-word);
+    }
+    &:hover {
+      @apply bg-[#F6FCFF] #{!important};
+    }
+  }
+  .mat-pseudo-checkbox {
+    @apply hidden #{!important};
+  }
+  .mat-mdc-option-ripple {
+    @apply hidden;
+  }
+}
+
+//Custom datepicker design//
+.custom-datepicker {
+  @apply w-full relative h-[50px] border border-gray-500;
+  @include rounded(10);
+  &.datepicker-opened {
+    @apply border-gray;
+  }
+  &.mat-focused {
+    @apply border-gray;
+  }
+  &.invalid-control {
+    @apply border border-solid border-error;
+    .formcontrol {
+      @apply border-0 #{!important};
+    }
+  }
+  .mat-mdc-text-field-wrapper {
+    @apply pl-4;
+    @apply pr-11 #{!important};
+  }
+  .mat-mdc-form-field-subscript-wrapper {
+    @apply hidden;
+  }
+  input {
+    @apply bg-transparent #{!important};
+    @apply text-md leading-[1.1] font-normal font-primary text-secondary #{!important};
+
+    &:focus {
+      @apply border-transparent shadow-none outline-none #{!important};
+    }
+  }
+
+  &.disabled {
+    @apply pointer-events-none cursor-default;
+    .mat-mdc-text-field-wrapper,
+    .mdc-text-field--filled:not(.mdc-text-field--disabled) {
+      @apply bg-[#ddd] opacity-50;
+    }
+    .mat-datepicker-toggle {
+      @apply pointer-events-none;
+      button {
+        @apply pointer-events-none cursor-default;
+      }
+    }
+  }
+
+  input::placeholder {
+    @apply font-primary text-md leading-[1.1] font-normal text-gray not-italic opacity-100 #{!important};
+  }
+  input::-webkit-input-placeholder {
+    @apply font-primary text-md leading-[1.1] font-normal text-gray not-italic opacity-100 #{!important};
+  }
+  input::-moz-placeholder {
+    @apply font-primary text-md leading-[1.1] font-normal text-gray not-italic opacity-100 #{!important};
+  }
+  .mdc-text-field--filled:not(.mdc-text-field--disabled) {
+    @apply bg-transparent border-gray-100;
+  }
+  .mdc-text-field--filled.mdc-text-field--disabled {
+    @apply rounded-[10px] bg-[#ddd] opacity-50;
+    input {
+      @apply text-[#8e8e8e] #{!important};
+      &::placeholder,
+      &::-webkit-input-placeholder,
+      &::-moz-placeholder {
+        @apply text-[#8e8e8e] #{!important};
+      }
+    }
+  }
+  .mat-mdc-form-field-focus-overlay {
+    @apply bg-transparent;
+  }
+  .mdc-line-ripple {
+    @apply hidden #{!important};
+  }
+  .mat-mdc-form-field-flex {
+    @apply h-[50px];
+  }
+  .mdc-text-field--no-label .mat-mdc-form-field-infix {
+    @apply pt-5 #{!important};
+  }
+  .mdc-text-field--no-label:not(.mdc-text-field--textarea)
+    .mat-mdc-form-field-input-control.mdc-text-field__input,
+  .mat-mdc-text-field-wrapper .mat-mdc-form-field-input-control {
+    @apply h-[50px] relative -top-5;
+  }
+
+  .mat-datepicker-toggle {
+    @apply absolute top-1/2 -translate-y-1/2 right-3;
+    @apply size-7 pb-2.5;
+    button {
+      @apply p-0 size-8 -right-10;
+      --mat-mdc-button-persistent-ripple-color: transparent;
+      @include background-image('calender-month.svg', no-repeat, $position: 6px 3px, $size: 20px);
+
+      &:focus {
+        @apply outline-none;
+        --mat-mdc-button-persistent-ripple-color: transparent;
+      }
+      svg {
+        @apply text-[#b0adad] size-5 opacity-0;
+      }
+      .mat-mdc-button-touch-target {
+        @apply size-5;
+      }
+    }
+    .mat-mdc-icon-button:active .mat-mdc-button-persistent-ripple::before {
+      @apply opacity-0;
+    }
+    .mat-mdc-icon-button .mat-mdc-button-persistent-ripple::before {
+      @apply bg-transparent;
+    }
+    .mat-mdc-icon-button .mat-mdc-button-ripple,
+    .mat-mdc-icon-button .mat-mdc-button-persistent-ripple,
+    .mat-mdc-icon-button .mat-mdc-button-persistent-ripple::before {
+      @apply hidden;
+    }
+  }
+  .formcontrol:disabled + .mat-datepicker-toggle {
+    @apply pointer-events-none cursor-default;
+    button {
+      @apply bg-none;
+    }
+  }
+  .mat-mdc-icon-button[disabled],
+  .mat-mdc-icon-button.mat-mdc-button-disabled {
+    @apply opacity-50 #{!important};
+  }
+  &.datepicker-open {
+    @apply border-gray;
+  }
+  &.mat-form-field-disabled {
+    @apply border-[#eee];
+  }
+}
+.mat-datepicker-content {
+  @apply bg-transparent #{!important};
+}
+.custom-filter-calendar {
+  @apply bg-white -ml-px mt-1.5 border border-gray;
+  @include property('box-shadow', 0 2px 3px 0px rgba(0, 0, 0, 0.1) !important);
+  @include rounded(7);
+  @apply h-[338px] #{!important};
+  .mat-calendar-header {
+    @apply p-2 pb-3.5;
+    .mat-calendar-controls {
+      @apply m-0;
+      button.mat-calendar-period-button {
+        .mdc-button__label {
+          span {
+            @apply text-secondary text-base leading-none font-medium font-primary;
+          }
+          svg {
+            @apply hidden;
+          }
+        }
+      }
+      button.mat-calendar-previous-button,
+      button.mat-calendar-next-button {
+        @apply text-white;
+        @apply size-[26px] p-0.5;
+        @include flex-all(flex, center, center);
+        @include transition;
+        &:after {
+          @apply m-2;
+        }
+      }
+      button.mat-calendar-previous-button {
+        @apply bg-primary;
+        &:hover {
+          @apply bg-primary-100;
+        }
+      }
+
+      button.mat-calendar-next-button {
+        @apply bg-secondary ml-1;
+        &:hover {
+          @apply bg-secondary-100;
+        }
+      }
+
+      .mat-mdc-icon-button[disabled],
+      .mat-mdc-icon-button.mat-mdc-button-disabled {
+        @apply opacity-20;
+      }
+
+      .mat-mdc-button .mat-mdc-button-ripple {
+        @apply hidden;
+      }
+    }
+  }
+  .mat-calendar-table {
+    thead tr {
+      th {
+        @apply text-secondary text-sm leading-none font-normal font-primary;
+      }
+    }
+
+    tbody tr {
+      &:first-of-type td {
+        @apply text-primary text-label leading-none font-semibold font-primary;
+      }
+
+      td {
+        .mat-calendar-body-cell {
+          @apply text-sm leading-none font-normal font-primary;
+        }
+
+        span.mat-calendar-body-today {
+          @apply bg-primary border-primary text-white #{!important};
+          @apply shadow-none;
+        }
+
+        span.mat-calendar-body-selected {
+          @apply bg-secondary border-secondary;
+        }
+
+        button.mat-calendar-body-active {
+          span.mat-calendar-body-selected {
+            @apply bg-secondary border-secondary;
+          }
+        }
+        &:hover {
+          .mat-calendar-body-cell-content {
+            @apply bg-secondary border-secondary text-white #{!important};
+          }
+        }
+      }
+    }
+  }
+  .mat-mdc-button:not(:disabled) {
+    @apply m-0 mt-1.5 bg-[#EBF3FA] h-8 pt-0.5;
+  }
+  .mat-calendar-body-label {
+    @apply py-0 #{!important};
+  }
+}
+
+/* Custom autocompleted box Styles */
+.custom-autocomplete-box {
+  @apply w-full relative;
+  .mat-mdc-text-field-wrapper {
+    @apply bg-white #{!important};
+    @apply relative h-[50px] w-full py-2 pl-[18px] pr-10;
+    @apply text-md leading-[1.1] font-normal font-primary text-gray;
+  }
+  .mdc-text-field--focused {
+    .mdc-notched-outline__leading,
+    .mdc-notched-outline__notch,
+    .mdc-notched-outline__trailing {
+      @apply border-gray #{!important};
+    }
+  }
+
+  .mdc-notched-outline__leading,
+  .mdc-notched-outline__notch,
+  .mdc-notched-outline__trailing {
+    @apply border border-gray-500 #{!important};
+    @apply outline-none shadow-none #{!important};
+    @apply rounded-tr-xl rounded-br-xl #{!important};
+  }
+  .mdc-notched-outline__leading {
+    @apply rounded-none rounded-tl-[10px] rounded-bl-[10px] #{!important};
+  }
+
+  .autocomplete-input.mat-mdc-form-field-input-control {
+    @apply text-md font-normal font-primary;
+    @apply text-secondary #{!important};
+    @apply h-[34px] #{!important};
+    @include truncate(1);
+    @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    &:disabled {
+      &::placeholder {
+        @include input-placeholder;
+      }
+    }
+    &::-webkit-input-placeholder {
+      @apply text-md font-normal font-primary text-gray #{!important};
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    &:-moz-placeholder {
+      @apply text-md font-normal font-primary text-gray #{!important};
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    &::-moz-placeholder {
+      @apply text-md font-normal font-primary text-gray #{!important};
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    &:-ms-input-placeholder {
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    &::-ms-input-placeholder {
+      @apply text-md font-normal font-primary text-gray #{!important};
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    &::placeholder {
+      @apply text-md font-normal font-primary text-gray #{!important};
+      @include truncate(1);
+      @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+    }
+    .mdc-text-field--disabled {
+      @apply bg-[#F3F4F6];
+
+      .mdc-notched-outline {
+        @apply shadow-none;
+      }
+      .dropdown-arrow {
+        @apply hidden;
+      }
+    }
+  }
+  .mat-mdc-form-field-infix {
+    @apply w-full min-h-full;
+    @apply pt-0 pb-1 #{!important};
+  }
+  .mat-mdc-form-field-icon-suffix {
+    @apply hidden;
+  }
+  .mdc-text-field--no-label:not(.mdc-text-field--outlined):not(.mdc-text-field--textarea)
+    .mat-mdc-form-field-infix {
+    @apply py-1.5 pb-2;
+  }
+  .mat-mdc-form-field-subscript-wrapper {
+    @apply hidden;
+  }
+  .mat-mdc-form-field-focus-overlay {
+    @apply bg-transparent;
+  }
+  .mdc-text-field--filled:not(.mdc-text-field--disabled) .mdc-line-ripple::before {
+    @apply border-b-0 #{!important};
+  }
+  .mdc-text-field--filled .mdc-line-ripple::after {
+    @apply border-b-0 #{!important};
+  }
+  .icon-search {
+    @apply cursor-pointer absolute top-[7px] -right-5;
+    svg {
+      @apply size-[18px] fill-primary;
+    }
+  }
+  .autocomplete-cross {
+    @apply cursor-pointer absolute top-2.5 -right-5;
+    svg {
+      @apply size-3 fill-primary;
+    }
+  }
+  &.disabled,
+  &.mat-form-field-disabled {
+    .mat-mdc-text-field-wrapper {
+      @apply bg-[#ddd] opacity-50;
+    }
+    @apply pointer-events-none cursor-default;
+  }
+}
+
+.custom-autocomplete-box.invalid-control {
+  .mdc-notched-outline__leading,
+  .mdc-notched-outline__notch,
+  .mdc-notched-outline__trailing {
+    @apply border-red #{!important};
+  }
+
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__leading,
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__notch,
+  .mdc-text-field--outlined:hover .mdc-notched-outline .mdc-notched-outline__trailing {
+    @apply border-red #{!important};
+  }
+}
+
+.custom-autocomplete-panel {
+  @apply bg-white border-t-gray-300 border border-solid border-gray #{!important};
+  @apply pt-1 pb-2 #{!important};
+  @apply max-h-[295px] min-h-[45px] #{!important};
+  @apply -mt-2;
+  @apply rounded-bl-[10px] #{!important};
+  @apply rounded-br-[10px] #{!important};
+  @include property('box-shadow', 0 2px 3px 0px rgba(0, 0, 0, 0.2) !important);
+  &::-webkit-scrollbar {
+    @apply w-2.5;
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl bg-gray-300;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply rounded-xl bg-secondary;
+  }
+  .mat-mdc-option.mdc-list-item--selected:not(.mat-mdc-option-multiple):not(
+      .mdc-list-item--disabled
+    ) {
+    @include property('background', transparent);
+  }
+
+  .mat-mdc-option {
+    @apply py-2.5 pl-4 pr-3;
+    @include property('min-height', auto, !important);
+    &.mat-mdc-option-active {
+      @apply mr-0 rounded-none;
+      @apply bg-transparent #{!important};
+      span {
+        @apply font-medium #{!important};
+      }
+    }
+    &.mdc-list-item--selected {
+      @apply bg-[#F6FCFF] #{!important};
+      span {
+        @apply font-medium #{!important};
+      }
+    }
+    span {
+      @apply text-md leading-none font-normal font-primary  #{!important};
+      @apply text-secondary;
+    }
+    &:hover {
+      @apply bg-[#F6FCFF] #{!important};
+    }
+    &.mdc-list-item--disabled {
+      span {
+        @apply text-gray opacity-100 #{!important};
+      }
+    }
+  }
+  .mat-pseudo-checkbox {
+    @apply hidden #{!important};
+  }
+  .mat-mdc-option-ripple {
+    @apply hidden;
+  }
+}
+
+//autocomplete with chips design//
+
+.custom-chips-autocomplete {
+  @apply w-full;
+  @include rounded(10);
+  .mat-mdc-text-field-wrapper {
+    @apply h-[50px] py-0 pl-[11px] border border-gray-500 overflow-visible;
+    @apply bg-white z-auto #{!important};
+    @include rounded(10);
+  }
+  &.invalid-control {
+    .mat-mdc-text-field-wrapper {
+      @apply border-red;
+    }
+  }
+  .mdc-line-ripple::before {
+    @apply hidden #{!important};
+  }
+  .mat-mdc-form-field-bottom-align {
+    @apply hidden #{!important};
+  }
+  .mat-mdc-form-field-infix {
+    @apply h-[50px] flex items-center;
+    @apply py-0 #{!important};
+  }
+  .mdc-line-ripple--active {
+    @apply hidden #{!important};
+  }
+  input {
+    @apply h-[50px] #{!important};
+    &::-webkit-input-placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+    &:-moz-placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+    &::-moz-placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+    &:-ms-input-placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+    &::-ms-input-placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+    &::placeholder {
+      @apply text-md font-normal font-primary text-gray capitalize #{!important};
+    }
+  }
+  .icon-chips-autocomplete {
+    @apply top-[15px];
+  }
+}
+
+.chips-autocomplete-panel {
+  @apply -mt-1.5;
+}
+.custom-autocomplete-chips {
+  @apply relative z-auto;
+  .mat-mdc-standard-chip:not(.mdc-evolution-chip--disabled) {
+    @apply py-1.5 px-2.5 gap-x-2.5;
+    @apply bg-lightblue-200 m-0 #{!important};
+    @include rounded(5);
+  }
+  .mat-mdc-standard-chip.mdc-evolution-chip--with-trailing-action
+    .mdc-evolution-chip__action--primary {
+    @apply p-0 #{!important};
+  }
+  .mat-mdc-standard-chip {
+    @apply h-auto #{!important};
+  }
+  .mat-mdc-standard-chip:not(.mdc-evolution-chip--disabled) .mdc-evolution-chip__text-label {
+    @apply text-xs leading-4 font-normal text-primary font-primary max-w-[87px];
+    @include truncate(1);
+    @apply whitespace-nowrap min-w-0 text-ellipsis shrink-[1] block;
+  }
+  .mat-mdc-standard-chip:not(.mdc-evolution-chip--disabled)
+    .mdc-evolution-chip__action--primary::before {
+    @apply border-disabled rounded-[5px] #{!important};
+  }
+  .mat-mdc-chip-remove::after {
+    @apply hidden;
+  }
+  .remove-button {
+    svg {
+      @apply size-2 fill-primary;
+    }
+  }
+  .mat-mdc-standard-chip.mdc-evolution-chip--with-trailing-action
+    .mdc-evolution-chip__action--trailing {
+    @apply size-2 px-0 #{!important};
+  }
+  .mat-mdc-chip-remove:hover::after {
+    @apply hidden #{!important};
+  }
+  .mdc-evolution-chip-set__chips {
+    @apply ml-0 #{!important};
+    @apply gap-x-[5px];
+  }
+  .mat-mdc-chip-input {
+    flex: 1 0 114px;
+  }
+  .extra-chips {
+    @apply p-2.5 py-2 bg-primary cursor-pointer;
+    @include rounded(5);
+    p {
+      @apply text-xs leading-none font-normal text-white;
+    }
+  }
+  .mat-mdc-chip:hover .mat-mdc-chip-focus-overlay {
+    @apply opacity-0;
+  }
+}
+
+/*
+ * *Custom Mat Sidebar Style
+ */
+.custom-sidebar {
+  @apply w-[92%];
+  @apply rounded-none #{!important};
+  @include property('max-width', 990px);
+  @apply bg-transparent #{!important};
+  @apply shadow-none #{!important};
+}
+.custom-sidebar-large {
+  @apply max-w-full;
+  @apply w-[calc(100%-355px)] #{!important};
+}
+.custom-sidebar-medium {
+  @apply max-w-full;
+  @apply w-[calc(100%-562px)] #{!important};
+}
+.mat-drawer-inner-container {
+  @apply bg-white;
+  @apply overflow-hidden #{!important};
+}
+/*
+ * *Material Sidebar Append To Body Style
+ */
+.mat-drawer-container[fullscreen] {
+  @apply top-auto #{!important};
+  @apply bottom-auto #{!important};
+  @apply bg-transparent #{!important};
+  @include property('z-index', 998);
+}
+.custom-sidebar,
+.mat-drawer-backdrop {
+  @apply fixed #{!important};
+}
+/*
+ * *Custom Mat Small Sidebar Style
+ */
+.custom-sidebar-small {
+  @apply w-[58rem] #{!important};
+  @apply right-0 bg-white;
+  @apply z-[5] shadow-none fixed #{!important};
+}
+.mat-drawer-backdrop.mat-drawer-shown {
+  @include property('background-color', rgba(27, 54, 83, 0.5) !important);
+}
+
+/* Dialog Backdrop Styles */
+.customDialogBackdrop {
+  @include property('background-color', rgba(27, 54, 83, 0.5));
+}
+.chat-customDialogBackdrop {
+  @include property('background-color', rgba(0, 0, 0, 0.3));
+}
+
+/* Custom toggle switch */
+.custom-toggle-switch-header {
+  @apply bg-white overflow-hidden pb-1.5 pt-1.5 px-1.5 rounded-lg h-[50px] min-w-max w-max border border-[#C1E1EF];
+  @include flex-all(flex, center);
+  .custom-toggle-item {
+    @apply w-full;
+    .switch-label {
+      @apply font-primary text-md leading-none font-normal text-secondary bg-transparent rounded-md;
+      @apply whitespace-nowrap px-4 py-[5px];
+      transition: 0.3s ease-in-out;
+    }
+    input[type='radio'].switch-toggle {
+      @apply hidden;
+      & + .switch-label {
+        @apply cursor-pointer w-full #{!important};
+      }
+      &:checked + .switch-label {
+        @apply text-white bg-primary opacity-100 cursor-pointer #{!important};
+      }
+    }
+  }
+}
+
+/*
+ * *Material Sidebar Style
+ */
+.sidebar-content-wrapper {
+  @apply relative size-full;
+  header.sidebar-header {
+    @apply py-6 pl-[30px] pr-7 rounded-none;
+    @apply mb-0 #{!important};
+    @apply relative min-h-[100px] bg-primary border-b border-b-[#E5E7EB];
+    @include flex-all(flex, center, space-between);
+    h2 {
+      @apply text-white font-primary text-1xl leading-[1.1] font-medium;
+      @include flex-all(flex, center);
+      i {
+        @apply text-white font-primary text-xs leading-none font-normal not-italic;
+        @apply border border-white rounded pt-1 pr-1.5 pl-[5px] pb-[3px] ml-5;
+        @include flex-all(flex, center, center);
+      }
+      span {
+        @apply text-white font-primary text-sm leading-[1.1] font-normal border border-white p-1 rounded-md ml-2.5;
+      }
+    }
+
+    .cross-icon {
+      @apply size-[29px] bg-white cursor-pointer rounded-lg rotate-45;
+      @include flex-all(flex, center, center);
+      svg {
+        @apply size-[13px] fill-primary rotate-45;
+        @include transition;
+      }
+      &:hover {
+        svg {
+          @apply fill-secondary;
+        }
+      }
+    }
+  }
+}
+.sidebar-body-wrapper {
+  @apply pt-10 pl-[30px] pr-4;
+
+  &.drill-down-sidebar-body {
+    @apply pt-6 h-[calc(100vh-200px)] overflow-y-auto;
+    &::-webkit-scrollbar {
+      @apply w-2.5;
+    }
+    &::-webkit-scrollbar-track {
+      @apply rounded-xl bg-gray-300;
+    }
+    &::-webkit-scrollbar-thumb {
+      @apply rounded-xl bg-secondary;
+    }
+  }
+}
+.custom-form-block {
+  @apply h-[calc(100vh-239px)] overflow-x-hidden overflow-y-auto pr-3;
+  &::-webkit-scrollbar {
+    @apply w-[15px];
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl bg-gray-300;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply rounded-xl bg-secondary;
+  }
+}
+
+.custom-form-buttons-block {
+  @apply relative gap-x-4 border-t border-t-gray-300;
+  @apply pr-3.5 pt-6 pb-5;
+  @include flex-all(flex, center);
+  &:before {
+    @apply empty-content absolute -top-px -left-full h-px w-full bg-gray-300;
+  }
+  &:after {
+    @apply empty-content absolute -top-px -right-full h-px w-full bg-gray-300;
+  }
+  button {
+    &.btn-primary {
+      @apply px-5;
+      @apply min-w-[142px];
+    }
+    &.btn-secondary {
+      @apply px-[18px];
+      @apply min-w-[120px];
+    }
+    &.btn-close {
+      @apply px-3.5;
+    }
+    &.btn-close-outline {
+      @apply px-[18px];
+      @apply min-w-[100px];
+    }
+  }
+}
+
+/*
+ * *Custom Button Style
+ * @designer: Somnath Sil
+ */
+.btn {
+  @include rounded(10);
+  @apply pt-[11px] pb-[9px] px-[34px];
+  @apply text-[26px] leading-none font-secondary font-semibold tracking-[-0.52px] capitalize;
+  @apply h-[54px] text-center whitespace-normal;
+  @apply border border-solid border-transparent;
+  @apply select-none cursor-pointer;
+  @include flex-all(flex, center, center);
+  @include property('min-width', 75px);
+  @include transition;
+}
+.btn:disabled {
+  @apply cursor-default pointer-events-none;
+  @apply bg-disabled;
+  @apply border-disabled #{!important};
+}
+.btn-secondary {
+  @apply bg-secondary border-secondary text-white;
+  &:hover {
+    @apply bg-secondary-100 border-secondary-100;
+  }
+}
+.btn-primary {
+  @apply bg-primary border-primary text-white;
+  &:hover {
+    @apply bg-primary-100 border-primary-100;
+  }
+}
+.btn-close {
+  @apply bg-gray border-gray text-white;
+  &:hover {
+    @apply bg-gray-400 border-gray-400 text-white;
+  }
+}
+.btn-close-outline {
+  @apply bg-white border-gray text-gray;
+  &:hover {
+    @apply bg-gray-400 border-gray-400 text-white;
+  }
+}
+.btn-red {
+  @apply bg-red-200 border-red-200 text-white;
+  &:hover {
+    @apply bg-red-100 border-red-100;
+  }
+}
+
+/* Custom Tooltip Styles */
+.custom-tooltip {
+  @apply relative;
+  @include transition;
+  &:hover {
+    .custom-tooltip-text {
+      @apply opacity-100;
+    }
+  }
+}
+.custom-tooltip-text {
+  @apply text-xs font-medium font-primary text-white bg-secondary capitalize py-0.5 px-1.5 capitalize;
+  @apply absolute -bottom-[30px] left-2/4 -translate-x-1/2 min-w-max z-1 opacity-0 pointer-events-none;
+  @include transition;
+  @include rounded(5);
+  &::after {
+    @apply empty-content absolute -top-2 left-0 right-0 w-[18px] h-6 bg-secondary mx-auto;
+    clip-path: polygon(50% 9%, 26% 37%, 71% 37%);
+  }
+}
+
+/* Page Spacing */
+.custom-page-wrapper {
+  @apply mt-[22px] mx-[30px];
+  @apply h-full;
+  &.custom-page-wrapper-list {
+    @apply bg-white border border-disabled rounded-[14px] px-[26px] pb-7 pt-3 mb-12;
+    box-shadow: 6px 6px 54px 0 rgba(0, 0, 0, 0.03);
+  }
+}
+/* Manual Checkbox Styles */
+.manual-checkbox {
+  @apply px-4 pt-1 pb-2;
+  @include flex-all(flex, center, space-between);
+  @include transition;
+  &:hover {
+    @apply bg-[#F6FCFF];
+  }
+  &:not(:last-of-type) {
+    @apply mb-1.5;
+  }
+  &.disabled {
+    @apply cursor-default pointer-events-none;
+  }
+  .customCheckbox {
+    @apply relative inline-block cursor-pointer pl-9;
+    @apply text-md leading-[18px] font-normal text-secondary font-primary;
+    @include property('-webkit-user-select', none);
+    @include property('-moz-user-select', none);
+    @include property('-ms-user-select', none);
+    @include property('user-select', none);
+    @include property('word-break', break-all);
+    &:has(input:checked ~ .checkmark) {
+      @apply font-semibold;
+    }
+    input {
+      @apply absolute cursor-pointer size-0 opacity-0 appearance-none;
+      @include property('-webkit-appearance', none);
+      @include property('-moz-appearance', none);
+    }
+    .checkmark {
+      @apply absolute top-0 left-0 size-[22px] rounded-[7px];
+      @apply border border-solid border-secondary;
+    }
+  }
+  .customCheckbox input:checked ~ .checkmark {
+    @apply bg-primary border-primary;
+  }
+  .checkmark:after {
+    @apply empty-content absolute hidden;
+  }
+  .customCheckbox input:checked ~ .checkmark:after {
+    @apply block;
+  }
+  .customCheckbox .checkmark:after {
+    @apply left-[7px] top-px w-[7px] h-[13px];
+    @apply border border-solid border-white;
+    clip-path: inset(0 round -2px);
+    @include property('border-width', 0 2px 2px 0);
+    @include property('-webkit-transform', rotate(45deg));
+    @include property('-ms-transform', rotate(45deg));
+    @include property('transform', rotate(45deg));
+  }
+}
+
+/* Manual Autocomplate Box Styles */
+.manual-autocomplate-block {
+  @apply border border-gray-300 border-b-0 rounded-tl-[10px] rounded-tr-[10px] pt-1.5 px-3;
+}
+.search-box {
+  @apply relative h-14 border-b border-b-gray-300;
+  input {
+    @apply size-full py-1.5 pl-[17px] pr-20 bg-white border-none;
+    @apply text-md font-normal font-primary text-secondary;
+    @apply outline-0 outline-offset-0 #{!important};
+    &:focus {
+      @include property('outline', 0px !important);
+    }
+    &::-webkit-input-placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+    &::-moz-placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+    &::-moz-placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+    &::-ms-input-placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+    &::-ms-input-placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+    &::placeholder {
+      @apply font-primary text-md font-normal text-[#8E8E8E];
+      @apply not-italic opacity-100;
+    }
+  }
+  .icon-search {
+    @apply absolute right-[18px] top-1/2 transform -translate-y-1/2;
+    @apply fill-gray-500 hover:fill-gray cursor-pointer size-5;
+    @include transition;
+  }
+}
+.manual-list-block {
+  @apply mt-7 h-[calc(100vh-368px)] overflow-y-auto;
+  &::-webkit-scrollbar {
+    @apply w-[15px];
+  }
+  &::-webkit-scrollbar-track {
+    @apply rounded-xl bg-gray-300;
+  }
+  &::-webkit-scrollbar-thumb {
+    @apply rounded-xl bg-secondary;
+  }
+  .manual-norecords-block {
+    @include flex-all(flex, center, center);
+    @apply flex-col h-[94%];
+    img {
+      @apply w-14;
+    }
+    p {
+      @apply text-secondary font-primary text-md font-normal mt-[18px];
+    }
+  }
+}
+
+// toggle block
+.custom-toggle-switch {
+  @apply bg-primary overflow-hidden p-1.5 pt-[5px] rounded-lg h-12 min-w-max w-max;
+  @include flex-all(flex, center);
+  .custom-toggle-item {
+    @apply w-full;
+    .switch-label {
+      @apply font-primary text-xs leading-none font-normal text-white bg-transparent capitalize rounded-md;
+      @apply whitespace-nowrap px-6 py-[9px];
+      transition: 0.3s ease-in-out;
+    }
+    input[type='checkbox'].switch-toggle {
+      @apply hidden;
+      & + .switch-label {
+        @apply cursor-pointer w-full;
+      }
+      &:checked + .switch-label {
+        @apply text-black bg-white cursor-pointer;
+      }
+    }
+  }
+}
+
+//Tab Design//
+.common-tab-area {
+  ul {
+    @include flex-all(flex, center, space-between);
+    @apply border-b border-gray-500 mb-7;
+
+    li {
+      @apply w-1/4 list-none;
+      &.disabled {
+        @apply pointer-events-none cursor-not-allowed;
+      }
+      a {
+        @apply text-base leading-none font-normal font-primary text-gray gap-x-3 pb-2.5 relative cursor-pointer text-center;
+        @include flex-all(flex, center, center);
+        &::after {
+          @apply empty-content h-0.5 bg-primary;
+          @apply absolute -bottom-px left-0 right-0 mx-auto w-0;
+          @include transition;
+        }
+        &:hover {
+          @apply text-primary;
+          &::after {
+            @apply w-full;
+            @include transition;
+          }
+          span {
+            @apply bg-primary;
+          }
+        }
+        span {
+          @apply rounded-full bg-disabled text-md leading-none font-normal font-primary text-white size-[22px] inline-block;
+          @include flex-all(flex, center, center);
+          @include transition;
+        }
+      }
+      &.active {
+        a {
+          @apply text-primary;
+          &::after {
+            @apply w-full;
+            @include transition;
+          }
+          span {
+            @apply bg-primary;
+          }
+        }
+      }
+      &.disable {
+        @apply cursor-not-allowed pointer-events-none;
+        a {
+          @apply text-disabled-100;
+          span {
+            @apply bg-disabled-100;
+          }
+        }
+      }
+    }
+  }
+}
+
+/* Custom Editor Styles */
+.custom-editor {
+  .note-editor {
+    @apply border border-gray-500 #{!important};
+    .note-toolbar {
+      @apply bg-white pb-2 pl-2;
+      > .note-btn-group {
+        @apply mt-2 mr-2;
+      }
+    }
+    .note-statusbar {
+      @apply border-t border-t-gray-500 #{!important};
+    }
+    .note-placeholder {
+      @apply text-gray leading-[18px] text-md;
+    }
+  }
+  .note-editable {
+    @apply leading-[18px] text-md;
+    p {
+      @apply leading-[18px] text-md;
+    }
+    ul {
+      @apply list-disc;
+    }
+    ol {
+      @apply list-decimal;
+    }
+    ul,
+    ol {
+      li {
+        @apply mb-0.5;
+      }
+    }
+  }
+  &.invalid-custom-editor {
+    .note-editor {
+      @apply border-red #{!important};
+    }
+  }
+}
+/* Compliment grid view on toggle */
+.sidebar-collapse {
+  .compliment-group-wrapper {
+    .form-area,
+    .acknowledgement-block,
+    .evidence-block {
+      @apply grid-cols-3;
+    }
+  }
+}
+
+/* Custom Breadcrumbs */
+.breadcrumbs-area {
+  h1 {
+    strong {
+      @apply font-secondary font-medium italic;
+    }
+  }
+}
+/* Smooth movement style during drag and drop */
+.cdk-drag-animating,
+.cdk-drop-list-dragging .question-lists-item:not(.cdk-drag-placeholder) {
+  @include property('transition', transform 250ms cubic-bezier(0, 0, 0.2, 1));
+}
+
+.cdk-drag-preview.question-lists-item {
+  box-sizing: border-box;
+}
+
+.cdk-drag-placeholder.question-lists-item {
+  opacity: 0.4;
+}
+
+/* Responsive */
+@media (width <= 1600px) {
+  .custom-sidebar-medium {
+    @apply w-[calc(100%-390px)] #{!important};
+  }
+}
+@media (width <= 1500px) {
+  .custom-sidebar-large {
+    @apply w-[calc(100%-250px)] #{!important};
+  }
+}
+@media (width <= 1440px) {
+  .custom-sidebar-medium {
+    @apply w-[calc(100%-320px)] #{!important};
+  }
+  .sidebar-collapse {
+    .compliment-group-wrapper {
+      .form-area,
+      .acknowledgement-block,
+      .evidence-block {
+        @apply grid-cols-2;
+      }
+    }
+  }
+}
+@media (width <= 1366px) {
+  .custom-form-block {
+    @apply h-[calc(100dvh-239px)];
+  }
+}
+@media (width >= 1200px) {
+  .custom-datatable-header {
+    p {
+      @include property('word-break', keep-all);
+    }
+  }
+  .custom-datatable-cont {
+    p {
+      @include property('line-break', auto !important);
+    }
+  }
+}
+@media (width <= 1199px) {
+  .custom-sidebar-medium {
+    @apply w-[calc(100%-70px)] #{!important};
+  }
+  .custom-sidebar-large {
+    @apply w-[calc(100%-80px)] #{!important};
+  }
+  .custom-datatable-header {
+    p {
+      @include property('word-break', keep-all);
+    }
+  }
+  .custom-datatable-cont {
+    p {
+      @include property('line-break', auto !important);
+    }
+  }
+}
+
+@media (width <= 991px) {
+  .sidebar-content-wrapper header.sidebar-header h2 span {
+    @apply text-xss;
+  }
+}

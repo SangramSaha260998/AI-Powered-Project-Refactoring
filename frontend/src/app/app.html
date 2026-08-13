@@ -2,6 +2,10 @@
   class="app-container"
   [loadingOverlay]="isLoading()"
   [overlayText]="progressText()"
+  [progressPercent]="migrationProgress()"
+  [currentStep]="currentStep()"
+  [totalSteps]="totalSteps()"
+  [currentStepIndex]="currentStepIndex()"
 >
   <button
     type="button"
@@ -80,7 +84,7 @@
             [disabled]="!reworkPrompt().trim() || isLoading()"
             (click)="submitChanges()">
             @if (isLoading()) {
-              <span class="spinner"></span> Applying Changes...
+              <span class="spinner"></span> {{ progressText() }}
             } @else {
               Submit Changes/Errors 🚀
             }
@@ -250,12 +254,11 @@
         class="action-btn"
         [disabled]="!selectedFile() || !toTech() || !fromTech() || !aiProvider() || !aiModel() || !prompt().trim() || isLoading() || modelsLoading()"
         (click)="uploadProject()"
-      >
-        @if (isLoading()) {
-          <span class="spinner"></span> Processing Package...
-        } @else {
-          Initialize AI Pipeline 🚀
-        }
+      >          @if (isLoading()) {
+              <span class="spinner"></span> {{ progressText() }}
+            } @else {
+              Initialize AI Pipeline 🚀
+            }
       </button>
 
       @if (statusMessage()) {

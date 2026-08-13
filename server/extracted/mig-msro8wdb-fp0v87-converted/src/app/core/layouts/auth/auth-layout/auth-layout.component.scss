@@ -1,0 +1,8 @@
+@use 'mixins' as *;
+
+.auth-outer {
+  @apply relative h-screen grid place-items-center;
+}
+.auth-inner {
+  @apply size-full w-full relative bg-white;
+}

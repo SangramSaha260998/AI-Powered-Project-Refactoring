@@ -116,6 +116,14 @@ export class App implements OnDestroy {
   modelsLoading = signal<boolean>(false);
   /** Live overlay / status text while migration runs */
   progressText = signal<string>('Running AI migration pipeline...');
+  /** Migration progress percentage (0-100, -1 for indeterminate) */
+  migrationProgress = signal<number>(-1);
+  /** Current migration step description */
+  currentStep = signal<string>('');
+  /** Total number of migration steps */
+  totalSteps = signal<number>(0);
+  /** Current step index */
+  currentStepIndex = signal<number>(0);
   /** Completed session ready for manual download (rare edge case) */
   readySessionId = signal<string | null>(null);
   /** Currently created project (persisted) — follow-up interface state */
@@ -378,6 +386,10 @@ Final app must compile and run: npm install → ng serve`;
     this.isSuccess.set(true);
     this.readySessionId.set(null);
     this.progressText.set('Running AI migration pipeline...');
+    this.migrationProgress.set(100);
+    this.currentStep.set('Complete!');
+    this.totalSteps.set(0);
+    this.currentStepIndex.set(0);
     this.statusMessage.set('🎉 Project created! ZIP downloaded. You can now submit changes or errors below.');
 
     const input = this.fileInput()?.nativeElement;
@@ -420,14 +432,53 @@ Final app must compile and run: npm install → ng serve`;
 
   private applyProgress(status: MigrateStatusResponse) {
     const elapsed = this.formatElapsed(status.elapsedMs);
+    const base = status.message || 'Migrating...';
+    
+    // Calculate progress percentage
+    let progress = -1;
+    if (status.unitIndex && status.unitTotal && status.unitTotal > 0) {
+      progress = Math.round((status.unitIndex / status.unitTotal) * 100);
+      this.migrationProgress.set(progress);
+      this.currentStepIndex.set(status.unitIndex);
+      this.totalSteps.set(status.unitTotal);
+    } else {
+      // Indeterminate progress
+      this.migrationProgress.set(-1);
+    }
+
+    // Update step description based on phase
+    if (status.phase) {
+      this.currentStep.set(this.getPhaseDescription(status.phase, status.unitIndex, status.unitTotal));
+    }
+
+    // Format progress text with percentage and elapsed time
+    const progressBit = progress >= 0 ? ` [${progress}%]` : '';
     const unitBit =
       status.unitIndex && status.unitTotal
         ? ` (${status.unitIndex}/${status.unitTotal})`
         : '';
-    const base = status.message || 'Migrating...';
-    const text = elapsed ? `${base}${unitBit} · ${elapsed}` : `${base}${unitBit}`;
+    const text = elapsed 
+      ? `${base}${unitBit}${progressBit} · ${elapsed}` 
+      : `${base}${unitBit}${progressBit}`;
     this.progressText.set(text);
     this.statusMessage.set(`⏳ ${text}`);
+  }
+
+  /** Get human-readable phase description */
+  private getPhaseDescription(phase: string, unitIndex?: number | null, unitTotal?: number | null): string {
+    const phaseDescriptions: Record<string, string> = {
+      'extracting': 'Extracting project files...',
+      'reading': 'Reading source code...',
+      'planning': 'Creating migration plan...',
+      'converting': 'Converting components...',
+      'generating': 'Generating Angular code...',
+      'building': 'Building project...',
+      'fixing': 'Fixing build errors...',
+      'packaging': 'Packaging project...',
+      'completed': 'Migration complete!',
+      'failed': 'Migration failed'
+    };
+    return phaseDescriptions[phase] || `${phase}...`;
   }
 
   private triggerBlobDownload(blob: Blob, filename = 'migrated_project.zip') {
@@ -604,6 +655,10 @@ Final app must compile and run: npm install → ng serve`;
     this.readySessionId.set(null);
     this.progressText.set('Uploading project and starting migration...');
     this.statusMessage.set('⏳ Uploading project and starting migration...');
+    this.migrationProgress.set(-1);
+    this.currentStep.set('Uploading files...');
+    this.totalSteps.set(0);
+    this.currentStepIndex.set(0);
 
     this.lastSessionId =
       'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
@@ -911,6 +966,10 @@ Final app must compile and run: npm install → ng serve`;
     this.readySessionId.set(null);
     this.progressText.set('Applying changes to the existing project...');
     this.statusMessage.set('⏳ Applying changes to the existing project...');
+    this.migrationProgress.set(-1);
+    this.currentStep.set('Submitting changes...');
+    this.totalSteps.set(0);
+    this.currentStepIndex.set(0);
 
     this.lastSessionId = project.sessionId;
 

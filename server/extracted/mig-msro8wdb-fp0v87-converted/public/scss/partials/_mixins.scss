@@ -1,0 +1,140 @@
+/* 
+ * * Dynamic Mixins
+ */
+
+// @include font-size(value, !important)
+@mixin font-size($font-size, $important: false) {
+  font-size: $font-size / 10 + rem if($important, !important, null);
+}
+
+// @include line-height(value, !important)
+@mixin line-height($line-height, $important: false) {
+  line-height: $line-height + px if($important, !important, null);
+}
+
+// @include rounded(value, !important)
+@mixin rounded($radius, $important: false) {
+  border-radius: $radius / 10 + rem if($important, !important, null);
+}
+// @include rounded-all('direction', value, !important)
+@mixin rounded-all($direction, $radius, $important: false) {
+  border-#{$direction}-radius: $radius / 10 + rem if($important, !important, null);
+}
+
+// @include border(value, style, !important)
+@mixin border($width, $style, $important: false) {
+  border: $width + px $style if($important, !important, null);
+}
+// @include border-all('direction', value, style, !important)
+@mixin border-all($direction, $width, $style, $important: false) {
+  border-#{$direction}: $width + px $style if($important, !important, null);
+}
+
+// @include flex-all(flex, flex-start , space-between)
+@mixin flex-all($flex, $align-items, $justify-content: null) {
+  display: $flex;
+  align-items: $align-items;
+  justify-content: $justify-content;
+}
+
+// @include width-height("width / height", value, !important);
+@mixin width-height($property, $area, $important: false) {
+  #{$property}: $area / 10 + rem if($important, !important, null);
+}
+
+// @include spacing("margin-left / padding-left", value, !important);
+@mixin spacing($direction, $space, $important: false) {
+  #{$direction}: $space / 10 + rem if($important, !important, null);
+}
+// @include spacing-all("padding / margin", topvalue, rightvalue, bottomvalue, leftvalue);
+@mixin spacing-all($property, $topspace, $rightspace, $bottomspace, $leftspace, $important: false) {
+  #{$property}: $topspace / 10 + rem $rightspace / 10 + rem $bottomspace / 10 + rem $leftspace /
+    10 + rem if($important, !important, null);
+}
+
+// @include position($top: value !important, $left: value !important);
+@mixin position($top: null, $right: null, $bottom: null, $left: null, $important: false) {
+  top: $top if($important, !important, null);
+  right: $right if($important, !important, null);
+  bottom: $bottom if($important, !important, null);
+  left: $left if($important, !important, null);
+}
+
+// @include transform(translate(-50%, -50%) !important);
+@mixin transform($direction, $value1: null, $value2: null, $important: false) {
+  transform: $direction($value1 $value2 if($important, !important, null));
+}
+
+// @include property("width", $value, !important);
+@mixin property($property, $value, $important: false) {
+  #{$property}: $value if($important, !important, null);
+}
+
+// @include background-image("example.png", no-repeat, $size: 100%)
+// Note: '!important' not gonna work here
+$imagePath: '/images';
+@mixin background-image($img, $repeat: null, $position: null, $size: null, $attachment: null) {
+  background-image: url('#{$imagePath}/#{$img}');
+  background-repeat: $repeat;
+  background-position: $position;
+  background-size: $size;
+  background-attachment: $attachment;
+}
+
+// @include truncate(value);
+@mixin truncate($line-clamp) {
+  display: -webkit-box;
+  -webkit-line-clamp: $line-clamp;
+  -webkit-box-orient: vertical;
+  line-break: anywhere;
+  @apply overflow-hidden;
+}
+
+/* 
+ * * Custom Mixins
+ */
+
+// @include transition
+@mixin transition {
+  @apply transition-all;
+  @apply duration-300;
+  @apply ease-in-out;
+}
+
+// @include autofill
+@mixin autofill {
+  box-shadow: 0 0 0 50px white inset;
+  -webkit-box-shadow: 0 0 0 50px white inset;
+  -webkit-text-fill-color: #666666;
+}
+@mixin search-autofill {
+  box-shadow: 0 0 0 50px white inset;
+  -webkit-box-shadow: 0 0 0 50px white inset;
+  -webkit-text-fill-color: #666666;
+}
+// @include search-placeholder
+@mixin search-placeholder {
+  @apply font-primary;
+  @apply text-sm;
+  @apply font-normal;
+  @apply text-[#A0A0A0] #{!important};
+  @apply not-italic #{!important};
+  @apply opacity-100;
+}
+// @include auth-placeholder
+@mixin auth-placeholder {
+  @apply text-md leading-none font-primary font-light text-gray-100;
+}
+// @include input-placeholder
+@mixin input-placeholder {
+  @apply font-primary text-md leading-[1.1] font-normal text-gray not-italic opacity-100;
+}
+// @include input-placeholder
+@mixin input-autocomplete-placeholder {
+  @apply font-primary;
+  @apply text-base;
+  @apply font-normal;
+  @apply text-primary #{!important};
+  @apply not-italic;
+  @apply opacity-100;
+}

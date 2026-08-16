@@ -154,15 +154,23 @@ loginDetails: User | null = null;
 ### **Error Pattern**
 ```
 TS2792: Cannot find module '@angular/core'.
+TS2792: Cannot find module '@angular/platform-browser'.
+TS2792: Cannot find module 'form-data'.
+TS2792: Cannot find module 'undici-types'.
+TS2339: Property 'mime' does not exist on type '(req: Readable, path: string, options?: SendOptions) => SendStream'.
 ```
 
 ### **Solution**
+**⚠️ Angular 21+ with `application` builder (esbuild) REQUIRES `moduleResolution: "bundler"`!**
+Using `"node"` will cause ALL module imports to fail.
 ```json
 {
   "compilerOptions": {
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "baseUrl": "./",
     "ignoreDeprecations": "6.0",
+    "target": "ES2022",
+    "module": "ES2022",
     "paths": {
       "@app/*": ["src/app/*"],
       "@core/*": ["src/app/core/*"],
@@ -171,6 +179,30 @@ TS2792: Cannot find module '@angular/core'.
     },
     "skipLibCheck": true
   }
+}
+```
+
+**Why `bundler` instead of `node`?**
+- Angular 21's `@angular-devkit/build-angular:application` uses esbuild
+- esbuild requires `moduleResolution: "bundler"` to resolve package `exports` fields correctly
+- `moduleResolution: "node"` fails to resolve `@angular/core`, `rxjs`, and ALL other packages
+
+**Why `skipLibCheck: true`?**
+- Suppresses `@types/serve-static` errors (Property 'mime' does not exist)
+- Suppresses `@types/node` → `undici-types` resolution errors
+- Suppresses `form-data` import errors from `@types/node-fetch`
+
+**⚠️ ALSO FIX `tsconfig.app.json`!** It must extend `tsconfig.json` and NOT override `compilerOptions` with only `baseUrl` and `paths`:
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "./",
+    "outDir": "./out-tsc/app",
+    "types": []
+  },
+  "files": ["src/main.ts"],
+  "include": ["src/**/*.d.ts"]
 }
 ```
 
@@ -247,7 +279,7 @@ constructor(
     "declaration": false,
     "downlevelIteration": true,
     "experimentalDecorators": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "importHelpers": true,
     "target": "ES2022",
     "module": "ES2022",
@@ -359,4 +391,7 @@ ng serve
 | Missing `@Injectable()` | Add decorator to service classes |
 | Missing `@Inject()` | Use for custom injection tokens |
 | Missing `skipLibCheck: true` | Add to tsconfig.json |
-| Wrong `moduleResolution` | Set to `"node"` |
+| Wrong `moduleResolution` | Set to `"bundler"` for Angular 21+ (esbuild `application` builder) |
+| Missing `import {` keyword in imports | Always use `import { X } from 'module'` syntax |
+| Duplicate imports from same module | Remove duplicate import statements |
+| `tsconfig.app.json` overriding base config | Must `extends` from base tsconfig, don't redeclare compilerOptions |

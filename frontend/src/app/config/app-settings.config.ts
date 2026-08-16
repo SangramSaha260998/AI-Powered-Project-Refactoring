@@ -1,0 +1,13 @@
+export const appSettings = {
+  storageKeys: {
+    theme: 'migration-studio-theme',
+    session: 'migration-studio-session',
+  },
+  pollIntervalMs: 2000,
+  uploadTimeoutMs: 120_000, // 2 minutes
+  downloadTimeoutMs: 300_000, // 5 minutes
+  statusTimeoutMs: 30_000, // 30 seconds
+  messageClearDelayMs: 4000,
+  deleteTimeoutMs: 30_000, // 30 seconds
+  projectCheckTimeoutMs: 15_000, // 15 seconds
+};

@@ -72,8 +72,31 @@
   }
 }
 
-.rework-textarea {
+.prompt-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background-color: var(--bg-field);
+  resize: vertical;
+  outline: none;
   min-height: 150px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+
+  &:focus {
+    border-color: var(--border-focus);
+    box-shadow: var(--focus-ring);
+    background-color: var(--bg-field);
+  }
+
+  &::placeholder {
+    color: var(--text-placeholder);
+  }
 }
 
 .rework-actions {

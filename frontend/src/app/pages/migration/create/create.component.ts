@@ -56,6 +56,7 @@ export class CreateMigrationComponent implements OnDestroy {
     { id: 'genai', label: 'Google Gemini' },
     { id: 'groq', label: 'Groq' },
     { id: 'ollama', label: 'Ollama Cloud' },
+    { id: 'tokenrouter', label: 'TokenRouter' },
   ];
 
   providerModels: Record<string, ModelOption[]> = {
@@ -63,6 +64,7 @@ export class CreateMigrationComponent implements OnDestroy {
     genai: [],
     groq: [],
     ollama: [],
+    tokenrouter: [],
   };
 
   fromTech = signal<string>('');
@@ -461,7 +463,7 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   private isDynamicProvider(provider: string): boolean {
-    return provider === 'openrouter' || provider === 'genai' || provider === 'groq' || provider === 'ollama';
+    return provider === 'openrouter' || provider === 'genai' || provider === 'groq' || provider === 'ollama' || provider === 'tokenrouter';
   }
 
   private loadProviderModels(provider: string): void {

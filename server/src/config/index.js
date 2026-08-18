@@ -120,6 +120,22 @@ export const PROVIDERS = {
       'gemma2-9b-it',
       'mixtral-8x7b-32768'
     ]
+  },
+  tokenrouter: {
+    name: 'TokenRouter',
+    envPrefix: 'TOKENROUTER',
+    defaultBaseURL: 'https://api.tokenrouter.com/v1',
+    defaultModel: 'openai/gpt-5-mini',
+    // TokenRouter provides access to 300+ models across 13 providers.
+    // Override with TOKENROUTER_MODELS=...
+    models: [
+      'openai/gpt-5-mini',
+      'anthropic/claude-sonnet-4-5',
+      'google/gemini-2.5-pro',
+      'deepseek/deepseek-chat',
+      'mistral/mistral-large-latest',
+      'groq/llama-3.3-70b-versatile'
+    ]
   }
 };
 
@@ -148,6 +164,7 @@ export const DEFAULT_PROVIDER_FALLBACK_CHAIN = [
   'openrouter',
   'ollama',
   'groq',
+  'tokenrouter',
 ];
 
 /**
@@ -207,6 +224,15 @@ export function isProviderConfigured(provider) {
   // Groq: not considered configured unless GROQ_API_KEY is set
   if (provider === 'groq') {
     const apiKey = process.env.GROQ_API_KEY || '';
+    return apiKey
+      .split(',')
+      .map((k) => k.trim())
+      .some(Boolean);
+  }
+
+  // TokenRouter: not considered configured unless TOKENROUTER_API_KEY is set
+  if (provider === 'tokenrouter') {
+    const apiKey = process.env.TOKENROUTER_API_KEY || '';
     return apiKey
       .split(',')
       .map((k) => k.trim())

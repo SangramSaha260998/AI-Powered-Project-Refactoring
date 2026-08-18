@@ -111,30 +111,26 @@ export const PROVIDERS = {
     name: 'Groq',
     envPrefix: 'GROQ',
     defaultBaseURL: 'https://api.groq.com/openai/v1',
-    defaultModel: 'llama-3.1-8b-instant',
-    // All Groq models are free-tier accessible. Override with GROQ_MODELS=...
+    defaultModel: 'groq/compound',
+    // Free Groq models only (zero/undefined pricing in the API).
+    // Override with GROQ_MODELS=custom/model1,custom/model2
     models: [
-      'llama-3.1-8b-instant',
-      'llama-3.3-70b-versatile',
-      'llama-3.3-70b-specdec',
-      'gemma2-9b-it',
-      'mixtral-8x7b-32768'
+      'groq/compound',
+      'groq/compound-mini',
+      'allam-2-7b'
     ]
   },
   tokenrouter: {
     name: 'TokenRouter',
     envPrefix: 'TOKENROUTER',
     defaultBaseURL: 'https://api.tokenrouter.com/v1',
-    defaultModel: 'openai/gpt-5-mini',
-    // TokenRouter provides access to 300+ models across 13 providers.
-    // Override with TOKENROUTER_MODELS=...
+    defaultModel: 'deepseek/deepseek-v4-pro-0813-free',
+    // Free TokenRouter models only — tried in order when a (key, model) pair hits its limit.
+    // Override with TOKENROUTER_MODELS=custom/model1,custom/model2
     models: [
-      'openai/gpt-5-mini',
-      'anthropic/claude-sonnet-4-5',
-      'google/gemini-2.5-pro',
-      'deepseek/deepseek-chat',
-      'mistral/mistral-large-latest',
-      'groq/llama-3.3-70b-versatile'
+      'deepseek/deepseek-v4-pro-0813-free',
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+      'qwen/qwen3.8-max-free'
     ]
   }
 };

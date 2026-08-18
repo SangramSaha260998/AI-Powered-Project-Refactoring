@@ -353,9 +353,24 @@ const EXCLUDED_GROQ_MODELS = new Set([
 ]);
 
 /**
+ * A Groq model is free when its pricing.prompt is 0 or undefined.
+ * Groq exposes pricing in the API response — models with no prompt price
+ * (or a zero prompt price) are free-tier accessible.
+ */
+function isFreeGroqModel(model) {
+  const pricing = model?.pricing;
+  if (!pricing) return true; // no pricing info → assume free
+  const prompt = parseFloat(pricing.prompt);
+  const completion = parseFloat(pricing.completion);
+  // Free if both prompt and completion are 0 or undefined/NaN
+  return (Number.isNaN(prompt) || prompt === 0) && (Number.isNaN(completion) || completion === 0);
+}
+
+/**
  * GET /api/models/groq
- * Fetches all models from Groq API and returns them sorted with best models first.
- * Groq doesn't expose an is_free flag in their API, but all models are free-tier accessible.
+ * Fetches all models from Groq API and returns only free chat models.
+ * Groq exposes pricing in the API response — models with zero/undefined
+ * pricing are free-tier accessible.
  */
 router.get('/models/groq', async (req, res) => {
   try {
@@ -383,12 +398,16 @@ router.get('/models/groq', async (req, res) => {
       return res.status(502).json({ error: 'Unexpected Groq models response shape.' });
     }
 
-    // Filter out non-chat models and sort with best models first
+    // Filter to free chat models only, then sort with best models first
     const mapped = models
       .filter((model) => {
         const id = String(model?.id || '');
-        // Filter out whisper/llama-guard (non-chat) models
-        return !EXCLUDED_GROQ_MODELS.has(id) && !id.includes('whisper');
+        // Filter out whisper/llama-guard (non-chat) models AND paid models
+        return (
+          !EXCLUDED_GROQ_MODELS.has(id) &&
+          !id.includes('whisper') &&
+          isFreeGroqModel(model)
+        );
       })
       .map((model) => ({
         id: model.id,

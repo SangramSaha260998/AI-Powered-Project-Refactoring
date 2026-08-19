@@ -11,6 +11,10 @@ frontend/.angular/
 .env
 server/.env
 
+# Server runtime directories
+server/extracted/
+server/uploads/
+
 # Operating System temporary tracking files
 Thumbs.db
 Desktop.ini

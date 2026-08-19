@@ -75,6 +75,15 @@ export class MigrationService {
       .pipe(timeout({ first: appSettings.uploadTimeoutMs }));
   }
 
+  analyzeSession(sessionId: string, fromTech?: string, toTech?: string): Observable<AnalyzeResponse> {
+    const fd = new FormData();
+    if (fromTech) fd.append('fromTech', fromTech);
+    if (toTech) fd.append('toTech', toTech);
+    return this.http
+      .post<AnalyzeResponse>(`${this.apiBase}/analyze/${sessionId}`, fd)
+      .pipe(timeout({ first: appSettings.uploadTimeoutMs }));
+  }
+
   getVisualQaReport(sessionId: string): Observable<VisualQaReport> {
     return this.http
       .get<VisualQaReport>(`${this.apiBase}/visual-qa/${sessionId}`)

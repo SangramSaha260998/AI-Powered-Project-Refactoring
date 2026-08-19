@@ -34,7 +34,7 @@ export class AnalyzeComponent {
     }
     try {
       const res = await firstValueFrom(
-        this.migrationService.analyzeProject(this.buildFormData(sessionId)),
+        this.migrationService.analyzeSession(sessionId),
       );
       this.analysis.set(res);
     } catch (err: any) {
@@ -42,14 +42,6 @@ export class AnalyzeComponent {
     } finally {
       this.isLoading.set(false);
     }
-  }
-
-  private buildFormData(sessionId: string): FormData {
-    // The analyze endpoint needs the source ZIP. Since we don't have it here,
-    // we re-upload from the stored session. For now, redirect to create page.
-    const fd = new FormData();
-    fd.append('sessionId', sessionId);
-    return fd;
   }
 
   startMigration(): void {

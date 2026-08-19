@@ -30,7 +30,7 @@
       </div>
       <div class="summary-item">
         <span class="label">Avg Similarity</span>
-        <span class="value">{{ report()?.summary?.averageSimilarity }}</span>
+        <span class="value">{{ (report()?.summary?.averageSimilarity ?? 0) * 100 | number:'1.0-0' }}%</span>
       </div>
     </div>
 
@@ -58,7 +58,7 @@
             [class.passed]="selectedComparison.passed"
             [class.failed]="!selectedComparison.passed"
           >
-            {{ selectedComparison.similarity }}% similar
+            {{ selectedComparison.similarity * 100 | number:'1.0-0' }}% similar
           </span>
         </div>
 

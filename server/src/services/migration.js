@@ -3701,7 +3701,7 @@ IMPORTANT RULES:
  * @returns {Promise<string>}    - Path to the new final ZIP
  */
 export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, options = {}) {
-  const { toTech = 'Unknown', aiProvider = 'openrouter', aiModel, onProgress } = options;
+  const { toTech = 'Unknown', aiProvider = 'openrouter', aiModel, referencePath = null, onProgress } = options;
   const report = (phase, message, extra = {}) => {
     if (typeof onProgress !== 'function') return;
     try {

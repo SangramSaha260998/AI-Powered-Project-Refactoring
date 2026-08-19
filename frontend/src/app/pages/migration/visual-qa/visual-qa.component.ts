@@ -1,5 +1,5 @@
 import { Component, inject, signal } from '@angular/core';
-import { CommonModule } from '@angular/common';
+import { CommonModule, DecimalPipe } from '@angular/common';
 import { ActivatedRoute, Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { MigrationService } from '@core/http';
@@ -8,7 +8,7 @@ import { VisualQaReport } from '@shared/models';
 @Component({
   selector: 'app-visual-qa',
   standalone: true,
-  imports: [CommonModule],
+  imports: [CommonModule, DecimalPipe],
   templateUrl: './visual-qa.component.html',
   styleUrl: './visual-qa.component.scss',
 })

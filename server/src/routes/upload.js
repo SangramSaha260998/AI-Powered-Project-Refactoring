@@ -350,6 +350,81 @@ router.post('/analyze', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
 });
 
 /**
+ * POST /api/analyze/:sessionId
+ * Analyzes an already-extracted session by its sessionId. No file upload
+ * required — uses the source files already on disk from the upload step.
+ *
+ * Body fields:
+ *   - referenceZip (file, optional): The uploaded ZIP of the reference project
+ *   - fromTech (string, optional): Source framework
+ *   - toTech   (string, optional): Target framework
+ */
+router.post('/analyze/:sessionId', upload.single('referenceZip'), (req, res) => {
+  const { sessionId } = req.params;
+  const referenceZip = req.file;
+  const fromTech = req.body.fromTech || 'Unknown';
+  const toTech = req.body.toTech || 'Unknown';
+
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+
+  const extractPath = path.join(EXTRACT_DIR, sessionId);
+  if (!fs.existsSync(extractPath)) {
+    return res.status(404).json({ error: `Session "${sessionId}" not found or already cleaned up.` });
+  }
+
+  try {
+    const sourceAnalysis = analyzeSourceProject(extractPath);
+
+    let referenceAnalysis = null;
+    if (referenceZip) {
+      const refExtractPath = path.join(EXTRACT_DIR, `${sessionId}-reference`);
+      ensureDirectoryExists(refExtractPath);
+      try {
+        const refZip = new AdmZip(referenceZip.path);
+        refZip.extractAllTo(refExtractPath, true);
+        referenceAnalysis = analyzeReferenceProject(refExtractPath);
+      } catch (refErr) {
+        console.warn(`[analyze] Failed to analyze reference project: ${refErr.message}`);
+      }
+    }
+
+    const planPreview = buildMigrationPlan(sourceAnalysis, referenceAnalysis, fromTech, toTech);
+
+    res.json({
+      sessionId,
+      fromTech,
+      toTech,
+      sourceAnalysis: {
+        framework: sourceAnalysis.framework,
+        fileCount: sourceAnalysis.fileCount,
+        fileTree: sourceAnalysis.fileTree,
+        components: sourceAnalysis.components,
+        services: sourceAnalysis.services,
+        routes: sourceAnalysis.routes,
+        hooks: sourceAnalysis.hooks,
+        contexts: sourceAnalysis.contexts,
+      },
+      referenceAnalysis: referenceAnalysis ? {
+        framework: referenceAnalysis.framework,
+        fileCount: referenceAnalysis.fileCount,
+        folders: referenceAnalysis.folders,
+        sharedComponents: referenceAnalysis.sharedComponents,
+        services: referenceAnalysis.services,
+        guards: referenceAnalysis.guards,
+        interceptors: referenceAnalysis.interceptors,
+        styling: referenceAnalysis.styling,
+      } : null,
+      migrationPlan: planPreview,
+    });
+  } catch (error) {
+    console.error(`[analyze] Analysis failed for session ${sessionId}:`, error);
+    res.status(500).json({ error: `Analysis failed: ${error.message}` });
+  }
+});
+
+/**
  * GET /api/download/:sessionId
  * Download the ZIP of a created project by its session ID. Works for
  * completed AND failed sessions alike, as long as the generated project
@@ -733,6 +808,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
         aiProvider,
         aiModel,
         projectName: deriveProjectName(convertedPath, toTech),
+        referencePath: referenceZip ? referenceZip.path : null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
@@ -913,6 +989,7 @@ router.post('/project/:sessionId/rework', (req, res) => {
         toTech,
         aiProvider,
         aiModel,
+        referencePath: meta.referencePath || null,
         onProgress: (progress) => {
           setSession(sessionId, {
             status: 'running',

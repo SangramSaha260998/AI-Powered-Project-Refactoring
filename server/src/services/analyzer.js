@@ -270,9 +270,9 @@ export function analyzeSourceProject(extractPath) {
     dependencyGraph: graph,
     components: [...new Map(components.map((c) => [`${c.file}:${c.name}`, c])).values()],
     services: [...new Map(services.map((s) => [`${s.file}:${s.name}`, s])).values()],
-    routes: [...new Map(routes.map((r) => `${r.file}:${r.path}`)).values()],
-    hooks: [...new Map(hooks.map((h) => `${h.file}:${h.name}`, h)).values()],
-    contexts: [...new Map(contexts.map((c) => `${c.file}:${c.name}`, c)).values()],
+    routes: [...new Map(routes.map((r) => [`${r.file}:${r.path}`, r])).values()],
+    hooks: [...new Map(hooks.map((h) => [`${h.file}:${h.name}`, h])).values()],
+    contexts: [...new Map(contexts.map((c) => [`${c.file}:${c.name}`, c])).values()],
   };
 }
 

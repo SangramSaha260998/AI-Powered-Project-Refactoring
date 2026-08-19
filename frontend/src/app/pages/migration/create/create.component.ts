@@ -89,6 +89,18 @@ export class CreateMigrationComponent implements OnDestroy {
   checkingProject = signal<boolean>(true);
   reworkPrompt = signal<string>('');
 
+  // ChatGPT workflow: reference project + priority rules + visual QA
+  priorityRulesMode = signal<string>('react-ui');
+  enableVisualQa = signal<boolean>(false);
+  visualQaRoutes = signal<string>('/');
+  referenceFile = signal<File | null>(null);
+  isReferenceDragging = signal<boolean>(false);
+
+  priorityRulesOptions = [
+    { value: 'react-ui', label: 'React = UI source, Angular reference = architecture' },
+    { value: 'angular-ui', label: 'Angular reference = UI + architecture source' },
+  ];
+
   private modelsVersion = signal(0);
   private lastSessionId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -169,7 +181,11 @@ Final app must compile and run: npm install → ng serve`;
     const value = (event.target as HTMLSelectElement).value;
     this.aiProvider.set(value);
     this.aiModel.set('');
-    if (this.isDynamicProvider(value) && this.providerModels[value].length === 0 && !this.modelsLoading()) {
+    if (
+      this.isDynamicProvider(value) &&
+      this.providerModels[value].length === 0 &&
+      !this.modelsLoading()
+    ) {
       this.loadProviderModels(value);
     }
   }
@@ -205,6 +221,59 @@ Final app must compile and run: npm install → ng serve`;
   onReworkPromptChange(event: Event): void {
     const value = (event.target as HTMLTextAreaElement).value;
     this.reworkPrompt.set(value);
+  }
+
+  onPriorityRulesChange(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.priorityRulesMode.set(value);
+  }
+
+  onEnableVisualQaChange(event: Event): void {
+    const target = event.target as HTMLInputElement;
+    this.enableVisualQa.set(target.checked);
+  }
+
+  onVisualQaRoutesChange(event: Event): void {
+    const value = (event.target as HTMLInputElement).value;
+    this.visualQaRoutes.set(value || '/');
+  }
+
+  onReferenceDragOver(event: DragEvent): void {
+    event.preventDefault();
+    this.isReferenceDragging.set(true);
+  }
+
+  onReferenceDragLeave(): void {
+    this.isReferenceDragging.set(false);
+  }
+
+  onReferenceDrop(event: DragEvent): void {
+    event.preventDefault();
+    this.isReferenceDragging.set(false);
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      this.validateAndSetReferenceFile(files[0]);
+    }
+  }
+
+  onReferenceFileSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    if (input.files && input.files.length > 0) {
+      this.validateAndSetReferenceFile(input.files[0]);
+    }
+  }
+
+  private validateAndSetReferenceFile(file: File): void {
+    if (file.name.endsWith('.zip')) {
+      this.referenceFile.set(file);
+      this.statusMessage.set('');
+      this.isSuccess.set(false);
+    } else {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ Invalid reference file. Please drop a valid zipped archive.');
+      this.referenceFile.set(null);
+      this.clearMessage();
+    }
   }
 
   onFileSelected(event: Event): void {
@@ -244,7 +313,12 @@ Final app must compile and run: npm install → ng serve`;
     this.lastMode = 'rework';
 
     this.startSub = this.migrationService
-      .submitChanges(project.sessionId, promptText, this.activeProject()?.aiProvider, this.activeProject()?.aiModel)
+      .submitChanges(
+        project.sessionId,
+        promptText,
+        this.activeProject()?.aiProvider,
+        this.activeProject()?.aiModel,
+      )
       .subscribe({
         next: (res) => {
           const sessionId = res.sessionId || project.sessionId;
@@ -317,15 +391,22 @@ Final app must compile and run: npm install → ng serve`;
     this.totalSteps.set(0);
     this.currentStepIndex.set(0);
 
-    this.lastSessionId = 'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    this.lastSessionId =
+      'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
     const formData = new FormData();
     formData.append('zipFile', file);
+    if (this.referenceFile()) {
+      formData.append('referenceZip', this.referenceFile()!);
+    }
     formData.append('sessionId', this.lastSessionId);
     formData.append('fromTech', from);
     formData.append('toTech', to);
     formData.append('prompt', promptText);
     formData.append('aiProvider', this.aiProvider());
+    formData.append('priorityRulesMode', this.priorityRulesMode());
+    formData.append('enableVisualQa', String(this.enableVisualQa()));
+    formData.append('visualQaRoutes', this.visualQaRoutes());
     if (this.aiModel()) {
       formData.append('aiModel', this.aiModel());
     }
@@ -463,7 +544,13 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   private isDynamicProvider(provider: string): boolean {
-    return provider === 'openrouter' || provider === 'genai' || provider === 'groq' || provider === 'ollama' || provider === 'tokenrouter';
+    return (
+      provider === 'openrouter' ||
+      provider === 'genai' ||
+      provider === 'groq' ||
+      provider === 'ollama' ||
+      provider === 'tokenrouter'
+    );
   }
 
   private loadProviderModels(provider: string): void {
@@ -540,7 +627,8 @@ Final app must compile and run: npm install → ng serve`;
       this.currentStep.set(this.getPhaseDescription(status.phase));
     }
     const progressBit = progress >= 0 ? ` [${progress}%]` : '';
-    const unitBit = status.unitIndex && status.unitTotal ? ` (${status.unitIndex}/${status.unitTotal})` : '';
+    const unitBit =
+      status.unitIndex && status.unitTotal ? ` (${status.unitIndex}/${status.unitTotal})` : '';
     const text = `${base}${unitBit}${progressBit}`;
     this.progressText.set(text);
     this.statusMessage.set(`⏳ ${text}`);
@@ -550,11 +638,13 @@ Final app must compile and run: npm install → ng serve`;
     const phaseDescriptions: Record<string, string> = {
       extracting: 'Extracting project files...',
       reading: 'Reading source code...',
+      analyze: 'Analyzing project structure...',
       planning: 'Creating migration plan...',
       converting: 'Converting components...',
       generating: 'Generating Angular code...',
       building: 'Building project...',
       fixing: 'Fixing build errors...',
+      'visual-qa': 'Running visual QA comparison...',
       packaging: 'Packaging project...',
       completed: 'Migration complete!',
       failed: 'Migration failed',
@@ -562,9 +652,16 @@ Final app must compile and run: npm install → ng serve`;
     return phaseDescriptions[phase] || `${phase}...`;
   }
 
-  private async downloadCompletedSession(sessionId: string, mode: 'create' | 'rework' = 'create'): Promise<void> {
-    this.progressText.set(mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...');
-    this.statusMessage.set(`⏳ ${mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...'}`);
+  private async downloadCompletedSession(
+    sessionId: string,
+    mode: 'create' | 'rework' = 'create',
+  ): Promise<void> {
+    this.progressText.set(
+      mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...',
+    );
+    this.statusMessage.set(
+      `⏳ ${mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...'}`,
+    );
 
     try {
       const blob = await firstValueFrom(this.migrationService.downloadProject(sessionId));
@@ -617,6 +714,11 @@ Final app must compile and run: npm install → ng serve`;
     this.prompt.set('');
     this.selectedFile.set(null);
     this.isDragging.set(false);
+    this.priorityRulesMode.set('react-ui');
+    this.enableVisualQa.set(false);
+    this.visualQaRoutes.set('/');
+    this.referenceFile.set(null);
+    this.isReferenceDragging.set(false);
     this.isLoading.set(false);
     this.isSuccess.set(true);
     this.readySessionId.set(null);
@@ -625,7 +727,9 @@ Final app must compile and run: npm install → ng serve`;
     this.currentStep.set('Complete!');
     this.totalSteps.set(0);
     this.currentStepIndex.set(0);
-    this.statusMessage.set('🎉 Project created! ZIP downloaded. You can now submit changes or errors below.');
+    this.statusMessage.set(
+      '🎉 Project created! ZIP downloaded. You can now submit changes or errors below.',
+    );
 
     const input = this.fileInput()?.nativeElement;
     if (input) {
@@ -666,7 +770,11 @@ Final app must compile and run: npm install → ng serve`;
         if (status.status === 'completed') {
           if (this.settlingDownload) return;
           this.settlingDownload = true;
-          this.progressText.set(mode === 'rework' ? 'Changes applied. Preparing download...' : 'Migration complete. Preparing download...');
+          this.progressText.set(
+            mode === 'rework'
+              ? 'Changes applied. Preparing download...'
+              : 'Migration complete. Preparing download...',
+          );
           try {
             await this.downloadCompletedSession(sessionId, mode);
           } finally {
@@ -716,7 +824,9 @@ Final app must compile and run: npm install → ng serve`;
       triggerBlobDownload(blob);
       this.isSuccess.set(true);
       this.progressText.set('Running AI migration pipeline...');
-      this.statusMessage.set(`⚠️ ${errMsg} — the generated project was still downloaded. Fix the errors below and submit again.`);
+      this.statusMessage.set(
+        `⚠️ ${errMsg} — the generated project was still downloaded. Fix the errors below and submit again.`,
+      );
       return true;
     } catch (err: any) {
       this.isSuccess.set(false);

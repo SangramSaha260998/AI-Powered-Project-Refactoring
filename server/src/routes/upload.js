@@ -7,6 +7,7 @@ import { validateProjectFramework } from '../services/validator.js';
 import { removeDirectoryRecursive, removeFile, ensureDirectoryExists } from '../utils/file.js';
 import { EXTRACT_DIR, UPLOAD_DIR, getProviderIds, PROVIDERS } from '../config/index.js';
 import { runMigrationPipeline, runReworkPipeline } from '../services/migration.js';
+import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from '../services/analyzer.js';
 
 // Ensure the extract and upload directories exist at startup
 ensureDirectoryExists(EXTRACT_DIR);
@@ -262,6 +263,93 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
 });
 
 /**
+ * POST /api/analyze
+ * Analyzes the uploaded source project (and optional reference project)
+ * WITHOUT running the AI migration. Returns the source analysis, reference
+ * architecture, and a migration plan preview. This is the "Analyzer" stage
+ * from the ChatGPT workflow.
+ *
+ * Body fields:
+ *   - zipFile (file, required): The uploaded ZIP of the source project
+ *   - referenceZip (file, optional): The uploaded ZIP of the reference project
+ *   - fromTech (string, optional): Source framework
+ *   - toTech   (string, optional): Target framework
+ */
+router.post('/analyze', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name: 'referenceZip', maxCount: 1 }]), (req, res) => {
+  const zipFile = req.files?.zipFile?.[0];
+  const referenceZip = req.files?.referenceZip?.[0];
+  const fromTech = req.body.fromTech || 'Unknown';
+  const toTech = req.body.toTech || 'Unknown';
+
+  if (!zipFile) {
+    return res.status(400).json({ error: 'Please upload a valid source project ZIP.' });
+  }
+
+  const id = `analyze-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const extractPath = path.join(EXTRACT_DIR, id);
+  ensureDirectoryExists(extractPath);
+
+  try {
+    const zip = new AdmZip(zipFile.path);
+    zip.extractAllTo(extractPath, true);
+    const sourceAnalysis = analyzeSourceProject(extractPath);
+
+    let referenceAnalysis = null;
+    if (referenceZip) {
+      const refExtractPath = path.join(EXTRACT_DIR, `${id}-reference`);
+      ensureDirectoryExists(refExtractPath);
+      try {
+        const refZip = new AdmZip(referenceZip.path);
+        refZip.extractAllTo(refExtractPath, true);
+        referenceAnalysis = analyzeReferenceProject(refExtractPath);
+      } catch (refErr) {
+        console.warn(`[analyze] Failed to analyze reference project: ${refErr.message}`);
+      }
+    }
+
+    const planPreview = buildMigrationPlan(sourceAnalysis, referenceAnalysis, fromTech, toTech);
+
+    // Clean up temp extraction
+    removeDirectoryRecursive(extractPath);
+    if (referenceZip) removeFile(referenceZip.path);
+    removeFile(zipFile.path);
+
+    res.json({
+      sessionId: id,
+      fromTech,
+      toTech,
+      sourceAnalysis: {
+        framework: sourceAnalysis.framework,
+        fileCount: sourceAnalysis.fileCount,
+        fileTree: sourceAnalysis.fileTree,
+        components: sourceAnalysis.components,
+        services: sourceAnalysis.services,
+        routes: sourceAnalysis.routes,
+        hooks: sourceAnalysis.hooks,
+        contexts: sourceAnalysis.contexts,
+      },
+      referenceAnalysis: referenceAnalysis ? {
+        framework: referenceAnalysis.framework,
+        fileCount: referenceAnalysis.fileCount,
+        folders: referenceAnalysis.folders,
+        sharedComponents: referenceAnalysis.sharedComponents,
+        services: referenceAnalysis.services,
+        guards: referenceAnalysis.guards,
+        interceptors: referenceAnalysis.interceptors,
+        styling: referenceAnalysis.styling,
+      } : null,
+      migrationPlan: planPreview,
+    });
+  } catch (error) {
+    removeDirectoryRecursive(extractPath);
+    if (referenceZip) removeFile(referenceZip.path);
+    removeFile(zipFile.path);
+    console.error(`[analyze] Analysis failed:`, error);
+    res.status(500).json({ error: `Analysis failed: ${error.message}` });
+  }
+});
+
+/**
  * GET /api/download/:sessionId
  * Download the ZIP of a created project by its session ID. Works for
  * completed AND failed sessions alike, as long as the generated project
@@ -354,6 +442,67 @@ router.get('/download/:sessionId', (req, res) => {
 });
 
 /**
+ * GET /api/visual-qa/:sessionId
+ * Returns the persisted Visual QA report JSON for a completed migration.
+ * The report is written to disk by the visual QA stage in visualQa.js.
+ */
+router.get('/visual-qa/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+  const qaDir = path.join(EXTRACT_DIR, `${sessionId}-visual-qa`);
+  const reportPath = path.join(qaDir, 'visual-qa-report.json');
+  if (!fs.existsSync(reportPath)) {
+    return res.status(404).json({
+      error: `No visual QA report found for session "${sessionId}".`,
+    });
+  }
+  try {
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf-8'));
+    // Make image paths relative-serveable: prefix with the QA dir
+    const toRelativeUrl = (p) => {
+      const rel = path.relative(EXTRACT_DIR, p).replace(/\\/g, '/');
+      return `/api/files/${sessionId}/${rel}`;
+    };
+    const enriched = {
+      ...report,
+      comparisons: (report.comparisons || []).map((c) => ({
+        ...c,
+        sourceImage: c.sourceImage ? toRelativeUrl(c.sourceImage) : null,
+        migratedImage: c.migratedImage ? toRelativeUrl(c.migratedImage) : null,
+        diffImage: c.diffImage ? toRelativeUrl(c.diffImage) : null,
+      })),
+    };
+    res.json(enriched);
+  } catch (err) {
+    console.error(`[visual-qa] Failed to read report:`, err);
+    res.status(500).json({ error: 'Failed to read visual QA report.' });
+  }
+});
+
+/**
+ * GET /api/files/:sessionId/:filePath(*)
+ * Serves screenshot image assets from a session's visual-qa output directory.
+ */
+router.get('/files/:sessionId/:filePath(.*)', (req, res) => {
+  const { sessionId, filePath } = req.params;
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+  const qaDir = path.join(EXTRACT_DIR, `${sessionId}-visual-qa`);
+  const fullPath = path.join(qaDir, filePath);
+  // Prevent path traversal outside the QA dir
+  if (!fullPath.startsWith(qaDir + path.sep) && fullPath !== qaDir) {
+    return res.status(400).json({ error: 'Invalid file path.' });
+  }
+  if (!fs.existsSync(fullPath)) {
+    return res.status(404).json({ error: 'File not found.' });
+  }
+  res.sendFile(fullPath);
+});
+
+/**
  * GET /api/migrate/:sessionId/status
  * Poll migration progress for an async job started by POST /migrate.
  */
@@ -419,14 +568,18 @@ router.get('/migrate/:sessionId/status', (req, res) => {
  *   - targetVersion (string, optional): Explicit target major version (e.g. '22', '19')
  *   - sessionId (string, optional): Client-provided session id
  */
-router.post('/migrate', upload.single('zipFile'), async (req, res) => {
+router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name: 'referenceZip', maxCount: 1 }]), async (req, res) => {
   const userPrompt = (req.body.prompt || '').trim();
-  const zipFile = req.file;
+  const zipFile = req.files?.zipFile?.[0];
+  const referenceZip = req.files?.referenceZip?.[0];
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
   const aiProvider = (req.body.aiProvider || '').trim();
   const aiModel = req.body.aiModel || '';
   const targetVersion = (req.body.targetVersion || '').trim();
+  const priorityRulesMode = (req.body.priorityRulesMode || 'react-ui').trim();
+  const enableVisualQa = String(req.body.enableVisualQa || '').toLowerCase() === 'true';
+  const visualQaRoutes = (req.body.visualQaRoutes || '/').split(',').map((r) => r.trim()).filter(Boolean);
 
   if (!zipFile || !userPrompt) {
     return res.status(400).json({ error: 'ZIP file and migration prompt are required.' });
@@ -550,6 +703,10 @@ router.post('/migrate', upload.single('zipFile'), async (req, res) => {
           aiProvider,
           aiModel: aiModel || undefined,
           targetVersion: targetVersion || undefined,
+          referenceZipPath: referenceZip ? referenceZip.path : null,
+          priorityRulesMode,
+          enableVisualQa,
+          visualQaRoutes,
           onProgress: (progress) => {
             setSession(id, {
               status: 'running',

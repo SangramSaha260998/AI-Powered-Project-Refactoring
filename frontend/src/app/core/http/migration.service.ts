@@ -8,6 +8,8 @@ import {
   MigrateStatusResponse,
   ProjectCheckResponse,
   ModelOption,
+  AnalyzeResponse,
+  VisualQaReport,
 } from '@shared/models';
 
 @Injectable({ providedIn: 'root' })
@@ -64,8 +66,18 @@ export class MigrationService {
   }
 
   loadModels(provider: string): Observable<{ models: ModelOption[] }> {
-    return this.http.get<{ models: ModelOption[] }>(
-      `${this.apiBase}/models/${provider}`,
-    );
+    return this.http.get<{ models: ModelOption[] }>(`${this.apiBase}/models/${provider}`);
+  }
+
+  analyzeProject(formData: FormData): Observable<AnalyzeResponse> {
+    return this.http
+      .post<AnalyzeResponse>(`${this.apiBase}/analyze`, formData)
+      .pipe(timeout({ first: appSettings.uploadTimeoutMs }));
+  }
+
+  getVisualQaReport(sessionId: string): Observable<VisualQaReport> {
+    return this.http
+      .get<VisualQaReport>(`${this.apiBase}/visual-qa/${sessionId}`)
+      .pipe(timeout({ first: appSettings.statusTimeoutMs }));
   }
 }

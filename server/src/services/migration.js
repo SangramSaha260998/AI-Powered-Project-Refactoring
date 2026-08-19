@@ -20,7 +20,10 @@ import {
   MAX_BUILD_FIX_ATTEMPTS
 } from '../config/index.js';
 import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
+import { getPriorityRules, formatPriorityRulesPrompt } from '../config/priorityRules.js';
 import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../config/targetVersions.js';
+import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
+import { runVisualQa } from './visualQa.js';
 import {
   webAngularNpmDeps,
   isWebAngularProtectedPath
@@ -2635,7 +2638,19 @@ function groupPlanIntoMigrationUnits(planItems) {
 }
 
 export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId, options = {}) {
-  const { fromTech = 'Unknown', toTech = 'Unknown', aiProvider = 'openrouter', aiModel, targetVersion, onProgress } = options;
+  const {
+    fromTech = 'Unknown',
+    toTech = 'Unknown',
+    aiProvider = 'openrouter',
+    aiModel,
+    targetVersion,
+    onProgress,
+    referenceZipPath = null,
+    priorityRulesMode = 'react-ui',
+    customPriorityRules = null,
+    enableVisualQa = false,
+    visualQaRoutes = ['/'],
+  } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
   const report = (phase, message, extra = {}) => {
     if (typeof onProgress !== 'function') return;
@@ -2662,6 +2677,11 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // Append the default strip-down / cross-framework prompt + version mandate
   const defaultSuffix = getDefaultPrompt(fromTech, toTech);
   const enhancedPrompt = `${userPrompt}\n\n${defaultSuffix}\n\n${versionMandate}`;
+
+  // Priority rules — explicit "source of truth" decision hierarchy (ChatGPT workflow)
+  const priorityRules = getPriorityRules(priorityRulesMode, customPriorityRules);
+  const priorityRulesPrompt = formatPriorityRulesPrompt(priorityRules);
+  console.log(`[${sessionId}] Priority rules mode: ${priorityRulesMode}`);
 
   // Use absolute paths based on the already-defined EXTRACT_DIR
   const extractPath = path.join(EXTRACT_DIR, sessionId);
@@ -2782,6 +2802,48 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   }
 
   // -----------------------------------------------------------------------
+  // 2c. ANALYZER STAGE (ChatGPT workflow): analyze source + reference projects
+  // -----------------------------------------------------------------------
+  let sourceAnalysis = null;
+  let referenceAnalysis = null;
+  let migrationPlanPreview = null;
+  try {
+    report('analyze', 'Analyzing source project structure...');
+    sourceAnalysis = analyzeSourceProject(extractPath);
+    console.log(
+      `[${sessionId}] Analyzer: source project = ${sourceAnalysis.framework}, ` +
+      `${sourceAnalysis.fileCount} files, ${sourceAnalysis.components.length} components, ` +
+      `${sourceAnalysis.services.length} services, ${sourceAnalysis.routes.length} routes`
+    );
+
+    if (referenceZipPath && fs.existsSync(referenceZipPath)) {
+      report('analyze', 'Analyzing reference project architecture...');
+      const refExtractPath = path.join(EXTRACT_DIR, `${sessionId}-reference`);
+      ensureDirectoryExists(refExtractPath);
+      try {
+        const refZip = new AdmZip(referenceZipPath);
+        refZip.extractAllTo(refExtractPath, true);
+        referenceAnalysis = analyzeReferenceProject(refExtractPath);
+        console.log(
+          `[${sessionId}] Analyzer: reference project = ${referenceAnalysis.framework}, ` +
+          `${referenceAnalysis.fileCount} files, ${referenceAnalysis.sharedComponents.length} shared components, ` +
+          `${referenceAnalysis.services.length} services`
+        );
+      } catch (refErr) {
+        console.warn(`[${sessionId}] Analyzer: failed to analyze reference project: ${refErr.message}`);
+      }
+    }
+
+    migrationPlanPreview = buildMigrationPlan(sourceAnalysis, referenceAnalysis, fromTech, toTech);
+    console.log(
+      `[${sessionId}] Analyzer: migration plan preview — ${migrationPlanPreview.mappings.length} mappings, ` +
+      `${migrationPlanPreview.plan.length} planned files`
+    );
+  } catch (analyzeErr) {
+    console.warn(`[${sessionId}] Analyzer: analysis failed (continuing without it): ${analyzeErr.message}`);
+  }
+
+  // -----------------------------------------------------------------------
   // 3. AGENT STEP 1: Generate migration blueprint
   // -----------------------------------------------------------------------
   report('blueprint', 'Building migration blueprint...');
@@ -2853,6 +2915,38 @@ ${filesContextSummary}
 
 [MIGRATION CORE MANDATE]
 ${enhancedPrompt}
+
+[PRIORITY RULES — DECISION HIERARCHY]
+${priorityRulesPrompt}
+
+[ANALYZER OUTPUT — SOURCE PROJECT ANALYSIS]
+${sourceAnalysis ? JSON.stringify({
+  framework: sourceAnalysis.framework,
+  fileCount: sourceAnalysis.fileCount,
+  components: sourceAnalysis.components,
+  services: sourceAnalysis.services,
+  routes: sourceAnalysis.routes,
+  hooks: sourceAnalysis.hooks,
+  contexts: sourceAnalysis.contexts,
+}, null, 2) : 'No source analysis available.'}
+
+[ANALYZER OUTPUT — REFERENCE PROJECT ARCHITECTURE]
+${referenceAnalysis ? JSON.stringify({
+  framework: referenceAnalysis.framework,
+  fileCount: referenceAnalysis.fileCount,
+  folders: referenceAnalysis.folders,
+  sharedComponents: referenceAnalysis.sharedComponents,
+  services: referenceAnalysis.services,
+  guards: referenceAnalysis.guards,
+  interceptors: referenceAnalysis.interceptors,
+  styling: referenceAnalysis.styling,
+}, null, 2) : 'No reference project analysis available.'}
+
+[ANALYZER OUTPUT — MIGRATION PLAN PREVIEW]
+${migrationPlanPreview ? JSON.stringify({
+  mappings: migrationPlanPreview.mappings,
+  plan: migrationPlanPreview.plan,
+}, null, 2) : 'No migration plan preview available.'}
 
 [FROM TECH] ${fromTech}
 [TO TECH] ${toTech}
@@ -3481,6 +3575,34 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
   const npmCiCheck = await verifyNpmCiBuild(migrationWorkspacePath, toTech, sessionId);
   if (!npmCiCheck.ok) {
     console.warn(`[${sessionId}] npm ci sanity check failed:\n${npmCiCheck.errors.slice(-1500)}`);
+  }
+
+  // -----------------------------------------------------------------------
+  // 5c. VISUAL QA STAGE (ChatGPT workflow): screenshot comparison
+  // -----------------------------------------------------------------------
+  let visualQaReport = null;
+  if (enableVisualQa && fs.existsSync(extractPath) && fs.existsSync(migrationWorkspacePath)) {
+    report('visual-qa', 'Running visual QA — capturing screenshots of source vs migrated...');
+    console.log(`[${sessionId}] Visual QA: comparing source vs migrated screenshots...`);
+    try {
+      const qaOutputDir = path.join(EXTRACT_DIR, `${sessionId}-visual-qa`);
+      visualQaReport = await runVisualQa({
+        sourcePath: extractPath,
+        migratedPath: migrationWorkspacePath,
+        sourceTech: fromTech,
+        migratedTech: toTech,
+        routes: visualQaRoutes,
+        outputDir: qaOutputDir,
+      });
+      console.log(
+        `[${sessionId}] Visual QA complete: ${visualQaReport.summary.passed}/${visualQaReport.summary.total} routes passed ` +
+        `(avg similarity ${visualQaReport.summary.averageSimilarity})`
+      );
+      report('visual-qa', `Visual QA complete — ${visualQaReport.summary.passed}/${visualQaReport.summary.total} routes passed.`);
+    } catch (qaErr) {
+      console.warn(`[${sessionId}] Visual QA failed (continuing without it): ${qaErr.message}`);
+      report('visual-qa', 'Visual QA failed — continuing without it.');
+    }
   }
 
   // Remove node_modules to keep ZIP small (user will run npm ci locally)

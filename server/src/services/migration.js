@@ -1311,6 +1311,18 @@ if (rootElement) {
 `;
   fs.writeFileSync(path.join(destPath, 'src', 'main.tsx'), mainTsx);
 
+  // 5b. Stub App.tsx so the build doesn't fail on unit 1
+  //     (main.tsx imports ./App immediately; the AI overwrites this later)
+  const stubAppTsx = `export default function App() {
+  return (
+    <main style={{ fontFamily: 'system-ui', padding: '2rem', textAlign: 'center' }}>
+      <h1>Migration in progress...</h1>
+    </main>
+  );
+}
+`;
+  fs.writeFileSync(path.join(destPath, 'src', 'App.tsx'), stubAppTsx, 'utf-8');
+
   // 6. src/index.scss — Tailwind entry
   const indexScss = `@tailwind base;
 @tailwind components;

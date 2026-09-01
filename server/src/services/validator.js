@@ -62,7 +62,7 @@ export function hasFilesWithExtensions(dirPath, extensions, maxDepth = 5) {
  *
  * Checks:
  *  1. package.json includes the framework's signature dependency.
- *  2. Structural signals (angular.json for Angular, .jsx/.tsx files for React).
+ *  2. Structural signals (angular.json for Angular; .jsx/.tsx/.js for React).
  *
  * @param {string} extractPath - Root of the extracted project
  * @param {string} expectedFramework - 'Angular' or 'React' (case-insensitive)
@@ -130,8 +130,11 @@ export function validateProjectFramework(extractPath, expectedFramework) {
       failures.push('No angular.json found — this is not a standard Angular CLI project.');
     }
   } else if (expected === 'react') {
-    if (!hasFilesWithExtensions(extractPath, ['.jsx', '.tsx'])) {
-      failures.push('No .jsx or .tsx files found — this does not look like a React project.');
+    const hasReactUi = hasFilesWithExtensions(extractPath, ['.jsx', '.tsx', '.js', '.mjs']);
+    if (!hasReactUi) {
+      failures.push(
+        'No React source files found (.jsx, .tsx, or .js) — this does not look like a React project.'
+      );
     }
   }
 

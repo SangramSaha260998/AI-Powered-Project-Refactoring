@@ -16,6 +16,7 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+app.use(healthRouter);
 app.use('/api', healthRouter);
 app.use('/api', uploadRouter);
 app.use('/api', modelsRouter);

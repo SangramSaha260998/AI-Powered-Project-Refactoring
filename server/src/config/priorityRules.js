@@ -93,16 +93,48 @@ export function getPriorityRules(mode = 'react-ui', customRules = null) {
 /**
  * Renders the priority rules as a prompt block the AI can follow.
  * @param {object} rules - Priority rules object
+ * @param {{ hasReference?: boolean }} [options]
  * @returns {string}
  */
-export function formatPriorityRulesPrompt(rules) {
+export function formatPriorityRulesPrompt(rules, options = {}) {
   const r = rules || DEFAULT_PRIORITY_RULES;
+  const hasReference = Boolean(options.hasReference);
   const lines = [
     '## PRIORITY RULES — DECISION HIERARCHY (MANDATORY)',
     '',
-    'The following defines which project is the source of truth for each aspect:',
-    '',
   ];
+
+  if (!hasReference) {
+    lines.push(
+      'No reference ZIP was attached. The UPLOADED SOURCE PROJECT is the only',
+      'source of truth for functionality, UI, page structure, branding, and features.',
+      'For architecture and coding conventions, use idiomatic target-framework patterns',
+      '(standalone Angular under src/app, or Vite React). Do NOT invent a starter-kit',
+      'core/shared/store/auth tree, and do NOT "reuse" components that do not exist.',
+      '',
+      'Decision hierarchy (source = uploaded project; conventions = target framework):',
+      ''
+    );
+    for (const [aspect, source] of Object.entries(r.sourceOfTruth || {})) {
+      const label = aspect
+        .replace(/([A-Z])/g, ' $1')
+        .replace(/^./, (c) => c.toUpperCase());
+      const fromSource = source === 'react' || source === 'source';
+      lines.push(
+        `- ${label}: ${fromSource ? 'Uploaded source project' : 'Idiomatic target-framework conventions (no reference project)'}`
+      );
+    }
+    lines.push('');
+    lines.push('INVARIANTS (never violate):');
+    lines.push('- Convert the full source app — do not drop pages or features');
+    lines.push('- Do not change business behavior unless the user asked');
+    lines.push('- Do not redesign UI unless the user asked');
+    lines.push('- Preserve API, validation, loading/error/empty, and responsive behavior');
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  lines.push('The following defines which project is the source of truth for each aspect:', '');
   for (const [aspect, source] of Object.entries(r.sourceOfTruth || {})) {
     const label = aspect
       .replace(/([A-Z])/g, ' $1')

@@ -108,31 +108,7 @@ export const WEB_ANGULAR_PROTECTED_FILES = new Set([
   'src/index.html'
 ]);
 
-export function isWebAngularProtectedPath(relativePath) {
-  const p = String(relativePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
-  if (WEB_ANGULAR_PROTECTED_FILES.has(p)) return true;
-  if (WEB_ANGULAR_PROTECTED_PREFIXES.some((prefix) => p.startsWith(prefix))) {
-    return true;
-  }
-  // Barrel files at shared/core/store root that belong to the kit
-  if (
-    p === 'src/app/shared/components/index.ts' ||
-    p === 'src/app/shared/directives/index.ts' ||
-    p === 'src/app/shared/pipes/index.ts' ||
-    p === 'src/app/shared/validators/index.ts' ||
-    p === 'src/app/shared/utilities/index.ts' ||
-    p === 'src/app/shared/animations/index.ts' ||
-    p === 'src/app/store/index.ts' ||
-    p === 'src/app/core/interceptors/index.ts' ||
-    p === 'src/app/core/services/index.ts' ||
-    p === 'src/app/core/guards/index.ts' ||
-    p === 'src/app/core/http/index.ts' ||
-    p === 'src/app/core/resolvers/index.ts' ||
-    p === 'src/app/core/authentication/index.ts' ||
-    p === 'src/app/core/layouts/admin/index.ts' ||
-    p === 'src/app/core/layouts/auth/index.ts'
-  ) {
-    return true;
-  }
+export function isWebAngularProtectedPath(_relativePath) {
+  // Starter-kit paths are no longer protected — convert every source file.
   return false;
 }

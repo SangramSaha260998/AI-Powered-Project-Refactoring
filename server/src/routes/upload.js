@@ -6,7 +6,7 @@ import { upload } from '../middleware/upload.js';
 import { validateProjectFramework } from '../services/validator.js';
 import { removeDirectoryRecursive, removeFile, ensureDirectoryExists } from '../utils/file.js';
 import { EXTRACT_DIR, UPLOAD_DIR, getProviderIds, PROVIDERS } from '../config/index.js';
-import { runMigrationPipeline, runReworkPipeline } from '../services/migration.js';
+import { runMigrationPipeline, runReworkPipeline, ConversionPausedError, AllProvidersRateLimitedError, readCheckpoint, clearCheckpoint } from '../services/migration.js';
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from '../services/analyzer.js';
 
 // Ensure the extract and upload directories exist at startup
@@ -14,46 +14,64 @@ ensureDirectoryExists(EXTRACT_DIR);
 ensureDirectoryExists(UPLOAD_DIR);
 
 /**
- * Clear leftover contents of the extracted/ folder.
- * Called before each new extraction to ensure a clean slate.
+ * Clear leftover uploads and extracted work that does not belong to a live project.
  *
- * IMPORTANT: a live created project is NEVER auto-deleted. Any folder/file
- * belonging to a session that has a persisted {sessionId}-project.json meta
- * file (extracted source, converted project, final ZIPs) is kept on disk.
- * Those artifacts can only be removed via DELETE /api/project/:sessionId
- * (the "Clear Extracted Folder" button in the UI).
- * Note: uploads/ is NOT cleared here because multer saves the file there
- * before this function runs. Individual upload files are cleaned up after processing.
+ * A live created project (anything matching {sessionId}-project.json) is kept.
+ * Those artifacts can only be removed via DELETE /api/project/:sessionId.
+ *
+ * @param {string[]} [keepUploadPaths] - Upload files to keep (the ZIP just received).
  */
-function clearWorkFolders() {
-  // Clear extracted folder only (uploads/ is cleaned up individually after processing)
-  if (!fs.existsSync(EXTRACT_DIR)) return;
-  try {
-    // Sessions with a persisted project meta file are "live" created projects.
-    const liveSessions = new Set(
-      fs.readdirSync(EXTRACT_DIR)
-        .filter((name) => name.endsWith('-project.json'))
-        .map((name) => name.replace(/-project\.json$/, ''))
-    );
-    const items = fs.readdirSync(EXTRACT_DIR);
-    for (const item of items) {
-      const isLive =
-        liveSessions.has(item) ||
-        [...liveSessions].some((id) => item.startsWith(`${id}-`));
-      if (isLive) continue;
-      const fullPath = path.join(EXTRACT_DIR, item);
-      const stat = fs.statSync(fullPath);
-      if (stat.isDirectory()) {
-        fs.rmSync(fullPath, { recursive: true, force: true });
-      } else {
-        fs.unlinkSync(fullPath);
+function clearWorkFolders(keepUploadPaths = []) {
+  if (fs.existsSync(EXTRACT_DIR)) {
+    try {
+      const liveSessions = new Set(
+        fs.readdirSync(EXTRACT_DIR)
+          .filter((name) => name.endsWith('-project.json'))
+          .map((name) => name.replace(/-project\.json$/, ''))
+      );
+      const items = fs.readdirSync(EXTRACT_DIR);
+      for (const item of items) {
+        const isLive =
+          liveSessions.has(item) ||
+          [...liveSessions].some((id) => item.startsWith(`${id}-`));
+        if (isLive) continue;
+        const fullPath = path.join(EXTRACT_DIR, item);
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(fullPath);
+        }
       }
+    } catch (err) {
+      console.warn('[Cleanup] Failed to clear extracted/:', err.message);
     }
-    console.log('[Cleanup] Cleared extracted/ folder (created projects kept)');
-  } catch (err) {
-    console.warn('[Cleanup] Failed to clear extracted/:', err.message);
   }
+
+  if (fs.existsSync(UPLOAD_DIR)) {
+    try {
+      const keep = new Set(
+        keepUploadPaths.filter(Boolean).map((p) => path.resolve(p).toLowerCase())
+      );
+      for (const name of fs.readdirSync(UPLOAD_DIR)) {
+        const fullPath = path.join(UPLOAD_DIR, name);
+        if (keep.has(path.resolve(fullPath).toLowerCase())) continue;
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(fullPath);
+        }
+      }
+    } catch (err) {
+      console.warn('[Cleanup] Failed to clear uploads/:', err.message);
+    }
+  }
+
+  console.log('[Cleanup] Cleared leftover uploads and extracted folders (live projects kept)');
 }
+
+clearWorkFolders();
 
 /**
  * Validates a sessionId supplied via the URL so it cannot escape EXTRACT_DIR
@@ -108,6 +126,61 @@ function writeProjectMeta(sessionId, meta) {
   }
 }
 
+function resumeInfo(sessionId, meta = {}) {
+  const cp = readCheckpoint(sessionId) || {};
+  const live = sessionStatus.get(sessionId);
+  const unitTotal = (Array.isArray(cp.units) && cp.units.length) || meta.unitTotal || 0;
+  const completedUnitIndex = cp.completedUnitIndex ?? meta.completedUnitIndex ?? -1;
+  const running = live && (live.status === 'queued' || live.status === 'running');
+  const resumable =
+    !running &&
+    unitTotal > 0 &&
+    completedUnitIndex < unitTotal - 1;
+  return {
+    resumable,
+    paused: Boolean(cp.paused || meta.paused || live?.status === 'paused') && resumable,
+    completedUnitIndex,
+    unitTotal,
+  };
+}
+
+function isResumablePauseError(sessionId, error) {
+  if (error instanceof ConversionPausedError) return true;
+  if (!(error instanceof AllProvidersRateLimitedError)) return false;
+  const cp = readCheckpoint(sessionId);
+  return Array.isArray(cp?.units) && cp.units.length > 0;
+}
+
+function markSessionPaused(sessionId, error, extra = {}) {
+  const cp = readCheckpoint(sessionId) || {};
+  const errMsg = error?.message || 'Free-tier limit reached. Progress is saved.';
+  const completedUnitIndex = error?.completedUnitIndex ?? cp.completedUnitIndex ?? -1;
+  const unitTotal = error?.unitTotal || cp.units?.length || 0;
+  setSession(sessionId, {
+    status: 'paused',
+    message: errMsg,
+    phase: 'paused',
+    error: errMsg,
+    unitIndex: completedUnitIndex + 1,
+    unitTotal,
+  });
+  writeProjectMeta(sessionId, {
+    sessionId,
+    fromTech: extra.fromTech,
+    toTech: extra.toTech,
+    aiProvider: extra.aiProvider,
+    aiModel: extra.aiModel,
+    projectName: extra.projectName || deriveProjectName(extra.convertedPath, extra.toTech),
+    createdAt: extra.createdAt || Date.now(),
+    updatedAt: Date.now(),
+    resumable: true,
+    paused: true,
+    completedUnitIndex,
+    unitTotal,
+  });
+  console.warn(`[${sessionId}] Conversion paused (resumable):`, errMsg);
+}
+
 /**
  * In-memory map of session IDs to their final ZIP paths.
  * Populated when a migration completes successfully so the
@@ -126,7 +199,7 @@ const sessionFailed = new Set();
 /**
  * Live migration job status for async POST /migrate + GET /migrate/:id/status.
  * @typedef {{
- *   status: 'queued' | 'running' | 'completed' | 'failed',
+ *   status: 'queued' | 'running' | 'completed' | 'failed' | 'paused',
  *   message: string,
  *   phase?: string,
  *   unitIndex?: number,
@@ -189,8 +262,8 @@ router.post('/upload', upload.single('projectZip'), (req, res) => {
     return res.status(400).json({ error: 'Please upload a valid ZIP file.' });
   }
 
-  // Clear extracted/ folder before starting new extraction
-  clearWorkFolders();
+  // Drop leftover uploads/extracts before this new extraction
+  clearWorkFolders([req.file.path]);
 
   const fromTech = req.body.fromTech || 'Unknown';
   const toTech = req.body.toTech || 'Unknown';
@@ -535,9 +608,15 @@ router.get('/visual-qa/:sessionId', (req, res) => {
   }
   try {
     const report = JSON.parse(fs.readFileSync(reportPath, 'utf-8'));
-    // Make image paths relative-serveable: prefix with the QA dir
+    // Paths must be relative to the QA dir — GET /files/:sessionId/:filePath
+    // already joins under {sessionId}-visual-qa/.
     const toRelativeUrl = (p) => {
-      const rel = path.relative(EXTRACT_DIR, p).replace(/\\/g, '/');
+      if (!p) return null;
+      const abs = path.resolve(String(p));
+      let rel = path.relative(qaDir, abs).replace(/\\/g, '/');
+      if (!rel || rel.startsWith('..')) {
+        rel = path.basename(abs);
+      }
       return `/api/files/${sessionId}/${rel}`;
     };
     const enriched = {
@@ -602,6 +681,20 @@ router.get('/migrate/:sessionId/status', (req, res) => {
         downloadUrl: `/api/download/${sessionId}`,
       });
     }
+    const meta = readProjectMeta(sessionId) || {};
+    const info = resumeInfo(sessionId, meta);
+    if (info.resumable) {
+      return res.json({
+        sessionId,
+        status: 'paused',
+        message: 'Free-tier limit reached. Progress is saved. Click Continue to resume.',
+        phase: 'paused',
+        resumable: true,
+        unitIndex: info.completedUnitIndex + 1,
+        unitTotal: info.unitTotal,
+        completedUnitIndex: info.completedUnitIndex,
+      });
+    }
     return res.status(404).json({ error: `Session "${sessionId}" not found.` });
   }
 
@@ -622,6 +715,11 @@ router.get('/migrate/:sessionId/status', (req, res) => {
   }
   if (live.status === 'failed') {
     payload.error = live.error || 'Migration failed.';
+  }
+  if (live.status === 'paused') {
+    payload.resumable = true;
+    payload.error = live.error || live.message;
+    payload.completedUnitIndex = Math.max(-1, (live.unitIndex || 1) - 1);
   }
 
   return res.json(payload);
@@ -675,6 +773,8 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
   const extractPath = path.join(EXTRACT_DIR, id);
   const convertedPath = path.join(EXTRACT_DIR, `${id}-converted`);
   const outputZipPath = path.join(EXTRACT_DIR, `${id}-final.zip`);
+
+  clearWorkFolders([zipFile.path, referenceZip?.path].filter(Boolean));
 
   // Quick pre-check: unpack just enough to validate source framework before spending AI tokens
   const preExtractPath = path.join(EXTRACT_DIR, `${id}-precheck`);
@@ -811,9 +911,19 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
         referencePath: referenceZip ? referenceZip.path : null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        resumable: false,
+        paused: false,
       });
       console.log(`[${id}] Migration completed asynchronously. Download at GET /api/download/${id}`);
+      if (zipFile?.path) removeFile(zipFile.path);
+      if (referenceZip?.path) removeFile(referenceZip.path);
     } catch (error) {
+      if (isResumablePauseError(id, error)) {
+        markSessionPaused(id, error, { fromTech, toTech, aiProvider, aiModel, convertedPath });
+        if (zipFile?.path) removeFile(zipFile.path);
+        if (referenceZip?.path) removeFile(referenceZip.path);
+        return;
+      }
       sessionFailed.add(id);
       const errMsg = error?.message || 'The Agentic processing loop failed.';
       setSession(id, {
@@ -885,6 +995,7 @@ router.get('/project/latest', (req, res) => {
         aiModel: meta.aiModel || '',
         createdAt: meta.createdAt || null,
         updatedAt: meta.updatedAt || null,
+        ...resumeInfo(sessionId, meta),
       };
     }
   }
@@ -915,6 +1026,168 @@ router.get('/project/:sessionId', (req, res) => {
     aiModel: meta.aiModel || '',
     createdAt: meta.createdAt || null,
     updatedAt: meta.updatedAt || null,
+    ...resumeInfo(sessionId, meta),
+  });
+});
+
+/**
+ * POST /api/project/:sessionId/resume
+ * Continues a conversion paused by a free-tier 429. No new ZIP required.
+ * Body: { aiProvider?: string, aiModel?: string }
+ */
+router.post('/project/:sessionId/resume', (req, res) => {
+  const { sessionId } = req.params;
+  if (!isValidSessionId(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+
+  const checkpoint = readCheckpoint(sessionId);
+  if (!checkpoint || !Array.isArray(checkpoint.units) || checkpoint.units.length === 0) {
+    return res.status(400).json({
+      error: 'Nothing to resume. Start a new conversion.',
+    });
+  }
+
+  const extractPath = path.join(EXTRACT_DIR, sessionId);
+  const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
+  if (!fs.existsSync(extractPath) || !fs.existsSync(convertedPath)) {
+    return res.status(404).json({
+      error: `No paused conversion found for session "${sessionId}".`,
+    });
+  }
+
+  const live = sessionStatus.get(sessionId);
+  if (live && (live.status === 'queued' || live.status === 'running')) {
+    return res.status(409).json({
+      error: 'Conversion is already running for this project.',
+      status: live.status,
+      message: live.message,
+    });
+  }
+
+  const meta = readProjectMeta(sessionId) || {};
+  const fromTech = checkpoint.fromTech || meta.fromTech || 'Unknown';
+  const toTech = checkpoint.toTech || meta.toTech || 'Unknown';
+  const aiProvider = (req.body.aiProvider || checkpoint.aiProvider || meta.aiProvider || 'genai').trim();
+  const aiModel = req.body.aiModel || checkpoint.aiModel || meta.aiModel || '';
+  const userPrompt = checkpoint.userPrompt || '';
+  const targetVersion = checkpoint.targetVersion || '';
+  const priorityRulesMode = checkpoint.priorityRulesMode || 'react-ui';
+
+  sessionFailed.delete(sessionId);
+  sessionDownloads.delete(sessionId);
+
+  setSession(sessionId, {
+    status: 'queued',
+    message: 'Resuming conversion...',
+    phase: 'queued',
+    zipFile: null,
+    extractPath,
+    convertedPath,
+  });
+  scheduleSessionExpiry(sessionId);
+
+  writeProjectMeta(sessionId, {
+    ...meta,
+    sessionId,
+    fromTech,
+    toTech,
+    aiProvider,
+    aiModel,
+    updatedAt: Date.now(),
+    resumable: true,
+    paused: false,
+    completedUnitIndex: checkpoint.completedUnitIndex ?? -1,
+    unitTotal: checkpoint.units.length,
+  });
+
+  res.status(202).json({
+    sessionId,
+    status: 'queued',
+    message: 'Resuming conversion from the last saved unit.',
+    statusUrl: `/api/migrate/${sessionId}/status`,
+    downloadUrl: `/api/download/${sessionId}`,
+  });
+
+  setImmediate(async () => {
+    try {
+      setSession(sessionId, {
+        status: 'running',
+        message: 'Resuming conversion from checkpoint...',
+        phase: 'resume',
+      });
+
+      const resultZipPath = await runMigrationPipeline(null, userPrompt, sessionId, {
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel: aiModel || undefined,
+        targetVersion: targetVersion || undefined,
+        priorityRulesMode,
+        resume: true,
+        onProgress: (progress) => {
+          setSession(sessionId, {
+            status: 'running',
+            message: progress.message || 'Migrating...',
+            phase: progress.phase || 'running',
+            unitIndex: progress.unitIndex,
+            unitTotal: progress.unitTotal,
+          });
+        },
+      });
+
+      sessionDownloads.set(sessionId, resultZipPath);
+      setSession(sessionId, {
+        status: 'completed',
+        message: 'Migration complete. Ready to download.',
+        phase: 'completed',
+        zipPath: resultZipPath,
+      });
+      writeProjectMeta(sessionId, {
+        sessionId,
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel,
+        projectName: deriveProjectName(convertedPath, toTech),
+        createdAt: meta.createdAt || Date.now(),
+        updatedAt: Date.now(),
+        resumable: false,
+        paused: false,
+      });
+      console.log(`[${sessionId}] Resume completed. Download at GET /api/download/${sessionId}`);
+    } catch (error) {
+      if (isResumablePauseError(sessionId, error)) {
+        markSessionPaused(sessionId, error, {
+          fromTech,
+          toTech,
+          aiProvider,
+          aiModel,
+          convertedPath,
+          createdAt: meta.createdAt,
+        });
+        return;
+      }
+      sessionFailed.add(sessionId);
+      const errMsg = error?.message || 'Resume failed.';
+      setSession(sessionId, {
+        status: 'failed',
+        message: 'Migration failed.',
+        phase: 'failed',
+        error: errMsg,
+      });
+      console.error(`[${sessionId}] Resume pipeline failed:`, error);
+      writeProjectMeta(sessionId, {
+        ...meta,
+        sessionId,
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel,
+        updatedAt: Date.now(),
+        migrationError: errMsg,
+      });
+    }
   });
 });
 
@@ -954,7 +1227,7 @@ router.post('/project/:sessionId/rework', (req, res) => {
   const meta = readProjectMeta(sessionId) || {};
   const fromTech = meta.fromTech || 'Unknown';
   const toTech = meta.toTech || 'Unknown';
-  const aiProvider = (req.body.aiProvider || meta.aiProvider || 'openrouter').trim();
+  const aiProvider = (req.body.aiProvider || meta.aiProvider || 'genai').trim();
   const aiModel = req.body.aiModel || meta.aiModel || '';
 
   setSession(sessionId, {
@@ -1042,6 +1315,16 @@ router.delete('/project/:sessionId', (req, res) => {
   if (!isValidSessionId(sessionId)) {
     return res.status(400).json({ error: 'Invalid session id.' });
   }
+
+  const live = sessionStatus.get(sessionId);
+  if (live && (live.status === 'queued' || live.status === 'running')) {
+    return res.status(409).json({
+      error: 'Conversion is still running. Wait for it to finish before clearing the project.',
+      status: live.status,
+      message: live.message,
+    });
+  }
+
   const extractPath = path.join(EXTRACT_DIR, sessionId);
   const convertedPath = path.join(EXTRACT_DIR, `${sessionId}-converted`);
   const finalZip = path.join(EXTRACT_DIR, `${sessionId}-final.zip`);
@@ -1054,6 +1337,7 @@ router.delete('/project/:sessionId', (req, res) => {
   removeFile(finalZip);
   removeFile(reworkZip);
   removeFile(metaPath);
+  clearCheckpoint(sessionId);
 
   sessionDownloads.delete(sessionId);
   sessionFailed.delete(sessionId);

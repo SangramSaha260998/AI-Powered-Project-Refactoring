@@ -2,96 +2,22 @@
  * Default / master prompts appended after the user's migration prompt.
  *
  * Priority order the AI must obey:
- *   1. EXTRACTED BRANDING from uploaded project source files (name, colors, fonts, title)
- *   2. USER PROMPT (titles, colors, scope, branding, copy) — highest
+ *   1. USER PROMPT (titles, colors, scope, branding, copy)
+ *   2. EXTRACTED BRANDING from uploaded project source (when the user did not override)
  *   3. Direction-specific rules below (anti-hallucination + structure)
- *   4. Source code — only as material to convert; never invent missing APIs
+ *   4. Source code — convert it; never invent missing APIs
  */
 
 /** Shared preamble for every migration direction. */
 export const NO_HALLUCINATION_PREAMBLE = `
-## EXTRACT BRANDING FROM UPLOADED PROJECT — HIGHEST PRIORITY
-
-**MANDATORY**: Before writing ANY code, READ the uploaded source files and EXTRACT:
-
-### Project Name — EXTRACT FROM THESE FILES:
-1. **package.json** → \`name\` field (e.g., \"my-cool-app\")
-2. **index.html** → \`<title>\` tag (e.g., \"My Cool App\")
-3. **Root component meta tags**:
-   - React: \`__root.tsx\` → title in \`head()\` config
-   - Angular: \`app.component.ts\` → meta tags
-4. **HTML meta tags**: og:title, twitter:title, description
-5. **README.md** → first heading
-
-Use the EXTRACTED name (humanized with spaces) for:
-- \`<title>\` in index.html
-- \`appTitle\` in app-settings.config.ts
-- \`public title\` in app.component.ts
-- Package name in package.json (lowercase, hyphenated)
-
-**DO NOT** use hardcoded defaults like \"Angular Project\" or \"Tanstack Start TS\"
-
-### Design Colors — EXTRACT FROM THESE FILES:
-1. **tailwind.config.js/ts** → theme.colors (primary, secondary, accent, etc.)
-2. **CSS/SCSS variables** → look for:
-   - --primary, --color-primary, --bg-primary
-   - --secondary, --color-secondary
-   - --accent, --color-accent
-   - oklch(), hsl(), rgb(), hex values
-3. **React CSS variables** → styles.css :root section
-4. **SCSS variables** → $primary, $secondary, $color-*
-5. **Inline styles** in components
-
-Use the EXTRACTED colors for:
-- \`tailwind.config.js\` → theme.colors.primary, secondary, tertiary
-- \`app.component.html\` → loading bar [color]
-- Any other color references
-
-**DO NOT** use hardcoded defaults like \"#0788C0\" — use the EXTRACTED colors
-
-Example extraction from React styles.css:\n  --primary: oklch(0.6 0.22 22);  /* This is a red color */\n  --secondary: oklch(0.96 0.02 20);  /* This is a light color */\n  Convert to hex: #E63946 (primary red), #F5F0EB (secondary light)
-
-### Fonts — EXTRACT FROM THESE FILES:
-1. **index.html** → Google Fonts \`<link>\` tag
-2. **CSS/SCSS** → font-family declarations
-3. **tailwind.config.js** → theme.fontFamily
-4. **Inline styles** in components
-
-Use the EXTRACTED fonts in the new project's:
-- index.html Google Fonts link
-- tailwind.config.js fontFamily settings
-
-Example extraction:\n  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />\n  → Use Inter as the primary font
-
-### Design Tokens & Variables — EXTRACT FROM THESE FILES:
-1. **CSS/SCSS files** → CSS custom properties (--radius, --spacing, etc.)
-2. **tailwind.config.js** → theme.extend section
-3. **Theme configuration files** if any
-4. **SCSS partials** → _variables.scss, _mixins.scss
-
-Apply these to the new project where applicable.
-
----
-
-## AFTER EXTRACTION: Apply to new project
-
-1. Update \`package.json\` → name field
-2. Update \`index.html\` → title, fonts
-3. Update \`tailwind.config.js\` → colors, fonts
-4. Update \`app.component.ts\` → title
-5. Update \`app.component.html\` → loading bar color
-6. Update \`app-settings.config.ts\` → appTitle
-
-**NEVER skip extraction** — always read source files first.
-
----
-
-## USER PROMPT FIRST — NO HALLUCINATION (applied automatically)
+## USER PROMPT FIRST, THEN SOURCE BRANDING
 
 1. Follow the USER's migration prompt exactly. Their titles, colors, themes,
-   branding, copy, and scope overrides are highest priority.
-2. EXTRACTED BRANDING from uploaded source files takes precedence over defaults
-   but can be overridden by explicit user prompt instructions.
+   branding, copy, and scope overrides win.
+2. If the user did not override branding, EXTRACT name, colors, and fonts from
+   the uploaded source (package.json name, index.html title, CSS/Tailwind tokens)
+   and apply them in the converted app. Do not invent a generic "Angular Project" name
+   or default blue unless the source actually uses them.
 3. Do NOT invent npm packages, exports, modules, components, props, hooks,
    decorators, or APIs that do not exist in the real target framework / npm.
 4. Do NOT invent files, routes, or features the user did not ask for and that
@@ -101,12 +27,24 @@ Apply these to the new project where applicable.
 6. Output must compile and run after npm install → ng serve / npm start.
    No dangling imports, placeholders like "// TODO implement", or truncated files.
 
+### Where to read branding from the upload
+- Name: package.json \`name\`, index.html \`<title>\`, root component title/meta
+- Colors: tailwind.config.*, CSS/SCSS variables, :root tokens
+- Fonts: index.html Google Fonts links, font-family in CSS, tailwind fontFamily
+
+Apply extracted values to the converted project's index.html, tailwind config,
+root component title, and package.json name. There is no starter-kit
+app-settings.config.ts unless you create it because the source needs it.
+
+---
+
 ## TARGET VERSIONS (applied automatically — all conversions)
 
 Version selection rule:
 1. If the USER PROMPT specifies an Angular or React version (e.g. "Angular 20",
    "React 18.3", "version 20" while Angular is the target) → use THAT version.
 2. Otherwise use the latest stable defaults (currently Angular 22 / React 19).
+   A UI-selected version is injected as [VERSION INSTRUCTION] and counts as (1).
 
 The concrete pins are in the TARGET VERSION MANDATE block appended after this
 prompt — obey THAT block for package.json and APIs. Do not invent a different major.
@@ -125,26 +63,21 @@ prompt — obey THAT block for package.json and APIs. Do not invent a different 
   or a few \`@apply\` / nesting rules only when truly needed).
 - Global entry: Angular \`src/styles.scss\`; React \`src/index.scss\` (with \`@tailwind\` layers).
 
-### Angular best structure (mirrors the web_angular template — keep it)
+### Angular structure
 \`\`\`
 src/
   main.ts
   index.html
   styles.scss
-  environments/     # from web_angular template (keep)
+  environments/
   app/
     app.component.ts|html|scss
-    app.config.ts   # from web_angular template (keep — wires interceptors, NGXS, toastr)
+    app.config.ts
     app.routes.ts
-    config/         # appSettings (keep from template)
-    core/           # auth, guards, http, interceptors, layouts, services (keep from template)
-    shared/         # components, directives, pipes, validators, utilities, models, animations (keep from template)
-    store/          # NGXS (keep from template)
-    pages/
-      common/       # not-found, forbidden (keep from template)
-      deeplink/     # redirects (keep from template)
-      auth/         # login, forgot-password, enter-otp, reset-password, create-new-password (functionalize)
-      admin/        # dashboard + any new features (functionalize / create)
+    pages/          # every converted feature/page
+    components/     # shared UI from the source
+    services/       # services / hooks converted from the source
+    lib/            # utils
 \`\`\`
 - One feature per folder. Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
 - \`styleUrl: './name.component.scss'\` (never \`.css\`).
@@ -152,13 +85,8 @@ src/
 - Clear names, small focused components, no dead code, no unused imports.
 - Strict typing; no \`any\` unless unavoidable. Public template API only
   (public/protected — never private in templates).
-- When targeting Angular, the complete \`web_angular\` template project is already injected
-  (src/app/config, core, shared, store, pages/common, pages/deeplink, app.config.ts, environments,
-  public/scss design system) plus npm deps (\`@angular/material\`, \`@angular/cdk\`, \`@ngxs/store\`,
-  \`@ngxs/logger-plugin\`, \`ngx-toastr\`, \`ngx-cookie-service\`, \`@ngx-loading-bar/core\`, \`bowser\`,
-  \`moment\`, \`crypto-js\`). Reuse those modules; keep the same folder layout. Only the auth pages
-  (src/app/pages/auth/**) and dashboard (src/app/pages/admin/**) are functionalized from the source
-  project — everything else stays exactly as the template provides it.
+- Convert EVERY source feature. Do not keep a starter-kit tree. Do not drop
+  pages to "auth + dashboard only" unless the user explicitly asks.
 
 ### React best structure
 \`\`\`
@@ -182,102 +110,38 @@ src/
 `;
 
 /**
- * Angular → Angular (same framework): strip down to auth + dashboard.
+ * Angular → Angular (same framework): convert the full app.
  */
 export const ANGULAR_TO_ANGULAR_PROMPT = `
-## ANGULAR → ANGULAR STRIP-DOWN (applied automatically)
+## ANGULAR → ANGULAR COMPLETE CONVERSION (applied automatically)
 
-### BRANDING EXTRACTION (MANDATORY)
-Before stripping down, READ the uploaded Angular project and extract:
-- Project name from package.json, index.html <title>, meta tags
-- Colors from tailwind.config.js, CSS variables, SCSS variables
-- Fonts from Google Fonts links, font-family declarations
-Apply these to the new project — do NOT use defaults.
+Convert the FULL uploaded Angular project. Do not strip features.
 
-STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
-
-### DELETE all components/files EXCEPT:
-- Auth module/folder — login, registration, forgot password, OTP verification, password reset, etc.
-- Dashboard component and its sub-components (charts, stats, widgets)
-- Core app shell — App component, routing, main layout wrapper
-- Shared services — auth service, HTTP interceptors, route guards, token storage
-- Configuration files — package.json, angular.json, tsconfig.json, tsconfig.app.json, etc.
-- Global styles — src/styles.scss (Tailwind entry)
-
-### REMOVE these pages/components ENTIRELY:
-- Profile/settings/user-management (unless critical for auth flow)
-- Listing/table/CRUD pages for books, products, users, items, etc.
-- Blog, about, contact, landing, or marketing pages
-- Admin-only pages (unless they are the dashboard itself)
-- Demo, placeholder, template, or skeleton components
-- Feature modules unrelated to auth or dashboard
-
-### UPDATE routing:
-- Login as default/landing route ('' or '/login')
-- Registration and forgot-password as accessible routes
-- Dashboard as post-login home ('/dashboard')
-- Auth guard protecting dashboard and authenticated routes
-
-### PRESERVE:
-- npm dependencies in package.json (do not remove packages)
-- Config files (angular.json, tsconfig.json, etc.)
-- Shared services, guards, and interceptors that support auth
-
-### Final app MUST be immediately runnable:
-- npm install → ng serve
-- Working login/register with validation
-- Working dashboard after login
-- No dangling imports, missing modules, or broken routing
-- Delete unused component files — do not leave orphans
-- Stay on real **Angular 22** APIs only (standalone components, CommonModule from
-  @angular/common, Router from @angular/router, signals/inject where appropriate).
-  Use feature folders under src/app (core / shared / features). Do not invent packages.
+- Keep every page, component, service, guard, interceptor, and route that exists in the source
+  (unless the USER PROMPT explicitly asks to remove something).
+- Preserve branding extracted from the source (name, colors, fonts, titles).
+- Use standalone components, templateUrl/styleUrl triads, Tailwind in HTML, .scss style files.
+- Final app MUST be runnable: npm install → ng serve
+- Stay on real Angular APIs only. Do not invent packages.
 `;
 
 /** @deprecated Use ANGULAR_TO_ANGULAR_PROMPT — kept for older imports. */
 export const DEFAULT_STRIP_DOWN_PROMPT = ANGULAR_TO_ANGULAR_PROMPT;
 
 /**
- * React → React (same framework): strip down to auth + dashboard.
+ * React → React (same framework): convert the full app.
  */
 export const REACT_TO_REACT_PROMPT = `
-## REACT → REACT STRIP-DOWN (applied automatically)
+## REACT → REACT COMPLETE CONVERSION (applied automatically)
 
-STRIP DOWN THE PROJECT — KEEP ONLY AUTH + DASHBOARD:
+Convert the FULL uploaded React project. Do not strip features.
 
-### DELETE all components/files EXCEPT:
-- Auth — login, registration, forgot password, OTP, password reset, etc.
-- Dashboard and its sub-components (charts, stats, widgets)
-- Core app shell — App, router setup, main layout
-- Shared logic — auth context/hooks, API client, route guards/protected routes
-- Configuration — package.json, vite.config / next config, tsconfig, etc.
-- Global styles
-
-### REMOVE entirely:
-- Profile/settings/user-management (unless critical for auth)
-- CRUD/listing pages, blog, about, contact, landing, marketing
-- Admin-only pages (unless they are the dashboard)
-- Demo / placeholder / skeleton components
-- Features unrelated to auth or dashboard
-
-### UPDATE routing:
-- Login as default route
-- Register + forgot-password accessible
-- Dashboard as post-login home
-- Protected route wrapper for authenticated pages
-
-### PRESERVE:
-- package.json dependencies (do not strip packages arbitrarily)
-- Build/config files
-- Auth-related hooks, context, and API helpers
-
-### Final app MUST be immediately runnable:
-- npm install → npm start / vite
-- Working login/register + dashboard
-- **React 19** functional components + hooks only. No Angular leftovers
-  (@Component, templateUrl, NgModule). No invented packages.
-- Main entry: src/main.tsx → src/App.tsx (not src/app/app.tsx).
-- Use components/, features/, hooks/, lib/, services/ layout. Delete unused files.
+- Keep every page, component, hook, context, and route from the source
+  (unless the USER PROMPT explicitly asks to remove something).
+- Preserve branding extracted from the source.
+- Functional components + hooks, Vite + TypeScript, Tailwind in JSX, .scss style files.
+- Main entry: src/main.tsx → src/App.tsx.
+- Final app MUST be runnable: npm install → npm start / vite
 `;
 
 /**
@@ -287,6 +151,8 @@ export const DEFAULT_CROSS_FRAMEWORK_PROMPT = `
 ## CROSS-FRAMEWORK BASELINE (applied automatically)
 
 Convert features to idiomatic target-framework code.
+Convert the FULL source app — every page, component, route, and service.
+Do NOT strip the project down to auth + dashboard unless the user explicitly asks.
 USER MIGRATION MANDATE IS HIGHEST PRIORITY for titles, colors, theme, branding.
 Do not keep source defaults when the user asked to change them.
 Prefer official framework APIs and plain custom components over invented wrappers.
@@ -337,12 +203,11 @@ export const REACT_TO_ANGULAR_PROMPT = `
 Before generating code, READ the uploaded React project files and extract:
 
 1. **Project Name**: From package.json name, index.html <title>, or meta tags
-   → Apply to: index.html <title>, app-settings.config.ts appTitle,
-   app.component.ts title, package.json name
+   → Apply to: index.html <title>, app.component.ts title, package.json name
 
 2. **Colors**: From tailwind.config.js theme.colors or CSS variables
-   → Apply to: tailwind.config.js (primary, secondary, tertiary colors),
-   app.component.html loading bar [color]
+   → Apply to: tailwind.config.js (primary, secondary, tertiary colors)
+   and the same tokens in converted templates
 
 3. **Fonts**: From index.html Google Fonts link or CSS font-family
    → Apply to: index.html Google Fonts link, tailwind.config.js fontFamily
@@ -381,7 +246,7 @@ Do NOT use default project names — use the EXTRACTED name.
 
 ### Angular quality
 - Target the mandated Angular version APIs only (signals, inject(), standalone, @if/@for).
-- Follow page-folder structure under src/app/pages (common|auth|admin) plus core|shared.
+- Follow page-folder structure under src/app/pages plus components/services as needed.
 - Strong typing; matching .ts/.html/.scss; Tailwind in templates; no hallucinated modules.
 - Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
 - Always \`export const routes\` from app.routes.ts (never unexported \`const routes\`).
@@ -432,15 +297,15 @@ Do NOT use default project names — use the EXTRACTED name.
 /**
  * Incremental migration blueprint prompt — instructs the AI to create an
  * ordered plan from leaf nodes (no dependencies) to root nodes.
- * Used for BOTH cross-framework conversion and same-framework strip-down.
+ * Used for BOTH cross-framework conversion and same-framework conversion.
  */
 export const INCREMENTAL_BLUEPRINT_PROMPT = `
 ## INCREMENTAL MIGRATION BLUEPRINT — DEPENDENCY ORDER (applied automatically)
 
-You are creating an INCREMENTAL migration plan. The uploaded project must be
-converted in SMALL PIECES, ordered from SMALLEST/SIMPLEST to LARGEST/MOST COMPLEX.
-The runtime will write one logical UNIT at a time, run a build, and only proceed
-after that unit compiles.
+You are creating an INCREMENTAL migration plan. Convert the FULL uploaded project.
+The runtime writes one logical UNIT per AI call (Angular .ts+.html+.scss together).
+Compile checks run periodically and again at the end — do not assume every unit
+is built before the next one is planned.
 
 ### Ordering Rules (MANDATORY):
 1. **Leaf nodes first**: Files with NO dependencies on other app files
@@ -466,48 +331,39 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
   "incrementalPlan": [
     {
       "step": 1,
-      "newPath": "src/app/shared/utils/format.ts",
+      "newPath": "src/lib/format.ts",
       "explanationOfSource": "Port utility (leaf — no app deps)",
-      "approximateSourceFilesToRead": ["src/lib/utils/format.ts"],
+      "approximateSourceFilesToRead": ["src/lib/format.ts"],
       "dependencies": [],
       "complexity": "low",
-      "unit": "src/app/shared/utils/format.ts"
+      "unit": "src/lib/format.ts"
     },
     {
       "step": 2,
-      "newPath": "src/app/core/services/auth.service.ts",
-      "explanationOfSource": "Port auth service",
-      "approximateSourceFilesToRead": ["src/contexts/AuthContext.tsx"],
-      "dependencies": ["src/app/shared/utils/format.ts"],
-      "complexity": "medium",
-      "unit": "src/app/core/services/auth.service.ts"
+      "newPath": "src/app/pages/admin-users/admin-users.component.ts",
+      "explanationOfSource": "Admin users page TypeScript",
+      "approximateSourceFilesToRead": ["src/routes/admin-users.tsx"],
+      "dependencies": ["src/lib/format.ts"],
+      "complexity": "high",
+      "unit": "src/app/pages/admin-users/admin-users.component"
     },
     {
       "step": 3,
-      "newPath": "src/app/pages/auth/login/login.component.ts",
-      "explanationOfSource": "Login page TypeScript",
-      "approximateSourceFilesToRead": ["src/pages/Login.tsx"],
-      "dependencies": ["src/app/core/services/auth.service.ts"],
-      "complexity": "medium",
-      "unit": "src/app/pages/auth/login/login.component"
+      "newPath": "src/app/pages/admin-users/admin-users.component.html",
+      "explanationOfSource": "Admin users page template",
+      "approximateSourceFilesToRead": ["src/routes/admin-users.tsx"],
+      "dependencies": ["src/lib/format.ts"],
+      "complexity": "high",
+      "unit": "src/app/pages/admin-users/admin-users.component"
     },
     {
       "step": 4,
-      "newPath": "src/app/pages/auth/login/login.component.html",
-      "explanationOfSource": "Login page template",
-      "approximateSourceFilesToRead": ["src/pages/Login.tsx"],
-      "dependencies": ["src/app/core/services/auth.service.ts"],
-      "complexity": "medium",
-      "unit": "src/app/pages/auth/login/login.component"
-    },
-    {
-      "step": 5,
-      "newPath": "src/app/pages/auth/login/login.component.scss",
-      "explanationOfSource": "Login page styles (minimal SCSS)",
+      "newPath": "src/app/pages/admin-users/admin-users.component.scss",
+      "explanationOfSource": "Admin users page styles (minimal SCSS)",
       "approximateSourceFilesToRead": [],
-      "dependencies": ["src/app/core/services/auth.service.ts"],
+      "dependencies": ["src/lib/format.ts"],
       "complexity": "low",
-      "unit": "src/app/pages/auth/login/login.component"
+      "unit": "src/app/pages/admin-users/admin-users.component"
     }
   ]
 }
@@ -520,11 +376,11 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
 - "dependencies" lists plan \`newPath\` values (or unit ids) that must exist before this file
 - "unit" groups sibling files of one component; identical \`unit\` for triad members
 - "complexity" must be one of: "low", "medium", "high"
-- Include ALL needed app files for the migration scope (not config: package.json, tsconfig, angular.json, vite.config)
+- Include ALL needed app files for the FULL source project (not config: package.json, tsconfig, angular.json, vite.config)
 - For Angular: always plan full .ts + .html + .scss triads with matching names
 - For React: plan .tsx (+ optional .scss)
-- Same-framework strip-down: only plan files that remain (auth + dashboard + shell); omit deleted features
-- Cover every file required for a runnable result within the user scope
+- Convert every source feature. Do NOT omit pages unless the user explicitly asked to delete them.
+- Cover every file required for a runnable result with the same functionality as the source
 - Output ONLY raw JSON — no markdown, no explanation, no backticks
 `;
 
@@ -562,7 +418,7 @@ export function getDefaultPrompt(fromTech, toTech) {
     return `${NO_HALLUCINATION_PREAMBLE}\n${DEFAULT_CROSS_FRAMEWORK_PROMPT}\n${ANGULAR_TO_REACT_PROMPT}`;
   }
 
-  // Same unknown framework — generic strip-down via Angular text is wrong;
+  // Same unknown framework — do not invent an Angular strip-down.
   // fall back to no-hallucination + cross-framework baseline only.
   if (from && to && from === to) {
     return `${NO_HALLUCINATION_PREAMBLE}\n${DEFAULT_CROSS_FRAMEWORK_PROMPT}`;

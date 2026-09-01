@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "test": "node tests/postprocess.mjs && node tests/validation.mjs && node tests/health.mjs",
     "test:validation": "node tests/validation.mjs",
     "test:debug": "node tests/debug.mjs",
     "test:postprocess": "node tests/postprocess.mjs"

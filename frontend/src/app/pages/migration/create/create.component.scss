@@ -72,6 +72,16 @@
   }
 }
 
+.continue-action-btn {
+  flex: 1.4;
+}
+
+.pause-hint {
+  margin-top: 16px;
+  margin-bottom: 0;
+  color: var(--text-primary);
+}
+
 .prompt-textarea {
   width: 100%;
   box-sizing: border-box;

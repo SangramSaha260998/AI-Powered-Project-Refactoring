@@ -17,6 +17,8 @@ import {
   isProviderConfigured,
   isOllamaCloudMode,
   RATE_LIMIT_PAUSE_MS,
+  LLM_REQUEST_TIMEOUT_MS,
+  BUILD_EVERY_N_UNITS,
   MAX_BUILD_FIX_ATTEMPTS
 } from '../config/index.js';
 import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
@@ -24,11 +26,8 @@ import { getPriorityRules, formatPriorityRulesPrompt } from '../config/priorityR
 import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../config/targetVersions.js';
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
-import {
-  webAngularNpmDeps,
-  isWebAngularProtectedPath
-} from '../config/webAngular.js';import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil } from './postprocess.js';
+import { ensureDirectoryExists } from '../utils/file.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
 // Multi-key / multi-provider OpenAI clients — rotate keys, then providers
@@ -46,6 +45,67 @@ export class AllProvidersRateLimitedError extends Error {
 }
 
 /**
+ * Thrown when conversion pauses so the user can continue later (free-tier 429).
+ * Partial files stay on disk; a checkpoint lists the next unit to write.
+ */
+export class ConversionPausedError extends Error {
+  constructor(message, extra = {}) {
+    super(message);
+    this.name = 'ConversionPausedError';
+    this.status = 429;
+    this.resumable = true;
+    this.completedUnitIndex = extra.completedUnitIndex ?? -1;
+    this.unitTotal = extra.unitTotal ?? 0;
+  }
+}
+
+/**
+ * Thrown when conversion must not ship a ZIP (skipped units, stubs, or build failure).
+ */
+export class ConversionIncompleteError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConversionIncompleteError';
+  }
+}
+
+function checkpointFilePath(sessionId) {
+  return path.join(EXTRACT_DIR, `${sessionId}-checkpoint.json`);
+}
+
+export function readCheckpoint(sessionId) {
+  try {
+    const raw = fs.readFileSync(checkpointFilePath(sessionId), 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function writeCheckpoint(sessionId, data) {
+  try {
+    fs.writeFileSync(
+      checkpointFilePath(sessionId),
+      `${JSON.stringify({ ...data, sessionId, updatedAt: Date.now() }, null, 2)}\n`,
+      'utf-8'
+    );
+  } catch (err) {
+    console.warn(`[${sessionId}] Failed to write checkpoint:`, err.message);
+  }
+}
+
+export function clearCheckpoint(sessionId) {
+  try {
+    const p = checkpointFilePath(sessionId);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {
+    /* ignore */
+  }
+}
+
+const UNIT_SOURCE_CONTEXT_MAX_CHARS = 24000;
+
+/**
  * Errors that should rotate keys and/or move to the next provider.
  * Includes quota/auth codes, server errors, and network failures.
  */
@@ -59,6 +119,7 @@ function isFallbackWorthyError(err) {
     const reason = statusCode === 429 ? 'rate-limit' : 'quota/auth';
     return { worthy: true, statusCode, reason };
   }
+  if (statusCode === 404) return { worthy: true, statusCode, reason: 'model-missing' };
   if (statusCode >= 500 && statusCode < 600) return { worthy: true, statusCode, reason: 'server' };
 
   // Connection / DNS / timeout style failures (no HTTP status)
@@ -114,6 +175,16 @@ function getRetryAfterMs(err, fallbackMs) {
  * @param {string} [aiModel]
  * @returns {Array<{client: OpenAI, config: object}> | null}
  */
+function openaiClientOptions(cfg) {
+  return {
+    baseURL: cfg.baseURL,
+    apiKey: cfg.apiKey || 'placeholder',
+    timeout: LLM_REQUEST_TIMEOUT_MS,
+    maxRetries: 0,
+    ...(cfg.defaultHeaders ? { defaultHeaders: cfg.defaultHeaders } : {}),
+  };
+}
+
 function createClients(aiProvider = 'openrouter', aiModel) {
   const configs = getProviderConfigs(aiProvider, aiModel);
   const provConfig = PROVIDERS[aiProvider];
@@ -130,11 +201,7 @@ function createClients(aiProvider = 'openrouter', aiModel) {
         `Using a placeholder key for client initialization.`
       );
       return configs.map(cfg => ({
-        client: new OpenAI({
-          baseURL: cfg.baseURL,
-          apiKey: 'placeholder',
-          ...(cfg.defaultHeaders ? { defaultHeaders: cfg.defaultHeaders } : {}),
-        }),
+        client: new OpenAI(openaiClientOptions({ ...cfg, apiKey: cfg.apiKey || 'placeholder' })),
         config: cfg
       }));
     }
@@ -142,11 +209,7 @@ function createClients(aiProvider = 'openrouter', aiModel) {
   }
 
   return configs.map(cfg => ({
-    client: new OpenAI({
-      baseURL: cfg.baseURL,
-      apiKey: cfg.apiKey,
-      ...(cfg.defaultHeaders ? { defaultHeaders: cfg.defaultHeaders } : {}),
-    }),
+    client: new OpenAI(openaiClientOptions(cfg)),
     config: cfg
   }));
 }
@@ -260,10 +323,23 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
         }
 
         try {
-          const response = await client.chat.completions.create(requestOptions);
+          const response = await client.chat.completions.create(requestOptions, {
+            timeout: LLM_REQUEST_TIMEOUT_MS,
+            maxRetries: 0
+          });
           const content = response.choices?.[0]?.message?.content;
           if (content == null || String(content).trim() === '') {
             throw new Error('AI returned an empty response.');
+          }
+          const lowered = String(content).toLowerCase();
+          if (
+            lowered.includes('upstream error') ||
+            lowered.includes('temporarily overloaded') ||
+            lowered.includes('provider returned error')
+          ) {
+            const bogus = new Error('AI returned an upstream/provider error payload.');
+            bogus.status = 503;
+            throw bogus;
           }
           if (providerIndex > 0 || keyIndex > 0 || modelIndex > 0) {
             console.log(
@@ -278,7 +354,7 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
 
           // Key-level failures (bad/missing auth, exhausted billing quota) —
           // no model change can fix these, so skip straight to the next key.
-          if (statusCode === 401 || statusCode === 402) {
+          if (statusCode === 401 || statusCode === 402 || statusCode === 403) {
             console.warn(
               `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
               `failed (${reason}: ${statusCode}). Moving to next key...`
@@ -292,7 +368,7 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           // Limit crossed for THIS (key, model) pair → try the next free model
           // on the same API key before touching other keys/providers.
           if (modelIndex < totalModels - 1) {
-            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 5000) : 1000;
+            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 5000) : 200;
             console.warn(
               `[Model Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
               `model ${modelIndex + 1}/${totalModels} "${model}" failed (${reason}: ${statusCode}). ` +
@@ -465,10 +541,7 @@ function resolveSafeWritePath(workspaceRoot, relativePath) {
     return null;
   }
 
-  // web_angular template kit — AI must not overwrite injected shared/core assets
-  if (isWebAngularProtectedPath(normalized)) {
-    return null;
-  }
+  // Convert every source file — do not block writes to a starter-kit tree.
 
   // Only allow application source (and public assets) under known roots
   if (
@@ -621,17 +694,10 @@ function enforceAngularPackageVersions(destPath, stack) {
     }
   }
 
-  // web_angular kit deps (major-scaled)
-  const kit = webAngularNpmDeps(stack.core);
-  for (const [name, version] of Object.entries(kit.dependencies)) {
-    pkg.dependencies[name] = version;
-  }
-
-  // Runtime essentials from the template
+  // Runtime essentials only — no starter-kit packages (Material/NGXS/toastr/…)
   if (stack.zone) pkg.dependencies['zone.js'] = stack.zone;
   if (!pkg.dependencies.rxjs) pkg.dependencies.rxjs = '~7.8.0';
   if (!pkg.dependencies.tslib) pkg.dependencies.tslib = '^2.3.0';
-  if (!pkg.dependencies['normalize.css']) pkg.dependencies['normalize.css'] = '^8.0.1';
 
   // Tooling
   if (stack.tooling) {
@@ -653,16 +719,9 @@ function enforceAngularPackageVersions(destPath, stack) {
     pkg.devDependencies['typescript-eslint'] = '^8.41.0';
   }
 
-  // Ensure template runtime deps that may have been dropped by postprocess
-  for (const name of ['moment', 'crypto-js', 'bowser', 'lru-cache']) {
-    if (!pkg.dependencies[name] && kit.dependencies[name]) {
-      pkg.dependencies[name] = kit.dependencies[name];
-    }
-  }
-
   fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8');
   console.log(
-    `[versions] Locked Angular package.json to ^${stack.core} (source=${stack.source}); web_angular kit major-aligned`
+    `[versions] Locked Angular package.json to ${stack.core} (source=${stack.source})`
   );
 }
 
@@ -988,56 +1047,253 @@ function applyAngularTemplateCustomizations(destPath, options) {
 }
 
 /**
- * Copy the whole web_angular template into the migration workspace and apply
- * the only allowed customizations: target version, project name, base colors.
- * Every other template file (shared kit, core services, store, layouts, scss
- * design system, environments, configs) is kept as-is.
+ * Write a MINIMAL Angular workspace (tooling only).
+ * Does NOT copy server/web_angular or any starter-kit pages/services.
+ * AI converts every uploaded source file into src/.
  */
 function injectAngularWorkspaceTemplates(destPath, versionStack = null, options = {}) {
   const stack = versionStack || LATEST_ANGULAR;
-  const { projectName = 'migrated-angular-project', designColors = {} } = options;
+  const { projectName = 'migrated-angular-project', designColors = {}, preserveSrc = false } = options;
+  const safeName = toSafeProjectName(projectName);
 
-  copyWebAngularTemplate(destPath);
+  ensureDirectoryExists(destPath);
+  ensureDirectoryExists(path.join(destPath, 'src', 'app'));
+  ensureDirectoryExists(path.join(destPath, 'src', 'environments'));
+  ensureDirectoryExists(path.join(destPath, 'public'));
+
+  const packageJson = {
+    name: safeName,
+    version: '1.0.0',
+    private: true,
+    scripts: {
+      ng: 'ng',
+      start: 'ng serve',
+      build: 'ng build',
+      watch: 'ng build --watch --configuration development'
+    },
+    dependencies: {
+      '@angular/animations': stack.core,
+      '@angular/common': stack.core,
+      '@angular/compiler': stack.core,
+      '@angular/core': stack.core,
+      '@angular/forms': stack.core,
+      '@angular/platform-browser': stack.core,
+      '@angular/platform-browser-dynamic': stack.core,
+      '@angular/router': stack.core,
+      rxjs: '~7.8.0',
+      tslib: '^2.3.0',
+      'zone.js': stack.zone || '~0.15.0'
+    },
+    devDependencies: {
+      '@angular/build': `^${stack.tooling}`,
+      '@angular/cli': `^${stack.tooling}`,
+      '@angular/compiler-cli': stack.core,
+      autoprefixer: '^10.4.20',
+      postcss: '^8.4.49',
+      sass: '^1.83.0',
+      tailwindcss: '^3.4.17',
+      typescript: stack.typescript || '~5.9.2'
+    }
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'package.json'),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+    'utf-8'
+  );
+
+  const angularJson = {
+    $schema: './node_modules/@angular/cli/lib/config/schema.json',
+    version: 1,
+    newProjectRoot: 'projects',
+    projects: {
+      [safeName]: {
+        projectType: 'application',
+        schematics: {
+          '@schematics/angular:component': { style: 'scss', standalone: true }
+        },
+        root: '',
+        sourceRoot: 'src',
+        prefix: 'app',
+        architect: {
+          build: {
+            builder: '@angular/build:application',
+            options: {
+              browser: 'src/main.ts',
+              polyfills: ['zone.js'],
+              tsConfig: 'tsconfig.app.json',
+              inlineStyleLanguage: 'scss',
+              assets: [{ glob: '**/*', input: 'public' }],
+              styles: ['src/styles.scss']
+            },
+            configurations: {
+              production: { budgets: [], outputHashing: 'all' },
+              development: { optimization: false, extractLicenses: false, sourceMap: true }
+            },
+            defaultConfiguration: 'production'
+          },
+          serve: {
+            builder: '@angular/build:dev-server',
+            configurations: {
+              production: { buildTarget: `${safeName}:build:production` },
+              development: { buildTarget: `${safeName}:build:development` }
+            },
+            defaultConfiguration: 'development'
+          }
+        }
+      }
+    }
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'angular.json'),
+    `${JSON.stringify(angularJson, null, 2)}\n`,
+    'utf-8'
+  );
+
+  const tsconfig = {
+    compileOnSave: false,
+    compilerOptions: {
+      strict: true,
+      noImplicitOverride: true,
+      noPropertyAccessFromIndexSignature: true,
+      noImplicitReturns: true,
+      noFallthroughCasesInSwitch: true,
+      skipLibCheck: true,
+      isolatedModules: true,
+      experimentalDecorators: true,
+      importHelpers: true,
+      target: 'ES2022',
+      module: 'preserve',
+      baseUrl: './',
+      paths: {
+        '@/*': ['src/*'],
+        '@app/*': ['src/app/*'],
+        '@env/*': ['src/environments/*']
+      }
+    },
+    angularCompilerOptions: {
+      enableI18nLegacyMessageIdFormat: false,
+      strictInjectionParameters: true,
+      strictInputAccessModifiers: true,
+      typeCheckHostBindings: true,
+      strictTemplates: true
+    }
+  };
+  if ((Number(stack.major) || 0) >= 22) {
+    tsconfig.compilerOptions.ignoreDeprecations = '6.0';
+  }
+  fs.writeFileSync(
+    path.join(destPath, 'tsconfig.json'),
+    `${JSON.stringify(tsconfig, null, 2)}\n`,
+    'utf-8'
+  );
+
+  const tsconfigApp = {
+    extends: './tsconfig.json',
+    compilerOptions: {
+      outDir: './out-tsc/app',
+      types: []
+    },
+    files: ['src/main.ts'],
+    include: ['src/**/*.ts'],
+    exclude: ['src/**/*.spec.ts']
+  };
+  fs.writeFileSync(
+    path.join(destPath, 'tsconfig.app.json'),
+    `${JSON.stringify(tsconfigApp, null, 2)}\n`,
+    'utf-8'
+  );
+
+  if (!preserveSrc) {
+    const humanName = humanizeProjectName(projectName);
+    fs.writeFileSync(
+      path.join(destPath, 'src', 'index.html'),
+      `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>${humanName}</title>
+    <base href="/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+  </body>
+</html>
+`,
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(destPath, 'src', 'main.ts'),
+      `import { bootstrapApplication } from '@angular/platform-browser';
+import { appConfig } from './app/app.config';
+import { AppComponent } from './app/app.component';
+
+bootstrapApplication(AppComponent, appConfig).catch((err) => console.error(err));
+`,
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(destPath, 'src', 'styles.scss'),
+      `@tailwind base;
+@tailwind components;
+@tailwind utilities;
+`,
+      'utf-8'
+    );
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'environments', 'environment.ts'),
+      `export const environment = {
+  production: false
+};
+`
+    );
+    writeFileIfMissing(
+      path.join(destPath, 'src', 'environments', 'environment.development.ts'),
+      `export const environment = {
+  production: false
+};
+`
+    );
+  }
+
+  const tailwindConfig = `/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: ['./src/**/*.{html,ts,scss}'],
+  theme: { extend: {} },
+  plugins: [],
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'tailwind.config.js'), tailwindConfig);
+
+  const postcssConfig = `module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+`;
+  fs.writeFileSync(path.join(destPath, 'postcss.config.js'), postcssConfig);
+
   applyAngularTemplateCustomizations(destPath, { projectName, designColors });
   enforceAngularPackageVersions(destPath, stack);
-
-  // Ensure the Angular app structure folders exist (template already provides them)
-  ensureDirectoryExists(path.join(destPath, 'src', 'app'));
-  ensureDirectoryExists(path.join(destPath, 'public'));
-  ensureDirectoryExists(path.join(destPath, 'public', 'scss'));
+  if (!preserveSrc) {
+    ensureAngularRuntimeFiles(destPath);
+    ensureAngularAppConfigUsesWebAngular(destPath);
+  }
+  console.log(`[angular] Minimal workspace injected at ${destPath} (preserveSrc=${preserveSrc})`);
 }
 
 /**
- * Restore pristine template root/config files after AI generation (pipeline
- * step 4b) so the delivered project always ships with the exact web_angular
- * tooling. Re-applies project name / colors / version customizations.
- * src/app/pages + src/app/core + src/app/shared + src/app/store are NEVER
- * touched here — the AI owns the feature pages, the template owns the kit.
+ * Re-lock root tooling files after AI generation without wiping converted src/.
  */
 function restoreAngularRootConfigs(destPath, stack, options = {}) {
   const { projectName = 'migrated-angular-project', designColors = {} } = options;
-  const rootFiles = [
-    'package.json', 'angular.json', 'tsconfig.json', 'tsconfig.app.json',
-    'tsconfig.spec.json', 'tailwind.config.js', 'eslint.config.js', '.prettierrc',
-    '.gitignore', '.editorconfig', '.husky/pre-commit'
-  ];
-  for (const rel of rootFiles) {
-    const src = path.join(WEB_ANGULAR_TEMPLATE_DIR, rel);
-    if (!fs.existsSync(src)) continue;
-    const dest = path.join(destPath, rel);
-    ensureDirectoryExists(path.dirname(dest));
-    fs.copyFileSync(src, dest);
-  }
-  for (const rel of ['src/index.html', 'src/main.ts', 'src/styles.scss', 'src/app/app.config.ts']) {
-    const src = path.join(WEB_ANGULAR_TEMPLATE_DIR, rel);
-    if (!fs.existsSync(src)) continue;
-    const dest = path.join(destPath, rel);
-    ensureDirectoryExists(path.dirname(dest));
-    fs.copyFileSync(src, dest);
-  }
-  applyAngularTemplateCustomizations(destPath, { projectName, designColors });
-  enforceAngularPackageVersions(destPath, stack);
-  console.log('[web_angular] Restored pristine root config files + customizations');
+  injectAngularWorkspaceTemplates(destPath, stack, {
+    projectName,
+    designColors,
+    preserveSrc: true
+  });
+  console.log('[angular] Restored root tooling files (src/ conversion kept)');
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1372,144 @@ function isEssentialSourcePath(n, promptLower) {
   return false;
 }
 
+function kebabStemFromPath(filePath) {
+  const base = path.posix
+    .basename(String(filePath || '').replace(/\\/g, '/'))
+    .replace(/\.(component\.)?(ts|tsx|js|jsx|html|scss|css)$/i, '')
+    .replace(/\.component$/i, '');
+  return (
+    base
+      .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+      .replace(/[^a-zA-Z0-9-]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase() || ''
+  );
+}
+
+function collectSourceStems(filesMap) {
+  const stems = new Set();
+  for (const rel of Object.keys(filesMap || {})) {
+    const n = rel.replace(/\\/g, '/');
+    if (!/^src\//.test(n)) continue;
+    if (!/\.(ts|tsx|js|jsx|html)$/i.test(n)) continue;
+    const stem = kebabStemFromPath(n);
+    if (stem) stems.add(stem);
+  }
+  return stems;
+}
+
+const INVENTED_PAGE_STEMS = new Set([
+  'home', 'dashboard', 'settings', 'login', 'register', 'signin', 'signup',
+  'sign-in', 'sign-up', 'profile', 'about', 'landing', 'not-found'
+]);
+
+function dropInventedPlanPages(plan, sourceStems, sessionId) {
+  return (plan || []).filter((item) => {
+    const stem = kebabStemFromPath(item?.newPath);
+    if (!INVENTED_PAGE_STEMS.has(stem)) return true;
+    if (sourceStems.has(stem)) return true;
+    console.log(`[${sessionId}] Dropping invented page not present in source: ${item.newPath}`);
+    return false;
+  });
+}
+
+function isPlaceholderGeneratedFile(filePath, content) {
+  if (isPlaceholderTemplate(filePath, content)) return true;
+  const text = String(content || '').trim();
+  if (!text) return true;
+  if (/\.html$/i.test(filePath) && text.length < 80 && /^<div class="[^"]*"><\/div>$/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * If the LLM omits source files from the blueprint, append plan items so
+ * every application source file is converted.
+ * Coverage is by destination stem matching the source file name — not by the
+ * model's approximateSourceFilesToRead (which often maps admin-users.tsx onto
+ * an invented home.component.ts).
+ */
+function ensurePlanCoversAllSourceFiles(plan, filesMap, toTech) {
+  const isAngular = String(toTech || '').toLowerCase().includes('angular');
+  const coveredStems = new Set();
+  for (const item of plan) {
+    const stem = kebabStemFromPath(item.newPath);
+    if (stem) coveredStems.add(stem);
+  }
+  const plannedPaths = new Set(plan.map((p) => String(p.newPath || '').replace(/\\/g, '/')));
+  const extras = [];
+
+  const toKebab = (name) =>
+    name
+      .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+      .replace(/[^a-zA-Z0-9-]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase() || 'converted';
+
+  for (const rel of Object.keys(filesMap)) {
+    const n = rel.replace(/\\/g, '/');
+    if (!/^src\//.test(n)) continue;
+    if (!/\.(ts|tsx|js|jsx|html|scss|css)$/i.test(n)) continue;
+    if (/\.(spec|test)\./i.test(n)) continue;
+    if (/routeTree\.gen|vite-env\.d|__root/.test(n)) continue;
+    if (/(^|\/)(server|start)\.(ts|js)$/i.test(n)) continue;
+    const kebab = kebabStemFromPath(n) || toKebab(path.posix.basename(n));
+    if (kebab && coveredStems.has(kebab)) continue;
+
+    if (isAngular) {
+      if (/\.(tsx|jsx)$/i.test(n)) {
+        const base = path.posix.basename(n).replace(/\.(tsx|jsx)$/i, '');
+        const kebab = toKebab(base.replace(/\.component$/i, ''));
+        const folder = n.includes('/lib/') || n.includes('/utils/')
+          ? `src/app/lib/${kebab}`
+          : `src/app/pages/${kebab}`;
+        const unit = `${folder}/${kebab}.component`;
+        for (const ext of ['.ts', '.html', '.scss']) {
+          const newPath = `${unit}${ext}`;
+          if (plannedPaths.has(newPath)) continue;
+          plannedPaths.add(newPath);
+          extras.push({
+            newPath,
+            explanationOfSource: `Complete conversion of ${n}`,
+            approximateSourceFilesToRead: [rel],
+            complexity: ext === '.scss' ? 'low' : 'medium',
+            unit
+          });
+        }
+      } else if (/\.(ts|js)$/i.test(n) && !/\.d\.ts$/i.test(n)) {
+        const base = path.posix.basename(n).replace(/\.(ts|js)$/i, '');
+        const kebab = toKebab(base);
+        const newPath = n.includes('/lib/') || n.includes('/utils/')
+          ? `src/lib/${kebab}.ts`
+          : `src/app/services/${kebab}.ts`;
+        if (plannedPaths.has(newPath)) continue;
+        plannedPaths.add(newPath);
+        extras.push({
+          newPath,
+          explanationOfSource: `Complete conversion of ${n}`,
+          approximateSourceFilesToRead: [rel],
+          complexity: 'low',
+          unit: newPath
+        });
+      }
+    } else {
+      const dest = n.replace(/\.(jsx)$/i, '.tsx').replace(/\.(css)$/i, '.scss');
+      const newPath = dest.startsWith('src/') ? dest : `src/${dest}`;
+      if (plannedPaths.has(newPath)) continue;
+      plannedPaths.add(newPath);
+      extras.push({
+        newPath,
+        explanationOfSource: `Complete conversion of ${n}`,
+        approximateSourceFilesToRead: [rel],
+        complexity: 'medium',
+        unit: newPath
+      });
+    }
+  }
+  return extras;
+}
+
 // ---------------------------------------------------------------------------
 // Final npm ci sanity check
 // ---------------------------------------------------------------------------
@@ -1184,7 +1578,8 @@ async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
 // React workspace template injection
 // ---------------------------------------------------------------------------
 
-function injectReactWorkspaceTemplates(destPath, versionStack = null) {
+function injectReactWorkspaceTemplates(destPath, versionStack = null, options = {}) {
+  const { preserveSrc = false } = options;
   // Default = latest stable React; override when user prompt names a version.
   const stack = versionStack || {
     react: '19.2.8',
@@ -1293,9 +1688,10 @@ export default defineConfig({
 `;
   fs.writeFileSync(path.join(destPath, 'index.html'), indexHtml);
 
-  // 5. src/main.tsx - with correct React import path
-  ensureDirectoryExists(path.join(destPath, 'src'));
-  const mainTsx = `import React from 'react';
+  // 5. src stubs — only on first inject so later restore does not wipe converted files
+  if (!preserveSrc) {
+    ensureDirectoryExists(path.join(destPath, 'src'));
+    const mainTsx = `import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import './index.scss';
@@ -1309,11 +1705,10 @@ if (rootElement) {
   );
 }
 `;
-  fs.writeFileSync(path.join(destPath, 'src', 'main.tsx'), mainTsx);
+    fs.writeFileSync(path.join(destPath, 'src', 'main.tsx'), mainTsx);
 
-  // 5b. Stub App.tsx so the build doesn't fail on unit 1
-  //     (main.tsx imports ./App immediately; the AI overwrites this later)
-  const stubAppTsx = `export default function App() {
+    // Stub App.tsx so the build doesn't fail on unit 1 (AI overwrites this later)
+    const stubAppTsx = `export default function App() {
   return (
     <main style={{ fontFamily: 'system-ui', padding: '2rem', textAlign: 'center' }}>
       <h1>Migration in progress...</h1>
@@ -1321,16 +1716,16 @@ if (rootElement) {
   );
 }
 `;
-  fs.writeFileSync(path.join(destPath, 'src', 'App.tsx'), stubAppTsx, 'utf-8');
+    fs.writeFileSync(path.join(destPath, 'src', 'App.tsx'), stubAppTsx, 'utf-8');
 
-  // 6. src/index.scss — Tailwind entry
-  const indexScss = `@tailwind base;
+    const indexScss = `@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 /* Global app styles — prefer Tailwind utilities in components */
 `;
-  fs.writeFileSync(path.join(destPath, 'src', 'index.scss'), indexScss);
+    fs.writeFileSync(path.join(destPath, 'src', 'index.scss'), indexScss);
+  }
 
   const reactTailwindConfig = `/** @type {import('tailwindcss').Config} */
 export default {
@@ -1445,7 +1840,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   </React.StrictMode>
 );
 `;
-  fs.writeFileSync(mainTsxPath, normalizedMain, 'utf-8');
+  writeFileIfMissing(mainTsxPath, normalizedMain);
 
   const indexScssPath = path.join(srcDir, 'index.scss');
   if (!fs.existsSync(indexScssPath)) {
@@ -1476,62 +1871,31 @@ function writeFileIfMissing(filePath, content) {
 }
 
 /**
- * Ensure app.config.ts wires the web_angular interceptors + NGXS store.
- * The template ships a complete app.config.ts, so this only creates a file
- * when it is missing (never overwrites a working config).
+ * Write a minimal standalone app.config.ts only when missing.
+ * Converted files own routing/providers after generation.
  */
 function ensureAngularAppConfigUsesWebAngular(destPath) {
   const appConfigPath = path.join(destPath, 'src', 'app', 'app.config.ts');
-  if (fs.existsSync(appConfigPath)) {
-    const existing = fs.readFileSync(appConfigPath, 'utf-8');
-    if (/provideStore\s*\(/.test(existing) && /withInterceptors\s*\(/.test(existing)) {
-      return;
-    }
-  }
+  if (fs.existsSync(appConfigPath)) return;
 
-  const kitConfig = `import {
-  httpErrorInterceptorFn,
-  httpAuthHeaderInterceptorFn,
-  httpSuccessHandlerInterceptorFn,
-} from './core/interceptors';
-import { routes } from './app.routes';
-import { provideStore } from '@ngxs/store';
-import { provideToastr } from 'ngx-toastr';
-import { PreloadAllModules, provideRouter, withPreloading } from '@angular/router';
-import { environment } from '../environments/environment';
-import { withNgxsLoggerPlugin } from '@ngxs/logger-plugin';
-import { provideHttpClient, withInterceptors } from '@angular/common/http';
+  const kitConfig = `import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+import { provideRouter } from '@angular/router';
+import { provideHttpClient } from '@angular/common/http';
 import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
-import { ApplicationConfig, importProvidersFrom, provideZoneChangeDetection } from '@angular/core';
-import { AppState } from './store';
-
-const STATES = [AppState];
+import { routes } from './app.routes';
 
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZoneChangeDetection({ eventCoalescing: true }),
-    provideRouter(routes, withPreloading(PreloadAllModules)),
+    provideRouter(routes),
+    provideHttpClient(),
     provideAnimationsAsync(),
-    importProvidersFrom(),
-    provideHttpClient(
-      withInterceptors([
-        httpErrorInterceptorFn,
-        httpAuthHeaderInterceptorFn,
-        httpSuccessHandlerInterceptorFn,
-      ]),
-    ),
-    provideToastr({
-      timeOut: 3000,
-      closeButton: true,
-      positionClass: 'toast-top-right',
-    }),
-    provideStore([...STATES], withNgxsLoggerPlugin({ disabled: environment.production })),
   ],
 };
 `;
   ensureDirectoryExists(path.dirname(appConfigPath));
   fs.writeFileSync(appConfigPath, kitConfig, 'utf-8');
-  console.log(`[web_angular] Wrote app.config.ts with interceptors + NGXS store + toastr`);
+  console.log(`[angular] Wrote missing app.config.ts (minimal bootstrap)`);
 }
 
 
@@ -1542,10 +1906,12 @@ function ensureAngularRuntimeFiles(destPath) {
   const componentTsPath = path.join(srcAppDir, 'app.component.ts');
   if (!fs.existsSync(componentTsPath)) {
     const componentTs = `import { Component } from '@angular/core';
+import { RouterOutlet } from '@angular/router';
 
 @Component({
   selector: 'app-root',
   standalone: true,
+  imports: [RouterOutlet],
   templateUrl: './app.component.html',
   styleUrl: './app.component.scss'
 })
@@ -1558,7 +1924,7 @@ export class AppComponent {}
   if (!fs.existsSync(componentHtmlPath)) {
     fs.writeFileSync(
       componentHtmlPath,
-      `<main class="p-8 font-sans">\n  <h1 class="text-2xl font-semibold">Migration Complete</h1>\n  <p class="mt-2 text-gray-600">This is a generated Angular workspace. Replace this with migrated templates.</p>\n</main>\n`,
+      `<router-outlet></router-outlet>\n`,
       'utf-8'
     );
   }
@@ -1578,10 +1944,7 @@ export class AppComponent {}
       routesPath,
       `import { Routes } from '@angular/router';
 
-export const routes: Routes = [
-  { path: '', pathMatch: 'full', redirectTo: 'login' },
-  { path: '**', redirectTo: 'login' }
-];
+export const routes: Routes = [];
 `,
       'utf-8'
     );
@@ -1603,6 +1966,104 @@ function stripCodeFences(content) {
   cleaned = cleaned.replace(/^```(?:[\w+-]+)?\s*\n?/m, '');
   cleaned = cleaned.replace(/\n?```\s*$/m, '');
   return cleaned.trim();
+}
+
+/**
+ * Collect a small source-file context for one unit (free-model token budget).
+ */
+function sourceContextForUnit(unit, filesMap) {
+  const wanted = [];
+  const seen = new Set();
+  const add = (rel) => {
+    const n = String(rel || '').replace(/\\/g, '/');
+    if (!n || seen.has(n) || !filesMap[n] && !filesMap[rel]) return;
+    seen.add(n);
+    wanted.push(filesMap[n] ? n : rel);
+  };
+
+  // Destination stem matching source file names is authoritative. Planner
+  // approximateSourceFilesToRead often maps a real page onto an invented Home.
+  for (const f of unit.files || []) {
+    const destStem = kebabStemFromPath(f.newPath);
+    if (!destStem) continue;
+    for (const rel of Object.keys(filesMap)) {
+      const srcStem = kebabStemFromPath(rel);
+      if (!srcStem) continue;
+      if (
+        srcStem === destStem ||
+        srcStem === destStem.replace(/^admin-/, '') ||
+        `admin-${srcStem}` === destStem
+      ) {
+        add(rel);
+      }
+    }
+  }
+
+  for (const f of unit.files || []) {
+    for (const s of f.approximateSourceFilesToRead || []) add(s);
+  }
+
+  if (wanted.length === 0) {
+    for (const f of unit.files || []) {
+      const base = path.posix
+        .basename(String(f.newPath || ''))
+        .replace(/\.(component\.)?(ts|tsx|js|jsx|html|scss|css)$/i, '')
+        .toLowerCase();
+      if (base.length < 3) continue;
+      for (const rel of Object.keys(filesMap)) {
+        const leaf = path.posix.basename(rel.replace(/\\/g, '/')).toLowerCase();
+        if (leaf.includes(base) && wanted.length < 4) add(rel);
+      }
+    }
+  }
+
+  let ctx = '';
+  for (const rel of wanted) {
+    const content = filesMap[rel] || filesMap[rel.replace(/\//g, '\\')];
+    if (!content) continue;
+    const chunk = `\n--- SOURCE FILE: ${rel} ---\n${content}\n`;
+    if (ctx.length + chunk.length > UNIT_SOURCE_CONTEXT_MAX_CHARS) break;
+    ctx += chunk;
+  }
+  return ctx;
+}
+
+/**
+ * Parse a multi-file unit response (JSON or ===== FILE: path ===== markers).
+ */
+function parseUnitFileBundle(raw, expectedPaths = []) {
+  const files = [];
+  const cleaned = stripCodeFences(raw);
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    const arr = Array.isArray(parsed) ? parsed : parsed.files;
+    if (Array.isArray(arr)) {
+      for (const f of arr) {
+        const p = f.path || f.newPath;
+        if (p && f.content != null) files.push({ path: String(p).replace(/\\/g, '/'), content: String(f.content) });
+      }
+    }
+  } catch {
+    /* marker format */
+  }
+
+  if (files.length === 0) {
+    const re = /===== FILE:\s*(.+?)\s*=====\s*\r?\n([\s\S]*?)(?====== FILE:|===== END =====|$)/g;
+    let m;
+    while ((m = re.exec(cleaned)) !== null) {
+      files.push({
+        path: m[1].trim().replace(/\\/g, '/').replace(/^[`'"]+|[`'"]+$/g, ''),
+        content: m[2].replace(/\n+$/, '')
+      });
+    }
+  }
+
+  if (files.length === 0 && expectedPaths.length === 1) {
+    files.push({ path: expectedPaths[0], content: cleaned });
+  }
+
+  return files.filter((f) => f.path && f.content != null);
 }
 
 /**
@@ -2316,10 +2777,23 @@ function patchEnvironmentMissingProps(workspacePath, buildErrors) {
  * Ask the AI to fix build errors. Returns an array of { relativePath, content }.
  */
 async function askAIToFixBuildErrors(sessionId, buildErrors, workspacePath, aiProvider, aiModel, targetTech) {
-  const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
-  const filesContext = buildFilesContext(currentFiles);
-
   const errorPaths = extractPathsFromBuildErrors(buildErrors);
+  const currentFiles = readDirectoryRecursively(workspacePath, workspacePath);
+  const subset = {};
+  const keys = Object.keys(currentFiles);
+  for (const p of errorPaths) {
+    const norm = String(p).replace(/\\/g, '/');
+    if (currentFiles[norm]) subset[norm] = currentFiles[norm];
+    else {
+      const hit = keys.find((k) => k.replace(/\\/g, '/').endsWith(norm) || norm.endsWith(k.replace(/\\/g, '/')));
+      if (hit) subset[hit] = currentFiles[hit];
+    }
+  }
+  if (Object.keys(subset).length === 0) {
+    // Fallback: only the first 8 source files, never the whole tree
+    for (const k of keys.slice(0, 8)) subset[k] = currentFiles[k];
+  }
+  const filesContext = buildFilesContext(subset);
   const fixPrompt = `The migrated ${targetTech} project has BUILD ERRORS. Fix ONLY the files causing errors.
 
 BUILD ERROR OUTPUT:
@@ -2340,6 +2814,7 @@ IMPORTANT RULES:
 - You MAY update src/environments/environment*.ts when errors are about missing environment properties (theme, appTitle, etc.).
 - Prefer extending environment with the missing keys rather than casting.
 - Make the minimum changes needed to fix compilation errors.
+- Do NOT delete converted pages/features to silence errors — fix the actual type/template/import issue.
 - Output ONLY valid JSON, no markdown fences.`;
 
   const systemInstruction = `You are an expert ${targetTech} developer. Your job is to fix build/compilation errors in a migrated project. Output ONLY a valid JSON object with a "files" array.`;
@@ -2377,14 +2852,16 @@ IMPORTANT RULES:
  * On failure: asks AI to fix errors, retries up to MAX_BUILD_RETRIES times.
  * Returns { verified: boolean }.
  */
-async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel) {
+async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel, sourceFilesMap = null) {
+  let lastErrors = '';
   for (let attempt = 1; attempt <= MAX_BUILD_FIX_ATTEMPTS; attempt++) {
     console.log(`[${sessionId}] Final build verification attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS}...`);
     // Skip npm install - node_modules should already exist from incremental builds
     const result = await verifyBuild(workspacePath, targetTech, sessionId, true);
     if (result.success) {
-      return { verified: true };
+      return { verified: true, errors: '' };
     }
+    lastErrors = result.errors || '';
 
     if (attempt < MAX_BUILD_FIX_ATTEMPTS) {
       console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
@@ -2415,14 +2892,14 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
       }
       // Re-run post-process repairs after AI fixes
       if (targetTech.toLowerCase().includes('angular')) {
-        repairAngularWorkspace(workspacePath, {});
+        repairAngularWorkspace(workspacePath, { sourceFilesMap });
       } else if (targetTech.toLowerCase().includes('react')) {
         repairReactWorkspace(workspacePath, {});
       }
     }
   }
 
-  return { verified: false };
+  return { verified: false, errors: lastErrors };
 }
 
 /**
@@ -2662,6 +3139,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
     customPriorityRules = null,
     enableVisualQa = false,
     visualQaRoutes = ['/'],
+    resume = false,
   } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
   const report = (phase, message, extra = {}) => {
@@ -2672,6 +3150,9 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
       /* ignore progress listener errors */
     }
   };
+
+  const checkpoint = readCheckpoint(sessionId);
+  const isResume = Boolean(resume && checkpoint?.units?.length);
 
   // --- Resolve target versions ---
   // If an explicit targetVersion was provided via UI, inject it into the prompt
@@ -2686,13 +3167,14 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   const targetVersions = resolveTargetVersions(effectivePrompt, toTech);
   const versionMandate = formatVersionMandate(targetVersions);
 
-  // Append the default strip-down / cross-framework prompt + version mandate
+  // Append direction-specific complete-conversion prompt + version mandate
   const defaultSuffix = getDefaultPrompt(fromTech, toTech);
   const enhancedPrompt = `${userPrompt}\n\n${defaultSuffix}\n\n${versionMandate}`;
 
-  // Priority rules — explicit "source of truth" decision hierarchy (ChatGPT workflow)
+  // Priority rules — source of truth. Without a reference ZIP, source project wins.
+  const hasReferenceZip = Boolean(referenceZipPath && fs.existsSync(referenceZipPath));
   const priorityRules = getPriorityRules(priorityRulesMode, customPriorityRules);
-  const priorityRulesPrompt = formatPriorityRulesPrompt(priorityRules);
+  const priorityRulesPrompt = formatPriorityRulesPrompt(priorityRules, { hasReference: hasReferenceZip });
   console.log(`[${sessionId}] Priority rules mode: ${priorityRulesMode}`);
 
   // Use absolute paths based on the already-defined EXTRACT_DIR
@@ -2705,27 +3187,38 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   ensureDirectoryExists(migrationWorkspacePath);
 
   // -----------------------------------------------------------------------
-  // 1. Unpack original framework archive
+  // 1. Unpack original framework archive (skipped when resuming)
   // -----------------------------------------------------------------------
-  report('extract', 'Extracting uploaded archive...');
-  console.log(`[${sessionId}] Extracting archive...`);
-  let zip;
-  try {
-    zip = new AdmZip(sourceZipPath);
-  } catch (zipError) {
-    if (zipError.message && zipError.message.includes('Invalid filename')) {
-      throw new Error(
-        'The uploaded ZIP contains entries with invalid filenames. '
-        + 'Please re-create your ZIP file avoiding special characters in file/folder names '
-        + '(e.g., colons, backslashes, or absolute paths).'
-      );
+  if (isResume) {
+    report('resume', `Resuming conversion from checkpoint (unit ${(checkpoint.completedUnitIndex ?? -1) + 2})...`);
+    console.log(
+      `[${sessionId}] Resume: next unit index ${(checkpoint.completedUnitIndex ?? -1) + 1} ` +
+      `of ${checkpoint.units.length}`
+    );
+  } else {
+    if (!sourceZipPath || !fs.existsSync(sourceZipPath)) {
+      throw new Error('Source ZIP is required for a new conversion.');
     }
-    throw new Error(`Could not read the uploaded ZIP file: ${zipError.message}`);
-  }
-  try {
-    zip.extractAllTo(extractPath, true);
-  } catch (extractError) {
-    throw new Error(`Could not extract ZIP archive: ${extractError.message}. The file may contain invalid entries or be corrupted.`);
+    report('extract', 'Extracting uploaded archive...');
+    console.log(`[${sessionId}] Extracting archive...`);
+    let zip;
+    try {
+      zip = new AdmZip(sourceZipPath);
+    } catch (zipError) {
+      if (zipError.message && zipError.message.includes('Invalid filename')) {
+        throw new Error(
+          'The uploaded ZIP contains entries with invalid filenames. '
+          + 'Please re-create your ZIP file avoiding special characters in file/folder names '
+          + '(e.g., colons, backslashes, or absolute paths).'
+        );
+      }
+      throw new Error(`Could not read the uploaded ZIP file: ${zipError.message}`);
+    }
+    try {
+      zip.extractAllTo(extractPath, true);
+    } catch (extractError) {
+      throw new Error(`Could not extract ZIP archive: ${extractError.message}. The file may contain invalid entries or be corrupted.`);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -2738,18 +3231,14 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
     throw new Error('No readable source files found inside the uploaded ZIP.');
   }
 
-  // Token efficiency: keep only source files essential to build a
-  // web_angular-style app (auth + dashboard + shell + shared plumbing).
-  // Feature pages outside that scope are dropped so the AI context stays small.
-  const essentialFilesMap = filterEssentialSourceFiles(filesMap, userPrompt);
-  const droppedCount = Object.keys(filesMap).length - Object.keys(essentialFilesMap).length;
+  // Convert EVERY readable source file — do not strip features.
+  const essentialFilesMap = filesMap;
 
   const fileTree = Object.keys(essentialFilesMap).map((f) => `- ${f}`).join('\n');
   const filesContextSummary = buildFilesContext(essentialFilesMap);
 
   console.log(
-    `[${sessionId}] Read ${Object.keys(filesMap).length} source files; ` +
-      `kept ${Object.keys(essentialFilesMap).length} essential file(s) for the web_angular app (dropped ${droppedCount}).`
+    `[${sessionId}] Read ${Object.keys(filesMap).length} source file(s); converting all of them (no template strip-down).`
   );
 
   // Read the source package.json once (project name + dependency carry-over)
@@ -2792,27 +3281,34 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   // 2b. Inject workspace templates for known target frameworks
   // -----------------------------------------------------------------------
-  let projectName = 'migrated-angular-project';
-  let designColors = {};
-  if (targetLower.includes('angular')) {
-    projectName = extractProjectName(userPrompt, sourcePackageJson);
-    designColors = extractDesignColors(userPrompt);
-    console.log(
-      `[${sessionId}] Injecting web_angular workspace template ` +
-        `(project=${projectName}, colors=${JSON.stringify(designColors)})...`
-    );
-    injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular, {
-      projectName,
-      designColors
-    });
-    ensureAngularRuntimeFiles(migrationWorkspacePath);
-    ensureCnUtil(migrationWorkspacePath);
-    enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
-  } else if (targetLower.includes('react')) {
-    console.log(`[${sessionId}] Injecting React workspace templates...`);
-    injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
+  let projectName = checkpoint?.projectName || 'migrated-angular-project';
+  let designColors = checkpoint?.designColors || {};
+  const skipInject = isResume && fs.existsSync(path.join(migrationWorkspacePath, 'package.json'));
+  if (!skipInject) {
+    if (targetLower.includes('angular')) {
+      projectName = extractProjectName(userPrompt, sourcePackageJson);
+      designColors = extractDesignColors(userPrompt);
+      console.log(
+        `[${sessionId}] Injecting minimal Angular workspace (no starter-kit pages) ` +
+          `(project=${projectName}, colors=${JSON.stringify(designColors)})...`
+      );
+      injectAngularWorkspaceTemplates(migrationWorkspacePath, targetVersions.angular, {
+        projectName,
+        designColors
+      });
+      ensureAngularRuntimeFiles(migrationWorkspacePath);
+      ensureCnUtil(migrationWorkspacePath);
+      enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
+    } else if (targetLower.includes('react')) {
+      console.log(`[${sessionId}] Injecting React workspace templates...`);
+      injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
+    }
   }
 
+  let migrationUnits = isResume ? checkpoint.units : null;
+  let startUnitIndex = isResume ? Math.max(0, (checkpoint.completedUnitIndex ?? -1) + 1) : 0;
+
+  if (!migrationUnits) {
   // -----------------------------------------------------------------------
   // 2c. ANALYZER STAGE (ChatGPT workflow): analyze source + reference projects
   // -----------------------------------------------------------------------
@@ -2862,33 +3358,37 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
   const sameFrameworkInstruction = `
-You are a code architect stripping down an app to ONLY auth + dashboard (same framework).
+You are a code architect converting EVERY uploaded source file (same framework).
 
 RULES:
-- KEEP ONLY: login, register, forgot-password, dashboard, auth service/guards/interceptors, core app shell.
-- DELETE everything else: profile pages, CRUD tables, blog, about, settings, admin panels, demos.
-- Route login as default, dashboard after login, protect with auth guard / protected route.
-- Plan ONLY src/ files (components, services, styles). Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html, vite.config).
+- Convert the FULL app. Do NOT strip features. Do NOT drop CRUD, settings, admin, or extra pages.
+- Plan a target file for every meaningful source file (components, pages, routes, services, hooks, utils, styles).
+- Plan ONLY src/ files. Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html, vite.config).
 - For Angular components, use templateUrl + styleUrl (NOT inline templates); plan full .ts + .html + .scss triads.
-- The workspace is pre-injected from the complete web_angular template (src/app/config, src/app/core, src/app/shared, src/app/store, src/app/pages/common, src/app/pages/deeplink, src/app/app.config.ts). KEEP all template files untouched. FUNCTIONALIZE the template's auth pages (login, forgot-password, enter-otp, reset-password, create-new-password) and the dashboard from the source project's auth + dashboard code — plan the template's exact paths under src/app/pages/.
-- The app must compile and run after stripping.
+- There is NO starter-kit template. You must plan app.component, app.routes, and every feature from the source tree.
+- The app must compile and run with the same user-visible functionality as the source.
 - Output ONLY raw JSON (no markdown, no backticks, no explanation).
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
 `;
 
   const crossFrameworkInstruction = `
-You are a Principal Software Architect. Your task is to analyze an incoming source codebase and plan out a structural framework migration based on the user's demands.
+You are a Principal Software Architect. Convert the incoming source codebase COMPLETELY into the target framework.
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
 
-- If targeting Angular: convert React components into Angular Standalone Components under src/app/ (e.g. src/app/pages/..., src/app/admin/...). NEVER plan paths like src/admin or src/pages outside src/app/.
+COMPLETE CONVERSION (MANDATORY):
+- Plan a target file for EVERY source application file (pages, routes, components, services, hooks, utils, styles).
+- Do NOT omit features. Do NOT reduce the app to auth + dashboard. CRUD, settings, admin, and extra pages MUST be converted.
+- There is NO starter-kit template. Do not assume src/app/core, shared, store, or auth pages already exist.
+
+- If targeting Angular: convert components into Angular Standalone Components under src/app/. NEVER plan paths like src/admin or src/pages outside src/app/.
 - If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 
 IMPORTANT RULES FOR FILE GENERATION:
 - For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
 - For Angular projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, angular.json.
-- Focus ONLY on converting the actual application code (components, services, utilities).
+- Convert the actual application code (components, services, utilities, pages, routes).
 - USER MIGRATION MANDATE IS HIGHEST PRIORITY: when the user specifies titles, colors, themes, branding, or copy changes, every planned UI file must reflect those exact values instead of copying the source project defaults.
 - For Angular: app.component.ts must use templateUrl/styleUrl — put all markup in app.component.html and styles in app.component.scss. Never plan inline templates in the .ts file when an .html sibling exists.
 - For Angular: EVERY component needs its own .ts + .html + .scss triad with matching names (e.g. avatar.component.ts / avatar.component.html / avatar.component.scss). Never share one template across components. Use Tailwind utility classes in HTML; keep SCSS minimal.
@@ -2897,23 +3397,11 @@ IMPORTANT RULES FOR FILE GENERATION:
 - For React: plan src/lib/* when the Angular app has shared utilities.
 - Prefer @if / @for / @switch control flow in Angular templates over *ngIf / *ngFor when practical.
 - Do NOT invent non-existent packages (e.g. @radix-ng/*). Use Angular primitives, CDK patterns, or plain custom components instead.
-- WEB_ANGULAR TEMPLATE (the complete reference project is ALREADY injected — do NOT re-plan or regenerate these paths):
-  src/app/config/, src/app/core/{authentication,guards,http,interceptors,layouts,resolvers,services},
-  src/app/shared/{animations,components,models,directives,pipes,utilities,validators},
-  src/app/store/, src/app/pages/common/, src/app/pages/deeplink/, src/app/app.config.ts.
-  Reuse breadcrumbs / confirmation-dialog / global-search / pipes / directives / validators / guards / http.service / store from the template.
-  Path aliases: @app/*, @core/*, @pages/*, @store/*, @env/*, @shared/*, @configs/* (and @/ → src/).
-  KEEP the template folder layout: src/app/pages/{auth,admin,common,deeplink}, core, shared, store, config.
-  FUNCTIONALIZE (plan + rewrite) ONLY the template's feature pages from the source project:
-    - Auth: src/app/pages/auth/auth/pages/{login,forgot-password,enter-otp,reset-password,create-new-password}/* (full .ts+.html+.scss triads)
-    - Dashboard: src/app/pages/admin/dashboard/pages/dashboard/dashboard.component.{ts,html,scss}
-    - Routes: src/app/pages/auth/auth.routes.ts, src/app/pages/admin/admin.routes.ts, src/app/app.routes.ts — extend, do not remove template guards/layouts.
-  Any NEW feature pages go under src/app/pages/admin/... following the same triad + folder pattern.
-- ENVIRONMENTS: src/environments/environment*.ts already include production, host, clientId, clientSecret, encryption. Extend with apiUrl/appTitle/theme in the SAME unit as the config that needs them.
+- Path aliases: @app/* → src/app/*, @env/* → src/environments/*, @/ → src/.
 - Map lucide-react icons to plain inline SVG markup in Angular (NO @lucide/angular / lucide-angular / lucide-react packages). Every icon must be a real <svg xmlns=...>...</svg> with Lucide paths. For React target keep lucide-react.
 - For Angular: NEVER plan Lucide* imports, LucideIconModule, <lucide-*> tags, or <svg lucideXxx>. Plan inline SVG only.
 - For Angular: every planned .html must have matching public/protected members on its .ts sibling; no React leftover cn()/className/return-in-template patterns unless the class exposes them.
-- For Angular: routes import page components from their own files — never from app.component.ts.
+- For Angular: routes import page components from their own files — never from app.component.ts. Plan app.routes.ts covering EVERY converted page.
 `;
 
   const blueprintSystemInstruction = isSameFramework ? sameFrameworkInstruction : crossFrameworkInstruction;
@@ -2962,7 +3450,7 @@ ${migrationPlanPreview ? JSON.stringify({
 
 [FROM TECH] ${fromTech}
 [TO TECH] ${toTech}
-${isSameFramework ? 'NOTE: Same framework — strip down, do NOT convert frameworks.' : ''}
+${isSameFramework ? 'NOTE: Same framework — convert every source file. Do NOT strip features.' : ''}
 `;
 
   let blueprintText;
@@ -2987,22 +3475,19 @@ ${isSameFramework ? 'NOTE: Same framework — strip down, do NOT convert framewo
     const useSimplePrompt = attempt === 2;
 
     const attemptInstruction = useSimplePrompt
-      ? `You are analyzing an Angular project file tree.
+      ? `You are converting a frontend project file tree.
 
-From the FILE TREE below, list the files that should be KEPT for an app with ONLY:
-- Auth (login, register, forgot-password)
-- Dashboard
-- Core app shell (App component, routing)
-- Shared services (auth service, guards)
+From the FILE TREE below, list EVERY application source file that must exist in the converted project.
+Include all pages, components, routes, services, hooks, and utils — not just auth/dashboard.
 
 List each file on a new line, starting with "src/".
 Example:
-src/app/login/login.component.ts
-src/app/dashboard/dashboard.component.ts
-src/app/auth.service.ts
+src/app/app.component.ts
+src/app/app.routes.ts
+src/app/pages/admin-users/admin-users.component.ts
 
 LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
-Minimum 5 files. Include ALL related files for auth + dashboard.`
+Include ALL feature files from the source tree.`
       : blueprintSystemInstruction;
 
     const attemptUserPrompt = useSimplePrompt
@@ -3097,7 +3582,8 @@ ${enhancedPrompt}`
   }
 
   // Drop unsafe / protected / framework-mismatched planned files before writing
-  const filteredPlan = targetFileList.filter((item) => {
+  const sourceStems = collectSourceStems(essentialFilesMap);
+  let filteredPlan = targetFileList.filter((item) => {
     if (!item || typeof item.newPath !== 'string') return false;
 
     // Normalize Angular plan paths that omit src/app/
@@ -3148,46 +3634,86 @@ ${enhancedPrompt}`
     return true;
   });
 
+  filteredPlan = dropInventedPlanPages(filteredPlan, sourceStems, sessionId);
+
   if (filteredPlan.length === 0) {
     throw new Error('Migration plan contained no writable source files. Please try again with a clearer prompt.');
+  }
+
+  const coverageExtras = ensurePlanCoversAllSourceFiles(filteredPlan, essentialFilesMap, toTech);
+  if (coverageExtras.length > 0) {
+    console.log(`[${sessionId}] Adding ${coverageExtras.length} omitted source file(s) to the conversion plan.`);
+    filteredPlan.push(...coverageExtras);
   }
 
   console.log(`[${sessionId}] Blueprint built. Total files to convert: ${filteredPlan.length}`);
   report('blueprint', `Blueprint ready — ${filteredPlan.length} file(s) planned.`);
 
   // Group into logical units (Angular triad / React+scss) and dependency order
-  const migrationUnits = groupPlanIntoMigrationUnits(filteredPlan);
+  migrationUnits = groupPlanIntoMigrationUnits(filteredPlan);
   console.log(
     `[${sessionId}] Incremental units: ${migrationUnits.length} ` +
-    `(from ${filteredPlan.length} planned files). Build runs once per unit.`
+    `(from ${filteredPlan.length} planned files). One AI call per unit.`
   );
+
+  writeCheckpoint(sessionId, {
+    userPrompt,
+    fromTech,
+    toTech,
+    aiProvider,
+    aiModel,
+    targetVersion,
+    priorityRulesMode,
+    projectName,
+    designColors,
+    units: migrationUnits,
+    completedUnitIndex: -1,
+    paused: false
+  });
+  } // end new-plan (not resume)
+
+  if (!migrationUnits || migrationUnits.length === 0) {
+    throw new Error('Migration plan contained no writable units. Please try again with a clearer prompt.');
+  }
 
   // -----------------------------------------------------------------------
   // 4. AGENT STEP 2: Write each UNIT (small → large), build, fix, then next
   // -----------------------------------------------------------------------
   const fileWriterSystemInstruction = `
 You are an elite Senior Frontend Engineer executing a framework translation.
-You are writing the code for ONE file only in the new framework structure.
-- If writing an Angular Standalone Component TypeScript file: write ONLY TypeScript. Use templateUrl/styleUrl. Do NOT include HTML markup or CSS rules in the .ts file.
-- If writing an Angular .html file: write ONLY HTML markup with Tailwind utility classes on elements. No TypeScript, no CSS/SCSS, no file path comments.
-- If writing an Angular .scss (or legacy .css) file: write ONLY SCSS/CSS (complete rules with braces). Prefer empty/minimal SCSS — styling belongs in Tailwind classes in the HTML. No HTML, no TypeScript, no file path comments. Empty files must be a comment like /* component */.
-- For Angular: keep the app layout under src/app with core, shared, and pages/{common,auth,admin}; do not create top-level src/core or src/shared folders.
-- If writing a React Component: use functional components with hooks and TypeScript. Style with Tailwind className utilities; companion styles use .scss only.
-- If writing a React .scss file: minimal SCSS only; prefer Tailwind in JSX.
+You write ONE logical UNIT per response. A unit is:
+- one file (service, util, routes, config-in-src), OR
+- an Angular component triad (.ts + .html + .scss) written together, OR
+- a React component (.tsx + optional .scss).
+
+OUTPUT FORMAT:
+- If more than one target file is listed, write EVERY listed file using this marker format (not JSON, not markdown fences around the whole response):
+===== FILE: exact/path =====
+<complete contents of THAT file only>
+===== END =====
+- If only one file is listed, markers are still preferred; raw code for that single file is also accepted.
+- Never put HTML inside a .ts file or TypeScript inside a .html file.
+- Never add comments like "// src/app/foo.component.html" inside a file body.
+
+PER-FILE TYPE RULES:
+- Angular .ts: TypeScript only. Use templateUrl/styleUrl. No HTML markup or CSS rules in the .ts file.
+- Angular .html: HTML only with Tailwind utility classes. No TypeScript, no CSS/SCSS.
+- Angular .scss: SCSS/CSS only. Prefer empty/minimal SCSS — styling belongs in Tailwind in the HTML. Empty files: /* component */
+- Angular layout: keep converted files under src/app (pages, components, services, lib). Do not invent a starter-kit core/shared/store tree.
+- React component: functional + hooks + TypeScript. Tailwind className utilities; companion styles use .scss only.
+- React .scss: minimal SCSS only; prefer Tailwind in JSX.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.
-Respond ONLY with raw code for the single requested file. Do not output markdown code blocks (\`\`\`).
-Do NOT concatenate multiple files. Do NOT add comments like "// src/app/app.component.html" or dump sibling file contents.
 
 CRITICAL RULES:
 0. USER PROMPT FIRST: obey the user's migration mandate exactly (titles, colors, themes, branding, scope). Do NOT hallucinate packages, exports, APIs, files, or features that are not real / not requested / not required by the source conversion.
 1. You are ONLY generating source code files (components, styles, utilities). Configuration files like package.json, tsconfig.json, vite.config.ts, angular.json are ALREADY provided and should NOT be generated.
 2. For React: The main App component MUST be at src/App.tsx (NOT src/app/app.tsx). Import it as 'import App from "./App"' (NOT './app/app').
-3. For React: Use consistent file extensions - ALL files should be .tsx for TypeScript React projects.
+3. For React: components are .tsx; utils/hooks/services may be .ts; companion styles are .scss — never force every file to .tsx.
 4. DO NOT create Angular-style directory structures (src/app/ subdirectory) for React projects.
-5. MANDATORY USER REQUIREMENTS override source defaults: if the user specifies titles, colors, theme values, or branding, apply those exact values in this file. Do NOT keep old source titles/colors when the user asked to change them.
+5. MANDATORY USER REQUIREMENTS override source defaults: if the user specifies titles, colors, theme values, or branding, apply those exact values in these files. Do NOT keep old source titles/colors when the user asked to change them.
 6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file (with Tailwind classes) and ALL leftover styles in the .scss file (styleUrl: './name.component.scss'). NEVER use .css, inline template, or styles property.
-7. When sibling files for the same component were already generated, stay consistent with them (same title text, colors, and layout).
-8. Output MUST contain only the contents of the single target file path you were asked to create.
+7. Files in the same unit must stay consistent (same title text, colors, and layout).
+8. Each ===== FILE ===== body must contain ONLY that path's contents — never concatenate siblings into one body.
 9. Angular standalone components MUST set standalone: true. If the template uses *ngIf, *ngFor, ngClass, ngStyle, or async pipe, import CommonModule from '@angular/common' (NOT from '@angular/core') and list it in the @Component imports array. Prefer @if / @for built-in control flow when possible.
 10. Class name MUST match the file: avatar.component.ts → export class AvatarComponent (never AppComponent unless the file is app.component.ts).
 11. Import RxJS symbols (Subject, takeUntil, map, etc.) from 'rxjs' — never from '@angular/core'.
@@ -3195,7 +3721,7 @@ CRITICAL RULES:
 13. Use WritableSignal (from signal()) when calling .set(); plain Signal is read-only.
 14. Getters are NOT callable in templates: use avatarClasses not avatarClasses(). Methods that need () must be real methods, not get accessors.
 15. Do not reference private fields in templates — use protected or public.
-16. Path aliases: @app/* → src/app/*, @core/* → src/app/core/*, @pages/* → src/app/pages/*, @store/* → src/app/store/*, @env/* → src/environments/*, @shared/* → src/app/shared/*, @configs/* → src/app/config/*, @/ → src/. Also emit the actual src/lib/*.ts files in the plan when a cn() helper is needed.
+16. Path aliases that exist in the workspace: @/* → src/*, @app/* → src/app/*, @env/* → src/environments/*. Prefer relative imports under src/app. Do NOT invent @core/@shared/@store/@configs unless those folders exist in THIS conversion. Emit real src/lib/*.ts files when a cn() helper is needed.
 17. Convert lucide-react icons to plain inline <svg>…</svg> in Angular (NO @lucide/angular, lucide-angular, or lucide-react in Angular package.json). NEVER use <Home />, <lucide-home>, or <svg lucideHome>. Do NOT import @radix-ng/* or other invented packages.
 18. app.component.ts must ONLY be the root shell component — never put ErrorHandler, provideHttpClient, or EnvironmentProviders inside a @Component.
 19. app.config.ts / routing providers belong in src/app/app.config.ts and src/app/app.routes.ts only.
@@ -3208,21 +3734,33 @@ CRITICAL RULES:
 26. Do not declare a field and a getter with the same name (e.g. canScrollPrev).
 27. Import HostListener from '@angular/core' when using @HostListener. Never import node:process in browser components.
 28. embla-carousel: \`import EmblaCarousel, { EmblaOptionsType, EmblaCarouselType } from 'embla-carousel'\` — never named Embla / EmblaOptions / EmblaApi.
-29. app.routes.ts must import AdminShellComponent (and other pages) from their real files, never from './app.component'. Always \`export const routes\`.
+29. app.routes.ts must import page components from their real files, never from './app.component'. Always \`export const routes\`. Include a route for every converted page.
 30. Form error checks: use errors?.['required'] / errors?.['minlength'] bracket access.
 31. HTML must be balanced and complete — no truncated templates (Unexpected EOF).
-32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow best folder structure (Angular: app/core|shared|pages/{common,auth,admin}; React: components|features|hooks|lib|services) and high code quality.
+32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow a clean folder structure (Angular: src/app with pages/components/services; React: components|features|hooks|lib|services) and high code quality.
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
-36. WEB_ANGULAR TEMPLATE: The complete template kit under src/app/config, src/app/core, src/app/shared, src/app/store, src/app/pages/common, src/app/pages/deeplink and src/app/app.config.ts is ALREADY present and complete — never recreate or overwrite it. Import via @app/*, @core/*, @pages/*, @store/*, @env/*, @shared/*, @configs/*. Only src/app/pages/auth/* and src/app/pages/admin/* feature pages are yours to functionalize/create.
-37. ENVIRONMENTS: src/environments/environment*.ts already include production, host, clientId, clientSecret, encryption. Extend with apiUrl/appTitle/theme in the SAME unit as the config that needs them (do not cast missing keys).
+36. COMPLETE CONVERSION: There is NO starter-kit template. Convert every source feature into real target files. Do not skip CRUD/admin/settings pages. You may overwrite stub app.component / app.routes / App.tsx.
+37. ENVIRONMENTS: src/environments/environment*.ts start as { production }. Extend with keys the converted code needs in the SAME unit.
 `;
 
   const generatedFiles = {};
   let npmInstallDone = false;
+  const skippedUnits = [];
 
-  for (let unitIndex = 0; unitIndex < migrationUnits.length; unitIndex++) {
+  const unitWriterSystemInstruction = `${fileWriterSystemInstruction}
+
+UNIT OUTPUT FORMAT (MANDATORY):
+Write EVERY file in the unit in ONE response using this exact marker format (not JSON):
+===== FILE: src/path/to/file.ts =====
+<complete file contents>
+===== FILE: src/path/to/file.html =====
+<complete file contents>
+===== END =====
+Do not wrap the whole response in markdown fences. Each file must be complete.`;
+
+  for (let unitIndex = startUnitIndex; unitIndex < migrationUnits.length; unitIndex++) {
     const unit = migrationUnits[unitIndex];
     report(
       'unit',
@@ -3231,251 +3769,179 @@ CRITICAL RULES:
     );
     console.log(
       `[${sessionId}] Unit [${unitIndex + 1}/${migrationUnits.length}] -> ${unit.label} ` +
-      `(${unit.files.length} file${unit.files.length > 1 ? 's' : ''})`
+      `(${unit.files.length} file${unit.files.length > 1 ? 's' : ''}, 1 AI call)`
     );
 
-    for (let fileIndex = 0; fileIndex < unit.files.length; fileIndex++) {
-      const fileTarget = unit.files[fileIndex];
-      console.log(`[${sessionId}]   Writing ${fileTarget.newPath}`);
+    const targetSpecificContext = sourceContextForUnit(unit, essentialFilesMap);
+    const expectedPaths = unit.files.map((f) => f.newPath);
+    const unitPrompt = `
+[TARGET FILES IN THIS UNIT]
+${expectedPaths.map((p) => `- ${p}`).join('\n')}
 
-      let targetSpecificContext = '';
-      if (
-        fileTarget.approximateSourceFilesToRead &&
-        Array.isArray(fileTarget.approximateSourceFilesToRead)
-      ) {
-        for (const relPath of fileTarget.approximateSourceFilesToRead) {
-          if (essentialFilesMap[relPath]) {
-            targetSpecificContext += `\n--- SOURCE FILE: ${relPath} ---\n${essentialFilesMap[relPath]}\n`;
-          }
-        }
-      }
+[RELEVANT SOURCE CODE]
+${targetSpecificContext || '(no matched source files — convert from the unit purpose)'}
 
-      const componentDir = path.posix.dirname(fileTarget.newPath.replace(/\\/g, '/'));
-      let siblingContext = '';
-      for (const [generatedPath, generatedContent] of Object.entries(generatedFiles)) {
-        const generatedDir = path.posix.dirname(generatedPath.replace(/\\/g, '/'));
-        if (generatedDir === componentDir && generatedPath !== fileTarget.newPath) {
-          siblingContext += `\n--- ALREADY GENERATED SIBLING FILE: ${generatedPath} ---\n${generatedContent}\n`;
-        }
-      }
+[USER MIGRATION REQUIREMENTS]
+${userPrompt}
 
-      const individualFileWriterPrompt = `
-[GLOBAL TARGET LAYOUT BLUEPRINT MAP]
-${fileTree}
+[PURPOSE]
+${unit.files.map((f) => `- ${f.newPath}: ${f.explanationOfSource || unit.label}`).join('\n')}
+${isSameFramework ? 'Keep the same framework. Convert fully — do not strip features.' : `Target framework: ${toTech}`}
 
-[RELEVANT SOURCE CODE CONTEXT FOR THIS TASK]
-${targetSpecificContext || 'Setup/Configuration asset generation task.'}
-
-[MANDATORY USER MIGRATION REQUIREMENTS — highest priority, override source defaults]
-${enhancedPrompt}
-
-[ALREADY GENERATED FILES IN THIS COMPONENT FOLDER]
-${siblingContext || 'None yet — you are the first file for this component.'}
-
-[INCREMENTAL UNIT]
-Unit ${unitIndex + 1}/${migrationUnits.length}: ${unit.label}
-Files in this unit: ${unit.files.map((f) => f.newPath).join(', ')}
-Completed units so far: ${unitIndex} — prefer compile-safe stubs for unfinished later units.
-
-[ASSIGNMENT DIRECTIONS]
-Create the complete code file content for: "${fileTarget.newPath}"
-Purpose/Details: ${fileTarget.explanationOfSource}
-${isSameFramework ? 'Keep the same framework. Strip down to essential auth + dashboard code.' : `Migration target framework: ${toTech}`}
-Write ONLY this one file. No sibling file contents. No markdown fences.
+Write ALL files listed above in one response using ===== FILE: path ===== markers.
+Each marker body is ONLY that file's contents (ts stays ts, html stays html, scss stays scss).
+Never write placeholder pages (no "HomeComponent placeholder", no empty stub classes). Convert the real source UI, including lucide-react icons as inline SVG.
 `;
 
-      let fileContent;
+    let bundleRaw = null;
+    let parsedFiles = [];
+    const maxUnitAttempts = 6;
+    let unitPromptAttempt = unitPrompt;
+    for (let attempt = 1; attempt <= maxUnitAttempts; attempt++) {
       try {
-        fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
+        bundleRaw = await callLLM(unitWriterSystemInstruction, unitPromptAttempt, false, aiProvider, aiModel);
+        parsedFiles = parseUnitFileBundle(bundleRaw, expectedPaths);
+        const placeholders = parsedFiles.filter((f) =>
+          isPlaceholderGeneratedFile(f.path, f.content)
+        );
+        if (placeholders.length > 0) {
+          console.warn(
+            `[${sessionId}] Placeholder output for ${unit.label} (attempt ${attempt}/${maxUnitAttempts}) — retrying`
+          );
+          bundleRaw = null;
+          parsedFiles = [];
+          unitPromptAttempt = `${unitPrompt}
+
+CRITICAL: Do NOT write placeholder text like "HomeComponent placeholder" or empty stub classes.
+Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-react icons as inline <svg>, real state and handlers.`;
+          continue;
+        }
+        if (parsedFiles.length > 0) break;
+        bundleRaw = null;
       } catch (err) {
-        console.error(`[${sessionId}] LLM call failed for ${fileTarget.newPath}:`, err.message);
-        await pause(10000);
-        fileContent = await callLLM(fileWriterSystemInstruction, individualFileWriterPrompt, false, aiProvider, aiModel);
-      }
-
-      const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
-      if (!safePath) {
-        console.log(`[${sessionId}] Refusing unsafe write path: ${fileTarget.newPath}`);
-        continue;
-      }
-
-      ensureDirectoryExists(path.dirname(safePath.full));
-      const trimmedContent = sanitizeGeneratedContent(safePath.relative, fileContent);
-      fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
-      generatedFiles[safePath.relative] = trimmedContent;
-
-      // Cool down between file LLM calls inside a multi-file unit
-      if (fileIndex < unit.files.length - 1) {
-        console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s...`);
-        await pause(RATE_LIMIT_PAUSE_MS);
+        const rateLimited = err instanceof AllProvidersRateLimitedError || err?.status === 429;
+        if (rateLimited) {
+          const waitMs = Math.min(120000, Math.max(15000, getRetryAfterMs(err, 30000) * attempt));
+          console.warn(
+            `[${sessionId}] Rate limited on unit ${unit.label}. ` +
+            `Waiting ${Math.round(waitMs / 1000)}s then retrying (${attempt}/${maxUnitAttempts})...`
+          );
+          report(
+            'unit',
+            `Rate limited — waiting ${Math.round(waitMs / 1000)}s, then continuing unit ${unitIndex + 1}/${migrationUnits.length}...`,
+            { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
+          );
+          await pause(waitMs);
+          continue;
+        }
+        console.error(
+          `[${sessionId}] LLM call failed for unit ${unit.label} ` +
+          `(attempt ${attempt}/${maxUnitAttempts}):`,
+          err.message
+        );
+        if (attempt < maxUnitAttempts) {
+          await pause(4000);
+        }
       }
     }
 
-    // -----------------------------------------------------------------------
-    // INCREMENTAL BUILD: after the whole unit is written — must pass to proceed
-    // -----------------------------------------------------------------------
-    if (targetLower.includes('angular') || targetLower.includes('react')) {
-      console.log(
-        `[${sessionId}] Unit ${unitIndex + 1}/${migrationUnits.length}: Verifying build after ${unit.label}...`
+    if (!bundleRaw || parsedFiles.length === 0) {
+      console.warn(
+        `[${sessionId}] Unit ${unit.label} failed after ${maxUnitAttempts} attempts — will not ship a stub.`
       );
-
-      let stepBuildVerified = false;
-      for (let buildAttempt = 1; buildAttempt <= MAX_BUILD_FIX_ATTEMPTS; buildAttempt++) {
-        const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, npmInstallDone);
-        if (buildResult.success) {
-          npmInstallDone = true;
-          stepBuildVerified = true;
-          console.log(`[${sessionId}] Unit ${unitIndex + 1} build ✅ PASSED (attempt ${buildAttempt})`);
-          report(
-            'unit',
-            `Unit ${unitIndex + 1}/${migrationUnits.length} compiled successfully`,
-            { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
-          );
-          break;
-        }
-        // Only skip install on later attempts when install actually succeeded
-        if (buildResult.installOk) {
-          npmInstallDone = true;
-        } else if (targetLower.includes('angular') && targetVersions?.angular) {
-          // Install failure is often a bad package pin — re-lock Material/CDK majors and retry
-          enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
-        }
-
-        if (buildAttempt < MAX_BUILD_FIX_ATTEMPTS) {
-          const isInstallFailure = /npm install failed/i.test(buildResult.errors || '');
-          console.log(
-            `[${sessionId}] Unit ${unitIndex + 1} build ❌ FAILED ` +
-            `(attempt ${buildAttempt}/${MAX_BUILD_FIX_ATTEMPTS}). ` +
-            (isInstallFailure ? 'Re-checking package.json then retrying install...' : 'Asking AI to fix...')
-          );
-          report(
-            'fix',
-            isInstallFailure
-              ? `Unit ${unitIndex + 1}/${migrationUnits.length}: fixing install...`
-              : `Unit ${unitIndex + 1}/${migrationUnits.length}: fixing build errors (attempt ${buildAttempt})...`,
-            { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
-          );
-
-          if (isInstallFailure) {
-            // AI cannot rewrite package.json (protected) — skip LLM fix for install errors
-            continue;
-          }
-
-          // Deterministic env patch first (theme/appTitle mismatches) — cheaper than LLM
-          if (targetLower.includes('angular')) {
-            const envPatched = patchEnvironmentMissingProps(migrationWorkspacePath, buildResult.errors);
-            if (envPatched > 0) {
-              console.log(
-                `[${sessionId}] Patched ${envPatched} environment file(s) for missing keys. Retrying build before AI fix...`
-              );
-              continue;
-            }
-          }
-
-          const fixes = await askAIToFixBuildErrors(
-            sessionId,
-            buildResult.errors,
-            migrationWorkspacePath,
-            aiProvider,
-            aiModel,
-            toTech
-          );
-          if (fixes.length === 0) {
-            console.warn(`[${sessionId}] AI returned no fixes for unit ${unitIndex + 1}.`);
-            // On syntax failures, force a full rewrite of this unit's primary .ts/.tsx file
-            if (isSyntaxHeavyBuildFailure(buildResult.errors)) {
-              const primary = unit.files.find((f) => /\.(ts|tsx)$/i.test(f.newPath) && !/\.d\.ts$/i.test(f.newPath));
-              if (primary) {
-                console.log(`[${sessionId}] Syntax-heavy failure — forcing rewrite of ${primary.newPath}`);
-                const rewritePrompt = `
-[MANDATORY USER MIGRATION REQUIREMENTS]
-${enhancedPrompt}
-
-[BUILD ERRORS]
-${buildResult.errors}
-
-[ASSIGNMENT]
-Rewrite COMPLETE valid contents for: "${primary.newPath}"
-Purpose: ${primary.explanationOfSource}
-Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
-`;
-                try {
-                  let rewritten = await callLLM(fileWriterSystemInstruction, rewritePrompt, false, aiProvider, aiModel);
-                  const safePath = resolveSafeWritePath(migrationWorkspacePath, primary.newPath);
-                  if (safePath) {
-                    const sanitized = sanitizeGeneratedContent(safePath.relative, rewritten);
-                    fs.writeFileSync(safePath.full, sanitized, 'utf-8');
-                    generatedFiles[safePath.relative] = sanitized;
-                    console.log(`[${sessionId}] Rewrote: ${safePath.relative}`);
-                  }
-                } catch (err) {
-                  console.warn(`[${sessionId}] Forced rewrite failed: ${err.message}`);
-                }
-              }
-            }
-            continue;
-          }
-          for (const fix of fixes) {
-            const fixPath = resolveFixWritePath(migrationWorkspacePath, fix.relativePath, buildResult.errors);
-            if (!fixPath) {
-              console.warn(`[${sessionId}] Skipping unsafe/unresolved fix path: ${fix.relativePath}`);
-              continue;
-            }
-            if (fixPath.relative.replace(/\\/g, '/') !== String(fix.relativePath).replace(/\\/g, '/').replace(/^\.?\//, '')) {
-              console.log(`[${sessionId}] Remapped fix path ${fix.relativePath} → ${fixPath.relative}`);
-              // Remove mistaken orphan path if AI created src/admin/... duplicate
-              const orphan = path.join(migrationWorkspacePath, String(fix.relativePath).replace(/^\.?\//, ''));
-              if (
-                fs.existsSync(orphan) &&
-                String(fix.relativePath).replace(/\\/g, '/').startsWith('src/admin/') &&
-                fixPath.relative.startsWith('src/app/admin/')
-              ) {
-                try { fs.unlinkSync(orphan); } catch { /* ignore */ }
-              }
-            }
-            ensureDirectoryExists(path.dirname(fixPath.full));
-            const sanitized = sanitizeGeneratedContent(fixPath.relative, fix.content);
-            fs.writeFileSync(fixPath.full, sanitized, 'utf-8');
-            console.log(`[${sessionId}] Fixed: ${fixPath.relative}`);
-            generatedFiles[fixPath.relative] = sanitized;
-          }
-          if (targetLower.includes('angular')) {
-            const pkgBefore = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
-              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
-              : '';
-            repairAngularWorkspace(migrationWorkspacePath, {});
-            const pkgAfter = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
-              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
-              : '';
-            if (pkgBefore !== pkgAfter) npmInstallDone = false;
-          } else if (targetLower.includes('react')) {
-            const pkgBefore = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
-              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
-              : '';
-            repairReactWorkspace(migrationWorkspacePath, {});
-            const pkgAfter = fs.existsSync(path.join(migrationWorkspacePath, 'package.json'))
-              ? fs.readFileSync(path.join(migrationWorkspacePath, 'package.json'), 'utf-8')
-              : '';
-            if (pkgBefore !== pkgAfter) npmInstallDone = false;
-          }
-        } else {
-          const errTail = (buildResult.errors || '').slice(-2000);
-          const priorNote = unitIndex > 0
-            ? 'Earlier units compiled; '
-            : '';
-          throw new Error(
-            `Incremental migration stopped at unit ${unitIndex + 1}/${migrationUnits.length} ` +
-            `(${unit.label}): build still failing after ${MAX_BUILD_FIX_ATTEMPTS} fix attempts. ` +
-            `${priorNote}fix this unit before continuing.\n\nLast build errors:\n${errTail}`
-          );
-        }
+      skippedUnits.push(unit.label);
+      report(
+        'unit',
+        `Unit ${unitIndex + 1}/${migrationUnits.length} (${unit.label}) did not convert — continuing remaining units, then failing if incomplete.`,
+        { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
+      );
+      writeCheckpoint(sessionId, {
+        userPrompt,
+        fromTech,
+        toTech,
+        aiProvider,
+        aiModel,
+        targetVersion,
+        priorityRulesMode,
+        projectName,
+        designColors,
+        units: migrationUnits,
+        completedUnitIndex: unitIndex,
+        paused: false,
+        skippedUnit: unit.label
+      });
+      if (unitIndex < migrationUnits.length - 1) {
+        await pause(RATE_LIMIT_PAUSE_MS);
       }
+      continue;
+    }
 
-      if (!stepBuildVerified) {
-        throw new Error(
-          `Incremental migration stopped at unit ${unitIndex + 1}/${migrationUnits.length} ` +
-          `(${unit.label}): build did not pass. Refusing to proceed to the next unit.`
+    const byPath = new Map(parsedFiles.map((f) => [f.path.replace(/\\/g, '/').replace(/^\.?\//, ''), f]));
+    let wroteAllExpected = true;
+    for (const fileTarget of unit.files) {
+      const match =
+        byPath.get(fileTarget.newPath.replace(/\\/g, '/')) ||
+        parsedFiles.find((f) => f.path.endsWith(path.posix.basename(fileTarget.newPath)));
+      if (!match) {
+        console.warn(`[${sessionId}] Unit bundle missing ${fileTarget.newPath} — incomplete unit`);
+        wroteAllExpected = false;
+        continue;
+      }
+      const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
+      if (!safePath) {
+        console.log(`[${sessionId}] Refusing unsafe write path: ${fileTarget.newPath}`);
+        wroteAllExpected = false;
+        continue;
+      }
+      ensureDirectoryExists(path.dirname(safePath.full));
+      const trimmedContent = sanitizeGeneratedContent(safePath.relative, match.content);
+      fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
+      generatedFiles[safePath.relative] = trimmedContent;
+      console.log(`[${sessionId}]   Wrote ${safePath.relative}`);
+    }
+    if (!wroteAllExpected) {
+      skippedUnits.push(`${unit.label} (incomplete file set)`);
+    }
+
+    writeCheckpoint(sessionId, {
+      userPrompt,
+      fromTech,
+      toTech,
+      aiProvider,
+      aiModel,
+      targetVersion,
+      priorityRulesMode,
+      projectName,
+      designColors,
+      units: migrationUnits,
+      completedUnitIndex: unitIndex,
+      paused: false
+    });
+
+    // Periodic compile check — skip most units to save free-tier time/quota.
+    // Failures do NOT stop the conversion; the final build still tries to fix.
+    const isLastUnit = unitIndex === migrationUnits.length - 1;
+    const shouldBuildNow =
+      (targetLower.includes('angular') || targetLower.includes('react')) &&
+      BUILD_EVERY_N_UNITS > 0 &&
+      !isLastUnit &&
+      (unitIndex + 1) % BUILD_EVERY_N_UNITS === 0;
+
+    if (shouldBuildNow) {
+      console.log(
+        `[${sessionId}] Checkpoint build after unit ${unitIndex + 1}/${migrationUnits.length}...`
+      );
+      const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, npmInstallDone);
+      if (buildResult.installOk) npmInstallDone = true;
+      if (buildResult.success) {
+        console.log(`[${sessionId}] Checkpoint build ✅`);
+      } else {
+        console.warn(
+          `[${sessionId}] Checkpoint build failed — continuing conversion (final fix at the end).\n` +
+          (buildResult.errors || '').slice(-800)
         );
+        if (targetLower.includes('angular')) repairAngularWorkspace(migrationWorkspacePath, {});
+        else if (targetLower.includes('react')) repairReactWorkspace(migrationWorkspacePath, {});
       }
     }
 
@@ -3502,15 +3968,15 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
   // ensure correct tooling. The AI owns src/app feature pages only — the
   // web_angular kit/config files are restored from the pristine template.
   if (targetLower.includes('react')) {
-    console.log(`[${sessionId}] Re-injecting React templates to ensure correct config files...`);
-    injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react);
+    console.log(`[${sessionId}] Restoring React tooling files (keeping converted src/)...`);
+    injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react, { preserveSrc: true });
     ensureReactRuntimeFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running React post-generation repairs...`);
     repairReactWorkspace(migrationWorkspacePath, { sourcePackageJson });
     enforceReactPackageVersions(migrationWorkspacePath, targetVersions.react);
   } else if (targetLower.includes('angular')) {
     console.log(
-      `[${sessionId}] Restoring web_angular template config files (AI kept ownership of src/app feature pages)...`
+      `[${sessionId}] Restoring Angular tooling files (keeping converted src/)...`
     );
     restoreAngularRootConfigs(migrationWorkspacePath, targetVersions.angular, {
       projectName,
@@ -3570,23 +4036,56 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
   }
 
   // -----------------------------------------------------------------------
-  // 5b. Verify the build compiles before packaging
+  // 5b. Quality gate — never ship stubs, skipped pages, or a failing build
   // -----------------------------------------------------------------------
+  if (targetLower.includes('angular')) {
+    const defects = collectConversionDefects(migrationWorkspacePath);
+    const missingPages = collectMissingSourcePages(migrationWorkspacePath, essentialFilesMap);
+    const problems = [];
+    if (skippedUnits.length) {
+      problems.push(`skipped units: ${skippedUnits.join(', ')}`);
+    }
+    if (defects.placeholders.length) {
+      problems.push(`placeholder templates: ${defects.placeholders.join(', ')}`);
+    }
+    if (missingPages.length) {
+      problems.push(`source pages never converted: ${missingPages.join(', ')}`);
+    }
+    if (problems.length) {
+      throw new ConversionIncompleteError(
+        `Conversion incomplete — refusing to ship a stub or partial project (${problems.join('; ')}). ` +
+        `Retry the conversion, or pick a different free model.`
+      );
+    }
+  } else if (skippedUnits.length) {
+    throw new ConversionIncompleteError(
+      `Conversion incomplete — skipped units: ${skippedUnits.join(', ')}. Refusing to ship a partial project.`
+    );
+  }
+
   const buildCheck = await verifyAndFixBuild(
     sessionId,
     migrationWorkspacePath,
     toTech,
     aiProvider,
-    aiModel || undefined
+    aiModel || undefined,
+    essentialFilesMap
   );
   if (!buildCheck.verified) {
-    console.warn(`[${sessionId}] Final build verification failed after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Delivering anyway.`);
+    const tail = String(buildCheck.errors || '').trim().slice(-1200);
+    throw new ConversionIncompleteError(
+      `Conversion failed: the migrated project did not compile after ${MAX_BUILD_FIX_ATTEMPTS} fix attempts. ` +
+      `The ZIP was not created.${tail ? `\n${tail}` : ''}`
+    );
   }
 
   // npm ci sanity check — the delivered project must install + build after only `npm ci`
   const npmCiCheck = await verifyNpmCiBuild(migrationWorkspacePath, toTech, sessionId);
   if (!npmCiCheck.ok) {
-    console.warn(`[${sessionId}] npm ci sanity check failed:\n${npmCiCheck.errors.slice(-1500)}`);
+    throw new ConversionIncompleteError(
+      `Conversion failed: clean npm ci + build did not succeed. The ZIP was not created.\n` +
+      `${String(npmCiCheck.errors || '').slice(-1500)}`
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -3631,6 +4130,7 @@ Fix all syntax errors. Output ONLY the raw file contents — no markdown fences.
   finalZip.writeZip(outputZipPath);
 
   console.log(`[${sessionId}] Final ZIP written to ${outputZipPath}`);
+  clearCheckpoint(sessionId);
 
   return outputZipPath;
 }
@@ -3792,13 +4292,19 @@ export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, 
   report('rework', 'Verifying the updated project still builds...');
   const buildCheck = await verifyAndFixBuild(sessionId, workspacePath, toTech, aiProvider, aiModel);
   if (!buildCheck.verified) {
-    console.warn(`[${sessionId}] Rework: final build verification failed after ${MAX_BUILD_FIX_ATTEMPTS} attempts. Delivering anyway.`);
+    throw new ConversionIncompleteError(
+      `Rework failed: the updated project did not compile after ${MAX_BUILD_FIX_ATTEMPTS} fix attempts. ` +
+      `The ZIP was not created.${buildCheck.errors ? `\n${String(buildCheck.errors).slice(-1200)}` : ''}`
+    );
   }
 
   // 5. npm ci sanity check
   const npmCiCheck = await verifyNpmCiBuild(workspacePath, toTech, sessionId);
   if (!npmCiCheck.ok) {
-    console.warn(`[${sessionId}] Rework: npm ci sanity check failed:\n${npmCiCheck.errors.slice(-1500)}`);
+    throw new ConversionIncompleteError(
+      `Rework failed: clean npm ci + build did not succeed. The ZIP was not created.\n` +
+      `${String(npmCiCheck.errors || '').slice(-1500)}`
+    );
   }
 
   // 6. Remove node_modules to keep ZIP small

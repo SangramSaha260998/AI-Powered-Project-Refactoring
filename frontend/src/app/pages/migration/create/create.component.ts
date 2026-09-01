@@ -1,5 +1,6 @@
 import { Component, ElementRef, OnDestroy, inject, signal, viewChild } from '@angular/core';
 import { DecimalPipe } from '@angular/common';
+import { ActivatedRoute } from '@angular/router';
 import { Subscription } from 'rxjs';
 import { firstValueFrom } from 'rxjs';
 import { ThemeService, SessionService } from '@core/services';
@@ -15,7 +16,7 @@ import {
   ProjectCheckResponse,
 } from '@shared/models';
 import { appSettings } from '@app/config';
-import { triggerBlobDownload } from '@shared/utilities';
+import { isWithinUploadLimit, isZipFileName, triggerBlobDownload } from '@shared/utilities';
 
 @Component({
   selector: 'app-create-migration',
@@ -27,7 +28,15 @@ import { triggerBlobDownload } from '@shared/utilities';
 export class CreateMigrationComponent implements OnDestroy {
   private readonly migrationService = inject(MigrationService);
   private readonly sessionService = inject(SessionService);
+  private readonly route = inject(ActivatedRoute);
   readonly themeService = inject(ThemeService);
+
+  private static readonly RETIRED_GENAI = /gemini-(1\.5|2\.0|2\.5)-/;
+  private static readonly PREFERRED_GENAI = [
+    'gemini-3.5-flash-lite',
+    'gemini-3.5-flash',
+    'gemini-3.6-flash',
+  ];
 
   private readonly fileInput = viewChild<ElementRef<HTMLInputElement>>('fileInput');
 
@@ -52,8 +61,8 @@ export class CreateMigrationComponent implements OnDestroy {
   };
 
   aiProviders: AiProviderOption[] = [
-    { id: 'openrouter', label: 'OpenRouter' },
     { id: 'genai', label: 'Google Gemini' },
+    { id: 'openrouter', label: 'OpenRouter' },
     { id: 'groq', label: 'Groq' },
     { id: 'ollama', label: 'Ollama Cloud' },
     { id: 'tokenrouter', label: 'TokenRouter' },
@@ -69,7 +78,7 @@ export class CreateMigrationComponent implements OnDestroy {
 
   fromTech = signal<string>('');
   toTech = signal<string>('');
-  aiProvider = signal<string>('');
+  aiProvider = signal<string>('genai');
   aiModel = signal<string>('');
   targetVersion = signal<string>('');
   isDragging = signal<boolean>(false);
@@ -89,18 +98,6 @@ export class CreateMigrationComponent implements OnDestroy {
   checkingProject = signal<boolean>(true);
   reworkPrompt = signal<string>('');
 
-  // ChatGPT workflow: reference project + priority rules + visual QA
-  priorityRulesMode = signal<string>('react-ui');
-  enableVisualQa = signal<boolean>(false);
-  visualQaRoutes = signal<string>('/');
-  referenceFile = signal<File | null>(null);
-  isReferenceDragging = signal<boolean>(false);
-
-  priorityRulesOptions = [
-    { value: 'react-ui', label: 'React = UI source, Angular reference = architecture' },
-    { value: 'angular-ui', label: 'Angular reference = UI + architecture source' },
-  ];
-
   private modelsVersion = signal(0);
   private lastSessionId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -108,23 +105,11 @@ export class CreateMigrationComponent implements OnDestroy {
   private settlingDownload = false;
   private lastMode: 'create' | 'rework' = 'create';
 
-  private readonly defaultStripDownPrompt = `STRIP DOWN PROJECT — KEEP ONLY AUTH + DASHBOARD
+  private readonly defaultStripDownPrompt = `Convert the uploaded project completely.
 
-DELETE all components/files EXCEPT:
-- Auth module (login, register, forgot password, OTP, password reset)
-- Dashboard page and its sub-components
-- Core app shell (App component, routing, main layout)
-- Shared services (auth service, guards, HTTP interceptors)
-
-REMOVE entirely:
-- Profile/settings/user-management pages
-- Listing/table/CRUD pages for any entities
-- Blog, about, contact, landing pages
-- Demo/placeholder/skeleton components
-
-UPDATE routing: login as default route, dashboard post-login, auth guard on protected routes.
-
-Final app must compile and run: npm install → ng serve`;
+Keep every page, component, route, and service from the source.
+Preserve branding, layout, and behavior unless I specify otherwise.
+Output must compile and run after npm install.`;
 
   get placeholderText(): string {
     const from = this.fromTech();
@@ -151,6 +136,7 @@ Final app must compile and run: npm install → ng serve`;
   }
 
   constructor() {
+    this.loadProviderModels('genai');
     void this.checkExistingProject();
   }
 
@@ -221,59 +207,6 @@ Final app must compile and run: npm install → ng serve`;
   onReworkPromptChange(event: Event): void {
     const value = (event.target as HTMLTextAreaElement).value;
     this.reworkPrompt.set(value);
-  }
-
-  onPriorityRulesChange(event: Event): void {
-    const value = (event.target as HTMLSelectElement).value;
-    this.priorityRulesMode.set(value);
-  }
-
-  onEnableVisualQaChange(event: Event): void {
-    const target = event.target as HTMLInputElement;
-    this.enableVisualQa.set(target.checked);
-  }
-
-  onVisualQaRoutesChange(event: Event): void {
-    const value = (event.target as HTMLInputElement).value;
-    this.visualQaRoutes.set(value || '/');
-  }
-
-  onReferenceDragOver(event: DragEvent): void {
-    event.preventDefault();
-    this.isReferenceDragging.set(true);
-  }
-
-  onReferenceDragLeave(): void {
-    this.isReferenceDragging.set(false);
-  }
-
-  onReferenceDrop(event: DragEvent): void {
-    event.preventDefault();
-    this.isReferenceDragging.set(false);
-    const files = event.dataTransfer?.files;
-    if (files && files.length > 0) {
-      this.validateAndSetReferenceFile(files[0]);
-    }
-  }
-
-  onReferenceFileSelected(event: Event): void {
-    const input = event.target as HTMLInputElement;
-    if (input.files && input.files.length > 0) {
-      this.validateAndSetReferenceFile(input.files[0]);
-    }
-  }
-
-  private validateAndSetReferenceFile(file: File): void {
-    if (file.name.endsWith('.zip')) {
-      this.referenceFile.set(file);
-      this.statusMessage.set('');
-      this.isSuccess.set(false);
-    } else {
-      this.isSuccess.set(false);
-      this.statusMessage.set('❌ Invalid reference file. Please drop a valid zipped archive.');
-      this.referenceFile.set(null);
-      this.clearMessage();
-    }
   }
 
   onFileSelected(event: Event): void {
@@ -396,17 +329,11 @@ Final app must compile and run: npm install → ng serve`;
 
     const formData = new FormData();
     formData.append('zipFile', file);
-    if (this.referenceFile()) {
-      formData.append('referenceZip', this.referenceFile()!);
-    }
     formData.append('sessionId', this.lastSessionId);
     formData.append('fromTech', from);
     formData.append('toTech', to);
     formData.append('prompt', promptText);
     formData.append('aiProvider', this.aiProvider());
-    formData.append('priorityRulesMode', this.priorityRulesMode());
-    formData.append('enableVisualQa', String(this.enableVisualQa()));
-    formData.append('visualQaRoutes', this.visualQaRoutes());
     if (this.aiModel()) {
       formData.append('aiModel', this.aiModel());
     }
@@ -492,6 +419,53 @@ Final app must compile and run: npm install → ng serve`;
     });
   }
 
+  continueConversion(): void {
+    const project = this.activeProject();
+    if (!project?.sessionId || this.isLoading()) return;
+
+    this.stopPolling();
+    this.startSub?.unsubscribe();
+    this.settlingDownload = false;
+
+    this.isLoading.set(true);
+    this.isSuccess.set(false);
+    this.readySessionId.set(null);
+    this.progressText.set('Resuming conversion...');
+    this.statusMessage.set('⏳ Resuming conversion from the last saved unit...');
+    this.migrationProgress.set(-1);
+    this.currentStep.set('Resuming...');
+    this.totalSteps.set(project.unitTotal || 0);
+    this.currentStepIndex.set(Math.max(0, (project.completedUnitIndex ?? -1) + 1));
+
+    this.lastSessionId = project.sessionId;
+    this.lastMode = 'create';
+
+    this.startSub = this.migrationService
+      .resumeMigration(project.sessionId, project.aiProvider, project.aiModel)
+      .subscribe({
+        next: (res) => {
+          const sessionId = res.sessionId || project.sessionId;
+          this.lastSessionId = sessionId;
+          this.progressText.set(res.message || 'Resuming conversion...');
+          this.statusMessage.set(`⏳ ${res.message || 'Resuming conversion...'}`);
+          this.startStatusPolling(sessionId, 'create');
+        },
+        error: (err: any) => {
+          this.stopPolling();
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+          let errorMessage = 'Failed to resume conversion.';
+          if (err?.error?.error) {
+            errorMessage = err.error.error;
+          } else if (err?.message) {
+            errorMessage = err.message;
+          }
+          this.statusMessage.set(`❌ ${errorMessage}`);
+          console.error(err);
+        },
+      });
+  }
+
   downloadLatestZip(): void {
     const project = this.activeProject();
     if (!project?.sessionId || this.isLoading()) return;
@@ -558,13 +532,16 @@ Final app must compile and run: npm install → ng serve`;
     this.modelsLoading.set(true);
     this.migrationService.loadModels(provider).subscribe({
       next: (res) => {
-        this.providerModels[provider] = res.models ?? [];
+        this.providerModels[provider] = this.filterProviderModels(provider, res.models ?? []);
         this.modelsVersion.update((v) => v + 1);
         this.modelsLoading.set(false);
         if (this.aiProvider() === provider) {
           const current = this.aiModel();
-          if (current && !this.providerModels[provider].some((m) => m.id === current)) {
-            this.aiModel.set('');
+          const models = this.providerModels[provider];
+          if (!current && models.length > 0) {
+            this.aiModel.set(models[0].id);
+          } else if (current && !models.some((m) => m.id === current)) {
+            this.aiModel.set(models[0]?.id || '');
           }
         }
       },
@@ -584,25 +561,62 @@ Final app must compile and run: npm install → ng serve`;
   private autoFillPromptIfSameFramework(): void {
     const from = this.fromTech();
     const to = this.toTech();
-    if (from && to && from.toLowerCase() === to.toLowerCase()) {
-      if (!this.prompt() || this.prompt() === this.defaultStripDownPrompt) {
-        this.prompt.set(this.defaultStripDownPrompt);
-      }
+    if (!from || !to) return;
+    if (!this.prompt() || this.prompt() === this.defaultStripDownPrompt) {
+      this.prompt.set(this.defaultStripDownPrompt);
     }
   }
 
+  private filterProviderModels(provider: string, models: ModelOption[]): ModelOption[] {
+    let list = models.filter((m) => Boolean(m?.id));
+    if (provider === 'genai') {
+      list = list.filter((m) => !CreateMigrationComponent.RETIRED_GENAI.test(m.id));
+      list = [...list].sort((a, b) => {
+        const preferred = CreateMigrationComponent.PREFERRED_GENAI;
+        const ai = preferred.indexOf(a.id);
+        const bi = preferred.indexOf(b.id);
+        if (ai !== -1 || bi !== -1) {
+          return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+        }
+        return a.label.localeCompare(b.label);
+      });
+    }
+    return list;
+  }
+
+  private applyQueryParams(): void {
+    const q = this.route.snapshot.queryParamMap;
+    const fromRaw = (q.get('fromTech') || '').trim();
+    const toRaw = (q.get('toTech') || '').trim();
+    const matchTech = (value: string) =>
+      this.technologies.find((t) => t.technology.toLowerCase() === value.toLowerCase())
+        ?.technology;
+    const from = fromRaw ? matchTech(fromRaw) : '';
+    const to = toRaw ? matchTech(toRaw) : '';
+    if (from) this.fromTech.set(from);
+    if (to) this.toTech.set(to);
+    if (from && to) this.autoFillPromptIfSameFramework();
+  }
+
   private validateAndSetFile(file: File): void {
-    if (file.name.endsWith('.zip')) {
-      this.selectedFile.set(file);
-      this.statusMessage.set('');
-      this.isSuccess.set(false);
-      this.readySessionId.set(null);
-    } else {
+    if (!isZipFileName(file.name)) {
       this.isSuccess.set(false);
       this.statusMessage.set('❌ Invalid file format. Please drop a valid zipped archive.');
       this.selectedFile.set(null);
       this.clearMessage();
+      return;
     }
+    if (!isWithinUploadLimit(file.size, appSettings.maxUploadBytes)) {
+      this.isSuccess.set(false);
+      this.statusMessage.set('❌ ZIP exceeds the 50 MB size limit. Remove node_modules and retry.');
+      this.selectedFile.set(null);
+      this.clearMessage();
+      return;
+    }
+    this.selectedFile.set(file);
+    this.statusMessage.set('');
+    this.isSuccess.set(false);
+    this.readySessionId.set(null);
   }
 
   private stopPolling(): void {
@@ -636,15 +650,23 @@ Final app must compile and run: npm install → ng serve`;
 
   private getPhaseDescription(phase: string): string {
     const phaseDescriptions: Record<string, string> = {
+      queued: 'Queued...',
+      starting: 'Starting migration...',
+      extract: 'Extracting project files...',
       extracting: 'Extracting project files...',
       reading: 'Reading source code...',
       analyze: 'Analyzing project structure...',
+      blueprint: 'Creating migration plan...',
       planning: 'Creating migration plan...',
+      unit: 'Converting components...',
       converting: 'Converting components...',
       generating: 'Generating Angular code...',
       building: 'Building project...',
       fixing: 'Fixing build errors...',
+      resume: 'Resuming conversion...',
+      rework: 'Applying changes...',
       'visual-qa': 'Running visual QA comparison...',
+      package: 'Packaging project...',
       packaging: 'Packaging project...',
       completed: 'Migration complete!',
       failed: 'Migration failed',
@@ -709,16 +731,11 @@ Final app must compile and run: npm install → ng serve`;
     this.fromTech.set('');
     this.toTech.set('');
     this.targetVersion.set('');
-    this.aiProvider.set('');
+    this.aiProvider.set('genai');
     this.aiModel.set('');
     this.prompt.set('');
     this.selectedFile.set(null);
     this.isDragging.set(false);
-    this.priorityRulesMode.set('react-ui');
-    this.enableVisualQa.set(false);
-    this.visualQaRoutes.set('/');
-    this.referenceFile.set(null);
-    this.isReferenceDragging.set(false);
     this.isLoading.set(false);
     this.isSuccess.set(true);
     this.readySessionId.set(null);
@@ -751,6 +768,11 @@ Final app must compile and run: npm install → ng serve`;
     }
 
     this.clearMessage();
+    if (this.providerModels['genai'].length === 0) {
+      this.loadProviderModels('genai');
+    } else if (!this.aiModel() && this.providerModels['genai'].length > 0) {
+      this.aiModel.set(this.providerModels['genai'][0].id);
+    }
   }
 
   private startStatusPolling(sessionId: string, mode: 'create' | 'rework' = 'create'): void {
@@ -766,6 +788,35 @@ Final app must compile and run: npm install → ng serve`;
         }
 
         this.stopPolling();
+
+        if (status.status === 'paused' || status.resumable) {
+          this.isLoading.set(false);
+          this.isSuccess.set(false);
+          this.readySessionId.set(null);
+          this.applyProgress(status);
+          const done = Math.max(0, status.completedUnitIndex ?? (status.unitIndex ?? 1) - 1);
+          const total = status.unitTotal || 0;
+          const progressNote = total ? ` Saved ${done}/${total} units.` : '';
+          this.statusMessage.set(
+            `⏸️ ${status.message || 'Free-tier limit reached. Progress is saved.'}${progressNote} Click Continue conversion when you have quota again.`,
+          );
+          const session: ProjectSession = {
+            sessionId,
+            projectName: this.selectedFile()?.name?.replace(/\.zip$/i, '') || this.activeProject()?.projectName || 'Migrated Project',
+            fromTech: this.fromTech() || this.activeProject()?.fromTech,
+            toTech: this.toTech() || this.activeProject()?.toTech,
+            aiProvider: this.aiProvider() || this.activeProject()?.aiProvider,
+            aiModel: this.aiModel() || this.activeProject()?.aiModel,
+            resumable: true,
+            paused: true,
+            completedUnitIndex: status.completedUnitIndex ?? done,
+            unitTotal: total || undefined,
+          };
+          this.activeProject.set(session);
+          this.sessionService.writeSession(session);
+          void this.refreshProjectMeta(sessionId);
+          return;
+        }
 
         if (status.status === 'completed') {
           if (this.settlingDownload) return;
@@ -783,32 +834,14 @@ Final app must compile and run: npm install → ng serve`;
           return;
         }
 
-        // failed
+        // failed — never auto-download or mark success; the ZIP was not created
         this.isLoading.set(false);
         this.isSuccess.set(false);
         this.lastSessionId = null;
         this.readySessionId.set(null);
         const errMsg = status.error || status.message || 'Migration failed.';
-        this.progressText.set('Migration had errors — downloading the generated project...');
-        this.settlingDownload = true;
-        try {
-          const downloaded = await this.downloadPartialProject(sessionId, errMsg);
-          if (downloaded && mode === 'create') {
-            const session: ProjectSession = {
-              sessionId,
-              projectName: this.selectedFile()?.name?.replace(/\.zip$/i, '') || 'Migrated Project',
-              fromTech: this.fromTech(),
-              toTech: this.toTech(),
-              aiProvider: this.aiProvider(),
-              aiModel: this.aiModel(),
-            };
-            this.activeProject.set(session);
-            this.sessionService.writeSession(session);
-            void this.refreshProjectMeta(sessionId);
-          }
-        } finally {
-          this.settlingDownload = false;
-        }
+        this.progressText.set('Migration failed.');
+        this.statusMessage.set(`❌ ${errMsg}`);
       } catch (err: any) {
         console.warn('Status poll failed (will retry):', err?.message || err);
       }
@@ -816,34 +849,6 @@ Final app must compile and run: npm install → ng serve`;
 
     void tick();
     this.pollTimer = setInterval(() => void tick(), appSettings.pollIntervalMs);
-  }
-
-  private async downloadPartialProject(sessionId: string, errMsg: string): Promise<boolean> {
-    try {
-      const blob = await firstValueFrom(this.migrationService.downloadProject(sessionId));
-      triggerBlobDownload(blob);
-      this.isSuccess.set(true);
-      this.progressText.set('Running AI migration pipeline...');
-      this.statusMessage.set(
-        `⚠️ ${errMsg} — the generated project was still downloaded. Fix the errors below and submit again.`,
-      );
-      return true;
-    } catch (err: any) {
-      this.isSuccess.set(false);
-      let reason = 'no generated project is available to download';
-      if (err?.error instanceof Blob) {
-        try {
-          const text = await err.error.text();
-          reason = JSON.parse(text).error || reason;
-        } catch {
-          reason = err?.message || reason;
-        }
-      } else {
-        reason = err?.error?.error || err?.message || reason;
-      }
-      this.statusMessage.set(`❌ ${errMsg} — ${reason}`);
-      return false;
-    }
   }
 
   private async checkExistingProject(): Promise<void> {
@@ -864,15 +869,7 @@ Final app must compile and run: npm install → ng serve`;
       }
 
       if (res?.exists && res.sessionId) {
-        const session: ProjectSession = {
-          sessionId: res.sessionId,
-          projectName: res.projectName,
-          fromTech: res.fromTech,
-          toTech: res.toTech,
-          aiProvider: res.aiProvider,
-          aiModel: res.aiModel,
-          updatedAt: res.updatedAt,
-        };
+        const session = this.toProjectSession(res);
         this.activeProject.set(session);
         this.sessionService.writeSession(session);
       }
@@ -884,6 +881,9 @@ Final app must compile and run: npm install → ng serve`;
       }
     } finally {
       this.checkingProject.set(false);
+      if (!this.activeProject()) {
+        this.applyQueryParams();
+      }
     }
   }
 
@@ -891,20 +891,28 @@ Final app must compile and run: npm install → ng serve`;
     try {
       const res = await firstValueFrom(this.migrationService.checkProject(sessionId));
       if (res?.exists && res.sessionId) {
-        const session: ProjectSession = {
-          sessionId: res.sessionId,
-          projectName: res.projectName,
-          fromTech: res.fromTech,
-          toTech: res.toTech,
-          aiProvider: res.aiProvider,
-          aiModel: res.aiModel,
-          updatedAt: res.updatedAt,
-        };
+        const session = this.toProjectSession(res);
         this.activeProject.set(session);
         this.sessionService.writeSession(session);
       }
     } catch {
       // Keep the local copy when the refresh fails
     }
+  }
+
+  private toProjectSession(res: ProjectCheckResponse): ProjectSession {
+    return {
+      sessionId: res.sessionId!,
+      projectName: res.projectName,
+      fromTech: res.fromTech,
+      toTech: res.toTech,
+      aiProvider: res.aiProvider,
+      aiModel: res.aiModel,
+      updatedAt: res.updatedAt,
+      resumable: res.resumable,
+      paused: res.paused,
+      completedUnitIndex: res.completedUnitIndex,
+      unitTotal: res.unitTotal,
+    };
   }
 }

@@ -192,6 +192,12 @@ router.get('/models/openrouter', async (req, res) => {
       return res.status(502).json({ error: 'Unexpected OpenRouter models response shape.' });
     }
 
+    const PREFERRED_OPENROUTER = ['nvidia/nemotron-3-super-120b-a12b:free'];
+    const BROKEN_OPENROUTER = new Set([
+      'inclusionai/ling-3.0-flash:free',
+      'openrouter/auto:free',
+    ]);
+
     const freeModels = models
       .filter(
         (model) =>
@@ -204,7 +210,16 @@ router.get('/models/openrouter', async (req, res) => {
       .map((model) => ({
         id: model.endpoint?.model_variant_slug || model.slug,
         label: model.name || model.short_name || model.slug,
-      }));
+      }))
+      .filter((m) => m.id && !BROKEN_OPENROUTER.has(m.id))
+      .sort((a, b) => {
+        const ai = PREFERRED_OPENROUTER.indexOf(a.id);
+        const bi = PREFERRED_OPENROUTER.indexOf(b.id);
+        if (ai !== -1 || bi !== -1) {
+          return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+        }
+        return a.label.localeCompare(b.label);
+      });
 
     res.json({ models: freeModels });
   } catch (err) {
@@ -298,6 +313,13 @@ router.get('/models/genai', async (req, res) => {
       return res.status(502).json({ error: 'Unexpected Gemini models response shape.' });
     }
 
+    const PREFERRED_GENAI = [
+      'gemini-3.5-flash-lite',
+      'gemini-3.5-flash',
+      'gemini-3.6-flash',
+    ];
+    const RETIRED_GENAI = /gemini-(1\.5|2\.0|2\.5)-/;
+
     const mapped = models
       .filter(isGeminiChatModel)
       .map((model) => {
@@ -307,10 +329,14 @@ router.get('/models/genai', async (req, res) => {
           label: model.displayName ? `${model.displayName} (${id})` : id,
         };
       })
-      .filter((m) => m.id)
+      .filter((m) => m.id && !RETIRED_GENAI.test(m.id))
       .filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
-      // Prefer flash models first for free-tier friendliness
       .sort((a, b) => {
+        const ai = PREFERRED_GENAI.indexOf(a.id);
+        const bi = PREFERRED_GENAI.indexOf(b.id);
+        if (ai !== -1 || bi !== -1) {
+          return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+        }
         const af = a.id.includes('flash') ? 0 : 1;
         const bf = b.id.includes('flash') ? 0 : 1;
         if (af !== bf) return af - bf;
@@ -332,8 +358,8 @@ router.get('/models/genai', async (req, res) => {
  */
 const TOP_GROQ_MODELS = [
   'groq/compound',
-  'groq/compound-mini',
   'allam-2-7b',
+  'groq/compound-mini',
 ];
 
 /**

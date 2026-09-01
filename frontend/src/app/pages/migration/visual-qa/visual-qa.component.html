@@ -65,16 +65,16 @@
         <div class="image-grid">
           <div class="image-card">
             <h3>Source</h3>
-            <img [src]="selectedComparison.sourceImage" alt="Source screenshot" />
+            <img [src]="fileUrl(selectedComparison.sourceImage)" alt="Source screenshot" />
           </div>
           <div class="image-card">
             <h3>Migrated</h3>
-            <img [src]="selectedComparison.migratedImage" alt="Migrated screenshot" />
+            <img [src]="fileUrl(selectedComparison.migratedImage)" alt="Migrated screenshot" />
           </div>
           @if (selectedComparison.diffImage) {
             <div class="image-card">
               <h3>Diff</h3>
-              <img [src]="selectedComparison.diffImage" alt="Diff overlay" />
+              <img [src]="fileUrl(selectedComparison.diffImage)" alt="Diff overlay" />
             </div>
           }
         </div>

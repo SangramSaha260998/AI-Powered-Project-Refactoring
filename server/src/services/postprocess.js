@@ -8,7 +8,7 @@ import {
   normalizeLucideSlug,
   resolveLucidePascalName
 } from './lucideInlineSvg.js';
-import { webAngularNpmDeps, WEB_ANGULAR_PATH_ALIASES } from '../config/webAngular.js';
+import { WEB_ANGULAR_PATH_ALIASES } from '../config/webAngular.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
@@ -61,6 +61,113 @@ function componentClassNameFromFile(filePath) {
   const withoutSuffix = base.replace(/\.component$/i, '');
   const pascal = toPascalCase(withoutSuffix);
   return pascal.endsWith('Component') ? pascal : `${pascal}Component`;
+}
+
+function kebabStemFromPath(filePath) {
+  const base = path.posix
+    .basename(String(filePath || '').replace(/\\/g, '/'))
+    .replace(/\.(component\.)?(ts|tsx|js|jsx|html|scss|css)$/i, '')
+    .replace(/\.component$/i, '');
+  return (
+    base
+      .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+      .replace(/[^a-zA-Z0-9-]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase() || ''
+  );
+}
+
+/**
+ * True when an HTML file is a postprocess/AI stub, not a real UI.
+ */
+export function isPlaceholderTemplate(filePath, content) {
+  if (!/\.html$/i.test(String(filePath || ''))) return false;
+  const text = String(content || '').trim();
+  if (!text) return true;
+  if (text.length < 400 && /placeholder/i.test(text)) return true;
+  if (/^<p>\s*\w*Component\s*(placeholder)?\s*<\/p>$/i.test(text)) return true;
+  if (/^<div class="[^"]*"><\/div>$/i.test(text) && text.length < 80) return true;
+  return false;
+}
+
+function findMatchingSourceContent(angularTsPath, destPath, sourceFilesMap) {
+  if (!sourceFilesMap) return '';
+  const destStem = kebabStemFromPath(angularTsPath);
+  if (!destStem) return '';
+  let best = '';
+  let bestLen = 0;
+  for (const [srcRel, content] of Object.entries(sourceFilesMap)) {
+    const n = String(srcRel).replace(/\\/g, '/');
+    if (!/\.(tsx|jsx|ts|js)$/i.test(n)) continue;
+    const srcStem = kebabStemFromPath(n);
+    if (
+      srcStem === destStem ||
+      srcStem === destStem.replace(/^admin-/, '') ||
+      `admin-${srcStem}` === destStem
+    ) {
+      const body = String(content || '');
+      if (body.length > bestLen) {
+        best = body;
+        bestLen = body.length;
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Scan a converted workspace for stub/placeholder templates that must not ship.
+ */
+export function collectConversionDefects(destPath) {
+  const placeholders = [];
+  const srcRoot = path.join(destPath, 'src');
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.html'))) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (isPlaceholderTemplate(file, content)) {
+      placeholders.push(path.relative(destPath, file).replace(/\\/g, '/'));
+    }
+  }
+  return { placeholders };
+}
+
+/**
+ * Source TSX/JSX UI files that should have a matching Angular component after conversion.
+ */
+export function collectMissingSourcePages(destPath, sourceFilesMap) {
+  if (!sourceFilesMap) return [];
+  const destStems = new Set();
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'))) {
+    const stem = kebabStemFromPath(file);
+    if (stem) destStems.add(stem);
+  }
+  const missing = [];
+  for (const [rel, content] of Object.entries(sourceFilesMap)) {
+    const n = String(rel).replace(/\\/g, '/');
+    if (!/^src\//.test(n)) continue;
+    if (!/\.(tsx|jsx)$/i.test(n)) continue;
+    if (/\.(spec|test)\./i.test(n)) continue;
+    if (/(routeTree\.gen|vite-env\.d|__root)/.test(n)) continue;
+    if (/(^|\/)(main|index|server|start)\.(tsx|jsx|ts|js)$/i.test(n)) continue;
+    if (/(^|\/)(hooks|lib|utils|types)\//i.test(n)) continue;
+    const isPageLike =
+      /\/(pages|views|routes|screens)\//i.test(n) ||
+      /(shell|layout|admin[-_])/i.test(path.posix.basename(n));
+    if (!isPageLike) continue;
+    const body = String(content || '');
+    if (body && !/</.test(body)) continue;
+    const stem = kebabStemFromPath(n);
+    if (!stem || stem === 'app' || stem === 'root') continue;
+    if (destStems.has(stem) || destStems.has(`admin-${stem}`) || destStems.has(stem.replace(/^admin-/, ''))) {
+      continue;
+    }
+    missing.push(n);
+  }
+  return missing;
 }
 
 function ensureImport(source, symbol, fromModule) {
@@ -288,9 +395,12 @@ function lucideSlugToSymbolAndAttr(rawSlug) {
 /**
  * Rewrite ALL Lucide / React-icon leftovers into plain inline <svg> markup.
  * Never emit @lucide/angular directives.
+ * Pass React source as extraSource so leftover <Plus /> tags convert even when
+ * the Angular TS file never imported lucide.
  */
-function rewriteLegacyLucideHtmlTags(html, source = '') {
-  return rewriteHtmlLucideToInlineSvg(html, source);
+function rewriteLegacyLucideHtmlTags(html, source = '', extraSource = '') {
+  const combined = extraSource ? `${source}\n${extraSource}` : source;
+  return rewriteHtmlLucideToInlineSvg(html, combined);
 }
 
 function normalizeLucideSvgAttrs(attrs) {
@@ -987,7 +1097,8 @@ function readAllTemplates(source, tsPath) {
     .join('\n');
 }
 
-function repairAngularComponentFile(tsPath) {
+function repairAngularComponentFile(tsPath, options = {}) {
+  const { sourceContent = '' } = options;
   let source = fs.readFileSync(tsPath, 'utf-8');
   const original = source;
   const className = componentClassNameFromFile(tsPath);
@@ -1144,7 +1255,8 @@ function repairAngularComponentFile(tsPath) {
     if (fs.existsSync(asset.full)) continue;
     ensureDirectoryExists(path.dirname(asset.full));
     if (asset.type === 'html') {
-      fs.writeFileSync(asset.full, `<div class="${path.basename(asset.full, '.html')}"></div>\n`, 'utf-8');
+      // Do not invent stub templates — missing HTML must fail the conversion.
+      console.warn(`[postprocess] Missing template (not stubbing): ${asset.full}`);
     } else {
       fs.writeFileSync(asset.full, `/* ${path.basename(asset.full)} */\n`, 'utf-8');
     }
@@ -1209,14 +1321,14 @@ function repairAngularComponentFile(tsPath) {
 
   for (const targetHtml of htmlFiles) {
     if (!fs.existsSync(targetHtml)) {
-      fs.writeFileSync(targetHtml, `<div class="${baseName}"></div>\n`, 'utf-8');
+      console.warn(`[postprocess] Missing HTML template (not stubbing): ${targetHtml}`);
       continue;
     }
     let html = fs.readFileSync(targetHtml, 'utf-8');
     // React leftover event / form patterns
     html = repairAngularTemplateHtml(html, source);
     // ALL lucide / React icon tags → plain inline <svg> (while lucide imports still visible)
-    html = rewriteLegacyLucideHtmlTags(html, source);
+    html = rewriteLegacyLucideHtmlTags(html, source, sourceContent);
     // Then drop every lucide package import — no @lucide/angular in output
     source = stripLucidePackageUsage(source);
     // Remaining self-closing capitalized custom elements
@@ -1319,7 +1431,7 @@ function repairAngularComponentFile(tsPath) {
   }
 }
 
-function repairAngularAppBootstrap(destPath) {
+function repairAngularAppBootstrap(destPath, sourceFilesMap = null) {
   const appConfigPath = path.join(destPath, 'src', 'app', 'app.config.ts');
   const appComponentPath = path.join(destPath, 'src', 'app', 'app.component.ts');
   const mainPath = path.join(destPath, 'src', 'main.ts');
@@ -1385,7 +1497,9 @@ export class AppComponent {}
 `;
       fs.writeFileSync(appComponentPath, appTs, 'utf-8');
     } else {
-      repairAngularComponentFile(appComponentPath);
+      repairAngularComponentFile(appComponentPath, {
+        sourceContent: findMatchingSourceContent(appComponentPath, destPath, sourceFilesMap)
+      });
       // Ensure root selector
       let fixed = fs.readFileSync(appComponentPath, 'utf-8');
       if (!/selector\s*:\s*['"]app-root['"]/.test(fixed)) {
@@ -1481,29 +1595,27 @@ function repairAngularRoutes(destPath) {
   }
 
   for (const item of missing) {
-    // Create a minimal stub component so the app still compiles
-    const symbols = item.symbols.split(',').map((s) => s.trim()).filter(Boolean);
-    const primary = (symbols[0] || 'StubComponent').replace(/^type\s+/, '');
-    const resolved = path.resolve(path.dirname(routesPath), item.from);
-    const stubTs = resolved.endsWith('.ts') ? resolved : `${resolved}.ts`;
-    ensureDirectoryExists(path.dirname(stubTs));
-    if (!fs.existsSync(stubTs)) {
-      const base = path.basename(stubTs, '.ts');
-      const html = stubTs.replace(/\.ts$/, '.html');
-      const css = stubTs.replace(/\.ts$/, '.scss');
-      fs.writeFileSync(
-        stubTs,
-        `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${base.replace(/\.component$/i, '')}',\n  standalone: true,\n  templateUrl: './${base}.html',\n  styleUrl: './${base}.scss'\n})\nexport class ${primary} {}\n`,
-        'utf-8'
+    // Never write placeholder pages. Drop the unresolved import and any route
+    // that referenced it so the workspace does not pretend the page exists.
+    source = source.replace(item.full, '');
+    const symbols = item.symbols
+      .split(',')
+      .map((s) => s.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    for (const sym of symbols) {
+      const esc = sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      source = source.replace(
+        new RegExp(`\\{[^{}]*\\bcomponent\\s*:\\s*${esc}\\b[^{}]*\\}\\s*,?`, 'g'),
+        ''
       );
-      if (!fs.existsSync(html)) fs.writeFileSync(html, `<p>${primary} placeholder</p>\n`, 'utf-8');
-      if (!fs.existsSync(css)) fs.writeFileSync(css, `/* ${base} */\n`, 'utf-8');
-      console.warn(`[postprocess] Stubbed missing route module: ${item.from}`);
     }
+    console.warn(`[postprocess] Removed unresolved route import (no stub): ${item.from}`);
   }
 
   if (missing.length > 0) {
-    console.warn(`[postprocess] app.routes.ts had ${missing.length} missing module(s); stubs created where possible.`);
+    console.warn(
+      `[postprocess] app.routes.ts had ${missing.length} missing module(s); imports dropped instead of placeholder stubs.`
+    );
   }
 
   fs.writeFileSync(routesPath, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
@@ -1534,6 +1646,13 @@ function addAngularPathAliases(destPath) {
     );
   }
   tsconfig.compilerOptions.paths = { ...normalizedPaths, ...pathAliases };
+  const coreVer = String(readJsonSafe(path.join(destPath, 'package.json'))?.dependencies?.['@angular/core'] || '');
+  const angularMajor = Number.parseInt(coreVer.replace(/^[^\d]*/, ''), 10);
+  if (!Number.isNaN(angularMajor) && angularMajor < 22) {
+    delete tsconfig.compilerOptions.ignoreDeprecations;
+  } else if (angularMajor >= 22) {
+    tsconfig.compilerOptions.ignoreDeprecations = '6.0';
+  }
   writeJson(tsconfigPath, tsconfig);
 
   if (fs.existsSync(tsconfigAppPath)) {
@@ -1550,6 +1669,28 @@ function addAngularPathAliases(destPath) {
     appCfg.compilerOptions.paths = { ...appNormalized, ...pathAliases };
     writeJson(tsconfigAppPath, appCfg);
   }
+}
+
+/**
+ * Packages that belong to the React/Vite/TanStack/Lovable toolchain.
+ * Copying these into an Angular workspace makes npm i fail (peer vite conflicts,
+ * private @lovable.dev scopes, nitro betas).
+ */
+function isReactEcosystemPackage(name) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return false;
+  if (n === 'react' || n === 'react-dom' || n === 'react-native') return true;
+  if (n.startsWith('react-') || n.endsWith('-react') || n.includes('/react-')) return true;
+  if (n.startsWith('@types/react')) return true;
+  if (n.startsWith('@tanstack/')) return true;
+  if (n.startsWith('@lovable') || n.includes('lovable')) return true;
+  if (n === 'vite' || n.startsWith('vite-') || n.startsWith('@vitejs/')) return true;
+  if (n === '@tailwindcss/vite' || n.startsWith('@tailwindcss/vite')) return true;
+  if (n === 'nitro' || n.startsWith('nitro') || n === 'nitropack') return true;
+  if (n.startsWith('@hookform/')) return true;
+  if (n.startsWith('@radix-ui/')) return true;
+  if (n === 'cmdk' || n === 'vaul' || n === 'sonner' || n === 'input-otp' || n === 'next') return true;
+  return false;
 }
 
 function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) {
@@ -1604,6 +1745,7 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     if (skip.has(name)) continue;
     if (name.startsWith('@angular/')) continue;
     if (name.startsWith('@types/') && targetFramework === 'angular') continue;
+    if (targetFramework === 'angular' && isReactEcosystemPackage(name)) continue;
     if (pkg.dependencies[name] || pkg.devDependencies[name]) continue;
 
     if (name.startsWith('@radix-ui/') && targetFramework === 'angular') {
@@ -1633,12 +1775,13 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
       pkg.dependencies['@angular/animations'] = coreVer;
     }
 
-    // web_angular template kit dependencies (Material, CDK, NGXS, toastr, …)
-    // Always overwrite Material/CDK — never keep a core-patch pin like ^21.2.18 (ETARGET).
-    const coreVer = String(pkg.dependencies['@angular/core'] || '^22.0.8').replace(/^\^/, '');
-    const kit = webAngularNpmDeps(coreVer);
-    for (const [name, version] of Object.entries(kit.dependencies)) {
-      pkg.dependencies[name] = version;
+    // Do not inject Material/NGXS/toastr kit packages — converted source owns deps.
+
+    for (const name of Object.keys(pkg.dependencies)) {
+      if (isReactEcosystemPackage(name)) delete pkg.dependencies[name];
+    }
+    for (const name of Object.keys(pkg.devDependencies)) {
+      if (isReactEcosystemPackage(name)) delete pkg.devDependencies[name];
     }
 
     // Remove ALL lucide packages from Angular output — icons are plain inline SVG
@@ -1766,38 +1909,8 @@ function rewriteAtAliasImportsInTree(destPath) {
           if (resolved) break;
         }
         if (!resolved) {
-          // Stub a missing component so the import can resolve after rewrite
-          const stem = base
-            .replace(/\.component$/i, '')
-            .replace(/([a-z])([A-Z])/g, '$1-$2')
-            .toLowerCase();
-          const className = toPascalCase(stem).endsWith('Component')
-            ? toPascalCase(stem)
-            : `${toPascalCase(stem)}Component`;
-          const stubDir = path.join(srcRoot, 'app', 'components', stem);
-          const stubTs = path.join(stubDir, `${stem}.component.ts`);
-          if (!fs.existsSync(stubTs)) {
-            ensureDirectoryExists(stubDir);
-            fs.writeFileSync(
-              stubTs,
-              `import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-${stem}',\n  standalone: true,\n  templateUrl: './${stem}.component.html',\n  styleUrl: './${stem}.component.scss'\n})\nexport class ${className} {}\n`,
-              'utf-8'
-            );
-            fs.writeFileSync(
-              path.join(stubDir, `${stem}.component.html`),
-              `<p>${className} placeholder</p>\n`,
-              'utf-8'
-            );
-            fs.writeFileSync(
-              path.join(stubDir, `${stem}.component.scss`),
-              `/* ${stem} */\n`,
-              'utf-8'
-            );
-            console.warn(`[postprocess] Stubbed missing @/components import: ${rest} → ${stem}.component`);
-          }
-          resolved = stubTs;
-          componentIndex.set(stem.toLowerCase(), stubTs);
-          componentIndex.set(className.toLowerCase(), stubTs);
+          console.warn(`[postprocess] Unresolved @/components import (not stubbing): ${rest}`);
+          return full;
         }
         let rel = path.relative(path.dirname(file), resolved).replace(/\\/g, '/');
         if (!rel.startsWith('.')) rel = `./${rel}`;
@@ -1996,7 +2109,9 @@ export function repairAngularWorkspace(destPath, options = {}) {
   );
   for (const file of componentFiles) {
     try {
-      repairAngularComponentFile(file);
+      repairAngularComponentFile(file, {
+        sourceContent: findMatchingSourceContent(file, destPath, sourceFilesMap)
+      });
     } catch (err) {
       console.warn(`[postprocess] Failed repairing ${file}: ${err.message}`);
     }
@@ -2020,7 +2135,9 @@ export function repairAngularWorkspace(destPath, options = {}) {
   });
   for (const file of otherTs) {
     try {
-      repairAngularComponentFile(file);
+      repairAngularComponentFile(file, {
+        sourceContent: findMatchingSourceContent(file, destPath, sourceFilesMap)
+      });
     } catch (err) {
       console.warn(`[postprocess] Failed repairing ${file}: ${err.message}`);
     }
@@ -2050,7 +2167,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
     }
   }
 
-  repairAngularAppBootstrap(destPath);
+  repairAngularAppBootstrap(destPath, sourceFilesMap);
   repairAngularRoutes(destPath);
   removeHallucinatedNgModules(destPath);
   fixBrokenRelativeComponentImports(destPath);
@@ -2060,7 +2177,9 @@ export function repairAngularWorkspace(destPath, options = {}) {
   // Second pass: child imports + lucide sync after path fixes
   for (const file of walkFiles(path.join(destPath, 'src'), (name) => name.endsWith('.component.ts'))) {
     try {
-      repairAngularComponentFile(file);
+      repairAngularComponentFile(file, {
+        sourceContent: findMatchingSourceContent(file, destPath, sourceFilesMap)
+      });
     } catch (err) {
       console.warn(`[postprocess] Second-pass repair failed for ${file}: ${err.message}`);
     }

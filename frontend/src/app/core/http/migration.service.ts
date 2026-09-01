@@ -50,6 +50,19 @@ export class MigrationService {
       .pipe(timeout({ first: appSettings.uploadTimeoutMs }));
   }
 
+  resumeMigration(
+    sessionId: string,
+    aiProvider?: string,
+    aiModel?: string,
+  ): Observable<MigrateStartResponse> {
+    return this.http
+      .post<MigrateStartResponse>(`${this.apiBase}/project/${sessionId}/resume`, {
+        aiProvider: aiProvider || undefined,
+        aiModel: aiModel || undefined,
+      })
+      .pipe(timeout({ first: appSettings.uploadTimeoutMs }));
+  }
+
   deleteProject(sessionId: string): Observable<unknown> {
     return this.http
       .delete(`${this.apiBase}/project/${sessionId}`)

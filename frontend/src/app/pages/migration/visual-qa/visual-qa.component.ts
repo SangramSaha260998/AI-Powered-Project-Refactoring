@@ -4,6 +4,7 @@ import { ActivatedRoute, Router } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import { MigrationService } from '@core/http';
 import { VisualQaReport } from '@shared/models';
+import { environment } from '@env/environment';
 
 @Component({
   selector: 'app-visual-qa',
@@ -57,6 +58,13 @@ export class VisualQaComponent {
 
   selectRoute(route: string): void {
     this.selectedRoute.set(route);
+  }
+
+  fileUrl(path: string | null | undefined): string {
+    if (!path) return '';
+    if (/^https?:\/\//i.test(path)) return path;
+    const origin = environment.apiBaseUrl.replace(/\/api\/?$/, '');
+    return path.startsWith('/') ? `${origin}${path}` : `${environment.apiBaseUrl}/${path}`;
   }
 
   goBack(): void {

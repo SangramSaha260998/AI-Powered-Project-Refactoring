@@ -21,14 +21,16 @@ export type MigrateStartResponse = {
 
 export type MigrateStatusResponse = {
   sessionId: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'paused' | string;
   message?: string;
   phase?: string | null;
   unitIndex?: number | null;
   unitTotal?: number | null;
+  completedUnitIndex?: number | null;
   error?: string;
   downloadUrl?: string;
   elapsedMs?: number;
+  resumable?: boolean;
 };
 
 export type ProjectSession = {
@@ -39,6 +41,10 @@ export type ProjectSession = {
   aiProvider?: string;
   aiModel?: string;
   updatedAt?: number;
+  resumable?: boolean;
+  paused?: boolean;
+  completedUnitIndex?: number;
+  unitTotal?: number;
 };
 
 export type ProjectCheckResponse = {
@@ -50,6 +56,10 @@ export type ProjectCheckResponse = {
   aiProvider?: string;
   aiModel?: string;
   updatedAt?: number;
+  resumable?: boolean;
+  paused?: boolean;
+  completedUnitIndex?: number;
+  unitTotal?: number;
 };
 
 export type TechnologyOption = {

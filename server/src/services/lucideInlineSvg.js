@@ -203,7 +203,28 @@ export function collectLucideImportNames(source) {
 }
 
 /**
+ * Find <Plus className="w-4" /> (and similar) usages of lucide-react icons in React source.
+ */
+export function collectLucideJsxUsages(source) {
+  const usages = [];
+  if (!source) return usages;
+  const imported = collectLucideImportNames(source);
+  for (const name of imported) {
+    const bare = String(name).replace(/^Lucide/, '');
+    if (!bare || !/^[A-Z]/.test(bare)) continue;
+    if (!icons[bare] && !icons[name]) continue;
+    const re = new RegExp(`<${bare}(\\s[^>]*)?(?:\\/>|>([\\s\\S]*?)<\\/${bare}>)`, 'g');
+    for (const m of source.matchAll(re)) {
+      usages.push({ name: bare, attrs: String(m[1] || '').trim() });
+    }
+  }
+  return usages;
+}
+
+/**
  * Rewrite all Lucide-ish markup in an Angular HTML template to plain inline SVG.
+ * `source` may be Angular TS, React TSX, or both concatenated — lucide imports in
+ * either file are used to rewrite leftover <Home />, <lucide-home>, <svg lucideHome>.
  */
 export function rewriteHtmlLucideToInlineSvg(html, source = '') {
   if (!html) return html;

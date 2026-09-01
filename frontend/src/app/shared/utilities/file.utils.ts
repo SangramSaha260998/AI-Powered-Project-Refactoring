@@ -17,3 +17,13 @@ export function formatElapsed(ms?: number): string {
   if (min <= 0) return `${sec}s`;
   return `${min}m ${sec.toString().padStart(2, '0')}s`;
 }
+
+/** Case-insensitive .zip check (Windows often uses .ZIP). */
+export function isZipFileName(name: string): boolean {
+  return name.toLowerCase().endsWith('.zip');
+}
+
+export function isWithinUploadLimit(sizeBytes: number, maxBytes: number): boolean {
+  return sizeBytes <= maxBytes;
+}
+

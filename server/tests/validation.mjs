@@ -1,43 +1,96 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import os from 'os';
 import { validateProjectFramework, hasFilesWithExtensions } from '../src/services/validator.js';
 
-// Re-export for backward compatibility with any manual scripting
-export { validateProjectFramework };
+function assert(condition, message) {
+  if (!condition) {
+    console.error('FAIL:', message);
+    process.exitCode = 1;
+  } else {
+    console.log('PASS:', message);
+  }
+}
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+function makeProject(prefix, files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  for (const [rel, content] of Object.entries(files)) {
+    const full = path.join(root, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, content);
+  }
+  return root;
+}
 
-// TEST: Angular project with fromTech = 'React'
-const angularExtractPath = path.join(__dirname, '..', 'extracted', '1783788916720-angular_project');
-console.log('='.repeat(70));
-console.log('TEST 1: Angular project with fromTech = "React"');
-console.log('='.repeat(70));
-const result1 = validateProjectFramework(angularExtractPath, 'React');
-console.log('Result:', JSON.stringify(result1, null, 2));
-console.log('');
+const angularPkg = JSON.stringify({
+  name: 'demo-ng',
+  dependencies: { '@angular/core': '^20.0.0' },
+});
+const reactPkg = JSON.stringify({
+  name: 'demo-react',
+  dependencies: { react: '^18.0.0', 'react-dom': '^18.0.0' },
+});
 
-// TEST: Angular project with fromTech = 'Angular'
-console.log('='.repeat(70));
-console.log('TEST 2: Angular project with fromTech = "Angular" (should pass)');
-console.log('='.repeat(70));
-const result2 = validateProjectFramework(angularExtractPath, 'Angular');
-console.log('Result:', JSON.stringify(result2, null, 2));
-console.log('');
+const angularDir = makeProject('val-ng-', {
+  'package.json': angularPkg,
+  'angular.json': '{"version":1}',
+  'src/app/app.component.ts': 'export class AppComponent {}',
+});
 
-// TEST: Does the angular project accidentally have .tsx files?
-console.log('='.repeat(70));
-console.log('TEST 3: Check if Angular project has .jsx or .tsx files');
-console.log('='.repeat(70));
-const hasJsx = hasFilesWithExtensions(angularExtractPath, ['.jsx', '.tsx']);
-console.log('Has .jsx/.tsx files:', hasJsx);
-console.log('');
+const reactTsxDir = makeProject('val-react-tsx-', {
+  'package.json': reactPkg,
+  'src/App.tsx': 'export default function App() { return null; }',
+});
 
-// TEST: What about the 2nd Angular project zip?
-const angularExtractPath2 = path.join(__dirname, '..', 'extracted', '1783789352619-angular_project');
-console.log('='.repeat(70));
-console.log('TEST 4: 2nd Angular project with fromTech = "React"');
-console.log('='.repeat(70));
-const result4 = validateProjectFramework(angularExtractPath2, 'React');
-console.log('Result:', JSON.stringify(result4, null, 2));
+const reactJsDir = makeProject('val-react-js-', {
+  'package.json': reactPkg,
+  'src/App.js': 'export default function App() { return null; }',
+});
+
+const nestedAngular = makeProject('val-ng-nested-', {
+  'my-app/package.json': angularPkg,
+  'my-app/angular.json': '{"version":1}',
+  'my-app/src/app/app.component.ts': 'export class AppComponent {}',
+});
+
+try {
+  const ngAsReact = validateProjectFramework(angularDir, 'React');
+  assert(ngAsReact.valid === false, 'Angular project rejected when fromTech is React');
+
+  const ngAsNg = validateProjectFramework(angularDir, 'Angular');
+  assert(ngAsNg.valid === true, 'Angular project accepted when fromTech is Angular');
+
+  const reactAsNg = validateProjectFramework(reactTsxDir, 'Angular');
+  assert(reactAsNg.valid === false, 'React project rejected when fromTech is Angular');
+
+  const reactAsReact = validateProjectFramework(reactTsxDir, 'React');
+  assert(reactAsReact.valid === true, 'React TSX project accepted when fromTech is React');
+
+  const jsOnly = validateProjectFramework(reactJsDir, 'React');
+  assert(jsOnly.valid === true, 'JavaScript-only React project (App.js) is accepted');
+
+  const nested = validateProjectFramework(nestedAngular, 'Angular');
+  assert(nested.valid === true, 'Nested Angular ZIP (one folder down) is accepted');
+
+  const unknown = validateProjectFramework(angularDir, 'Vue');
+  assert(unknown.valid === false, 'Unknown framework is rejected');
+
+  assert(
+    hasFilesWithExtensions(reactTsxDir, ['.tsx']) === true,
+    'hasFilesWithExtensions finds .tsx'
+  );
+  assert(
+    hasFilesWithExtensions(angularDir, ['.jsx', '.tsx']) === false,
+    'Angular tree has no .jsx/.tsx'
+  );
+} finally {
+  for (const dir of [angularDir, reactTsxDir, reactJsDir, nestedAngular]) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+if (process.exitCode) {
+  console.error('\nSome validation tests failed.');
+} else {
+  console.log('\nAll validation tests passed.');
+}

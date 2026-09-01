@@ -61,34 +61,28 @@ export const PROVIDERS = {
     envPrefix: 'OPENROUTER',
     defaultBaseURL: 'https://openrouter.ai/api/v1',
     // Prefer a known free chat model over auto-router (auto can route to paid models).
-    defaultModel: 'google/gemma-4-26b-a4b-it:free',
+    defaultModel: 'nvidia/nemotron-3-super-120b-a12b:free',
     defaultHeaders: {
       'HTTP-Referer': 'http://localhost:4200',
       'X-Title': 'AI Framework Migration Studio',
     },
-    // Free-tier chat models, tried in order when a (key, model) pair hits its limit.
-    // Override with OPENROUTER_MODELS=custom/model1,custom/model2
+    // Only models that currently succeed on the free key. Dead/429-first slugs
+    // waste minutes before fallback. Override with OPENROUTER_MODELS=...
     models: [
-      'google/gemma-4-31b-it:free',
-      'google/gemma-4-26b-a4b-it:free',
-      'nvidia/nemotron-3-super-120b-a12b:free',
-      'nvidia/nemotron-3-ultra-550b-a55b:free',
-      'inclusionai/ling-3.0-flash:free',
-      'openrouter/auto:free'
+      'nvidia/nemotron-3-super-120b-a12b:free'
     ]
   },
   genai: {
     name: 'Google Gemini',
     envPrefix: 'GENAI',
     defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    defaultModel: 'gemini-2.0-flash',
-    // Free-tier usable Gemini chat models (free keys can call these within quota).
-    // Override with GENAI_MODELS=gemini-2.0-flash,gemini-1.5-flash
+    defaultModel: 'gemini-3.5-flash-lite',
+    // Current Google Flash IDs (2.0 / 2.5 flash are retired for new keys).
+    // Override with GENAI_MODELS=gemini-3.5-flash-lite,gemini-3.6-flash
     models: [
-      'gemini-2.0-flash',
-      'gemini-2.0-flash-lite',
-      'gemini-1.5-flash',
-      'gemini-1.5-flash-8b'
+      'gemini-3.5-flash-lite',
+      'gemini-3.5-flash',
+      'gemini-3.6-flash'
     ]
   },
   ollama: {
@@ -103,8 +97,7 @@ export const PROVIDERS = {
     // Fallback models tried in order on the same key. Override with OLLAMA_MODELS=...
     models: [
       'gpt-oss:20b',
-      'gpt-oss:120b',
-      'qwen3-coder:30b'
+      'gpt-oss:120b'
     ]
   },
   groq: {
@@ -116,8 +109,8 @@ export const PROVIDERS = {
     // Override with GROQ_MODELS=custom/model1,custom/model2
     models: [
       'groq/compound',
-      'groq/compound-mini',
-      'allam-2-7b'
+      'allam-2-7b',
+      'groq/compound-mini'
     ]
   },
   tokenrouter: {
@@ -157,9 +150,9 @@ export function isOllamaCloudMode() {
  */
 export const DEFAULT_PROVIDER_FALLBACK_CHAIN = [
   'genai',
-  'openrouter',
-  'ollama',
   'groq',
+  'ollama',
+  'openrouter',
   'tokenrouter',
 ];
 
@@ -347,6 +340,25 @@ export function getProviderFallbackModels(provider = 'openrouter', overrideModel
  * Override via RATE_LIMIT_PAUSE_MS=2200
  */
 export const RATE_LIMIT_PAUSE_MS = parseInt(process.env.RATE_LIMIT_PAUSE_MS, 10) || 2200;
+
+/**
+ * Max wait for a single LLM HTTP request. Hung calls fail over to the next
+ * model/key/provider instead of blocking the conversion.
+ * Override via LLM_REQUEST_TIMEOUT_MS=90000
+ */
+export const LLM_REQUEST_TIMEOUT_MS = Number.isFinite(parseInt(process.env.LLM_REQUEST_TIMEOUT_MS, 10))
+  ? parseInt(process.env.LLM_REQUEST_TIMEOUT_MS, 10)
+  : 60000;
+
+/**
+ * How often to run a compile check during conversion.
+ * 0 = only after every unit is written (final build still always runs).
+ * Default 6: better for free-tier quotas (ng build is slow and burns time/tokens).
+ * Override via BUILD_EVERY_N_UNITS=8
+ */
+export const BUILD_EVERY_N_UNITS = Number.isFinite(parseInt(process.env.BUILD_EVERY_N_UNITS, 10))
+  ? parseInt(process.env.BUILD_EVERY_N_UNITS, 10)
+  : 6;
 
 /**
  * Max build-fix attempts per incremental UNIT before failing the migration.

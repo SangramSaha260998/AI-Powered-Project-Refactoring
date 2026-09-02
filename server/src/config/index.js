@@ -76,13 +76,13 @@ export const PROVIDERS = {
     name: 'Google Gemini',
     envPrefix: 'GENAI',
     defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    defaultModel: 'gemini-3.5-flash-lite',
-    // Current Google Flash IDs (2.0 / 2.5 flash are retired for new keys).
-    // Override with GENAI_MODELS=gemini-3.5-flash-lite,gemini-3.6-flash
+    defaultModel: 'gemini-3.6-flash',
+    // Largest Flash first, then next-largest. 2.0 / 2.5 are retired for new keys.
+    // Override with GENAI_MODELS=gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite
     models: [
-      'gemini-3.5-flash-lite',
+      'gemini-3.6-flash',
       'gemini-3.5-flash',
-      'gemini-3.6-flash'
+      'gemini-3.5-flash-lite'
     ]
   },
   ollama: {
@@ -91,13 +91,13 @@ export const PROVIDERS = {
     // Cloud OpenAI-compatible endpoint. For local Ollama use:
     // OLLAMA_BASE_URL=http://localhost:11434/v1
     defaultBaseURL: 'https://ollama.com/v1',
-    defaultModel: 'gpt-oss:20b',
+    defaultModel: 'gpt-oss:120b',
     // Cloud needs an API key; local mode can run without one.
     requiresApiKey: false,
-    // Fallback models tried in order on the same key. Override with OLLAMA_MODELS=...
+    // Largest first, then next-largest. Override with OLLAMA_MODELS=...
     models: [
-      'gpt-oss:20b',
-      'gpt-oss:120b'
+      'gpt-oss:120b',
+      'gpt-oss:20b'
     ]
   },
   groq: {
@@ -105,7 +105,7 @@ export const PROVIDERS = {
     envPrefix: 'GROQ',
     defaultBaseURL: 'https://api.groq.com/openai/v1',
     defaultModel: 'groq/compound',
-    // Free Groq models only (zero/undefined pricing in the API).
+    // Free Groq models only — largest first, then next-largest.
     // Override with GROQ_MODELS=custom/model1,custom/model2
     models: [
       'groq/compound',
@@ -118,12 +118,12 @@ export const PROVIDERS = {
     envPrefix: 'TOKENROUTER',
     defaultBaseURL: 'https://api.tokenrouter.com/v1',
     defaultModel: 'deepseek/deepseek-v4-pro-0813-free',
-    // Free TokenRouter models only — tried in order when a (key, model) pair hits its limit.
+    // Free TokenRouter models — largest first (pro → max → nano).
     // Override with TOKENROUTER_MODELS=custom/model1,custom/model2
     models: [
       'deepseek/deepseek-v4-pro-0813-free',
-      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-      'qwen/qwen3.8-max-free'
+      'qwen/qwen3.8-max-free',
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free'
     ]
   }
 };

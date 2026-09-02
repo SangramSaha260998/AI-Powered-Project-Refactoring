@@ -27,7 +27,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors } from './postprocess.js';
 
 // ---------------------------------------------------------------------------
 // Multi-key / multi-provider OpenAI clients — rotate keys, then providers
@@ -444,7 +444,7 @@ const PROTECTED_OUTPUT_FILES = new Set([
  */
 function extractPathsFromBuildErrors(buildErrors) {
   const text = String(buildErrors || '');
-  const matches = text.match(/src\/[\w./-]+\.(?:ts|tsx|html|scss|css|jsx)/g) || [];
+  const matches = text.match(/src\/[\w./-]+\.(?:tsx|jsx|ts|html|scss|css)/g) || [];
   return [...new Set(matches.map((p) => p.replace(/\\/g, '/')))];
 }
 
@@ -518,7 +518,7 @@ function resolveFixWritePath(workspaceRoot, requestedPath, buildErrors = '', all
  */
 function isSyntaxHeavyBuildFailure(buildErrors) {
   const text = String(buildErrors || '');
-  return /TS1005|TS1109|TS1128|TS1131|TS1003|TS2695|Unexpected EOF|Expression expected/i.test(text);
+  return /TS1005|TS1109|TS1128|TS1131|TS1003|TS1161|TS2695|Unexpected EOF|Expression expected|Unterminated regular expression/i.test(text);
 }
 
 /**
@@ -561,8 +561,75 @@ function resolveSafeWritePath(workspaceRoot, relativePath) {
 }
 
 /**
- * Safely filters out framework bloat and reads only real text files.
+ * If React source contains JSX, the destination must be .tsx — never .ts.
+ * Returns { relative, full, staleTsFull? }.
  */
+function reactDestinationForContent(workspaceRoot, relativePath, content) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  if (
+    !normalized.endsWith('.ts') ||
+    normalized.endsWith('.d.ts') ||
+    !fileContainsJsx(content)
+  ) {
+    return {
+      relative: normalized,
+      full: path.join(workspaceRoot, normalized)
+    };
+  }
+
+  const tsxRel = normalized.replace(/\.ts$/, '.tsx');
+  return {
+    relative: tsxRel,
+    full: path.join(workspaceRoot, tsxRel),
+    staleTsFull: path.join(workspaceRoot, normalized)
+  };
+}
+
+function unlinkIfExists(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Remap Angular-shaped / `.ts` React-component plan paths onto `.tsx`.
+ * Bootstrap/tooling files come from the React workspace template — never plan them.
+ */
+function isReactScaffoldPath(plannedPath) {
+  const p = String(plannedPath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  return (
+    /(^|\/)index\.html$/i.test(p) ||
+    /^src\/index\.(tsx|ts|jsx|js|scss|css)$/i.test(p) ||
+    /^src\/main\.(tsx|ts|jsx|js)$/i.test(p) ||
+    /^src\/styles\.(scss|css)$/i.test(p) ||
+    /^src\/vite-env\.d\.ts$/i.test(p) ||
+    /^src\/app\.config\.(ts|tsx)$/i.test(p)
+  );
+}
+
+function normalizeReactPlanPath(plannedPath) {
+  let planned = String(plannedPath || '').replace(/\\/g, '/');
+  if (/\.html$/i.test(planned)) return null;
+  if (isReactScaffoldPath(planned)) return null;
+  if (/\.component\.ts$/i.test(planned)) {
+    planned = planned.replace(/\.component\.ts$/i, '.tsx');
+  } else if (/\.component\.scss$/i.test(planned)) {
+    planned = planned.replace(/\.component\.scss$/i, '.scss');
+  } else if (
+    /\.ts$/i.test(planned) &&
+    !/\.d\.ts$/i.test(planned) &&
+    /\/(pages?|components?|features?|layouts?)\//i.test(planned) &&
+    !/\.(actions|state|selectors|model|service|types|spec)\.ts$/i.test(planned)
+  ) {
+    planned = planned.replace(/\.ts$/i, '.tsx');
+  }
+  planned = planned.replace(/^src\/app\//i, 'src/');
+  if (isReactScaffoldPath(planned)) return null;
+  return planned;
+}
+
 function readDirectoryRecursively(dirPath, baseDir = dirPath, fileList = {}) {
   if (!fs.existsSync(dirPath)) return fileList;
 
@@ -1420,6 +1487,9 @@ function isPlaceholderGeneratedFile(filePath, content) {
   if (/\.html$/i.test(filePath) && text.length < 80 && /^<div class="[^"]*"><\/div>$/i.test(text)) {
     return true;
   }
+  if (/\.(ts|tsx|js|jsx)$/i.test(filePath) && isTruncatedSource(content)) {
+    return true;
+  }
   return false;
 }
 
@@ -1494,8 +1564,15 @@ function ensurePlanCoversAllSourceFiles(plan, filesMap, toTech) {
         });
       }
     } else {
-      const dest = n.replace(/\.(jsx)$/i, '.tsx').replace(/\.(css)$/i, '.scss');
+      // React target: Angular component triads become one .tsx (+ optional .scss).
+      if (/\.html$/i.test(n)) continue;
+      if (isReactScaffoldPath(n) || isReactScaffoldPath(n.replace(/^src\/app\//i, 'src/'))) continue;
+      let dest = n.replace(/\.(jsx)$/i, '.tsx').replace(/\.(css)$/i, '.scss');
+      if (/\.component\.ts$/i.test(dest)) dest = dest.replace(/\.component\.ts$/i, '.tsx');
+      else if (/\.component\.scss$/i.test(dest)) dest = dest.replace(/\.component\.scss$/i, '.scss');
+      dest = dest.replace(/^src\/app\//i, 'src/');
       const newPath = dest.startsWith('src/') ? dest : `src/${dest}`;
+      if (isReactScaffoldPath(newPath)) continue;
       if (plannedPaths.has(newPath)) continue;
       plannedPaths.add(newPath);
       extras.push({
@@ -2066,6 +2143,43 @@ function parseUnitFileBundle(raw, expectedPaths = []) {
   return files.filter((f) => f.path && f.content != null);
 }
 
+function extCompatible(expectedExt, actualExt) {
+  const a = String(expectedExt || '').toLowerCase();
+  const b = String(actualExt || '').toLowerCase();
+  if (a === b) return true;
+  if ((a === '.ts' && b === '.tsx') || (a === '.tsx' && b === '.ts')) return true;
+  if ((a === '.js' && b === '.jsx') || (a === '.jsx' && b === '.js')) return true;
+  if ((a === '.scss' && b === '.css') || (a === '.css' && b === '.scss')) return true;
+  return false;
+}
+
+/** Match an AI bundle file to a planned path (PascalCase vs kebab, .ts vs .tsx). */
+function matchUnitBundleFile(parsedFiles, expectedPath) {
+  const expected = String(expectedPath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  const tsxExpected = expected.replace(/\.ts$/, '.tsx');
+  const byPath = new Map(
+    (parsedFiles || []).map((f) => [String(f.path || '').replace(/\\/g, '/').replace(/^\.?\//, ''), f])
+  );
+  const direct = byPath.get(expected) || byPath.get(tsxExpected);
+  if (direct) return direct;
+
+  const expectedBase = path.posix.basename(expected).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, '');
+  const expectedExt = path.posix.extname(expected);
+  const expectedStem = kebabStemFromPath(expected);
+
+  return (parsedFiles || []).find((f) => {
+    const p = String(f.path || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+    const base = path.posix.basename(p).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, '');
+    const ext = path.posix.extname(p);
+    if (!extCompatible(expectedExt, ext)) return false;
+    return (
+      base === expectedBase ||
+      base.toLowerCase() === expectedBase.toLowerCase() ||
+      kebabStemFromPath(p) === expectedStem
+    );
+  }) || null;
+}
+
 /**
  * Find the end index of the first exported class body in a TypeScript file.
  * Returns -1 if not found.
@@ -2617,7 +2731,9 @@ export {
   extractProjectName,
   extractDesignColors,
   filterEssentialSourceFiles,
-  verifyNpmCiBuild
+  verifyNpmCiBuild,
+  matchUnitBundleFile,
+  normalizeReactPlanPath
 };
 
 /**
@@ -2793,6 +2909,15 @@ async function askAIToFixBuildErrors(sessionId, buildErrors, workspacePath, aiPr
     // Fallback: only the first 8 source files, never the whole tree
     for (const k of keys.slice(0, 8)) subset[k] = currentFiles[k];
   }
+  if (String(targetTech).toLowerCase().includes('react')) {
+    for (const k of keys) {
+      if (Object.keys(subset).length >= 20) break;
+      if (subset[k]) continue;
+      if (/@angular\/|@ngxs\/|<mat-|\bmat-(?:button|icon|dialog)|@State\s*\(|store\.dispatch\s*\(\s*new /.test(currentFiles[k] || '')) {
+        subset[k] = currentFiles[k];
+      }
+    }
+  }
   const filesContext = buildFilesContext(subset);
   const fixPrompt = `The migrated ${targetTech} project has BUILD ERRORS. Fix ONLY the files causing errors.
 
@@ -2806,7 +2931,8 @@ ${filesContext}
 IMPORTANT RULES:
 - Output a JSON object with key "files" containing an array of objects:
   [{"path": "src/path/file.ts", "content": "full file content"}]
-- path MUST be an exact workspace-relative path from the error list (e.g. src/app/admin/... NOT src/admin/...).
+- You MAY change a .ts path to .tsx when the file contains JSX (TS1161 / Unterminated regular expression literal on a .ts file means JSX is in the wrong extension — emit the .tsx path and do not leave the .ts file).
+- path MUST be an exact workspace-relative path from the error list (e.g. src/app/admin/... NOT src/admin/...), except for the .ts → .tsx rename above.
 - For Angular, application code lives under src/app/ — never write src/admin or src/pages at the top of src/.
 - Only include files that need to be changed to fix the build errors.
 - Each file must be COMPLETE valid TypeScript/HTML/SCSS (not a diff, not truncated, no dangling commas/object literals).
@@ -2815,6 +2941,9 @@ IMPORTANT RULES:
 - Prefer extending environment with the missing keys rather than casting.
 - Make the minimum changes needed to fix compilation errors.
 - Do NOT delete converted pages/features to silence errors — fix the actual type/template/import issue.
+- If errors mention @ngxs/store, @State, Store.dispatch, or Action classes: rewrite that store as zustand (\`create\`, useXStore hook). Never keep NGXS in React.
+- If errors mention @angular/material, mat-* tags, or MatDialog/MatSidenav: rewrite to @mui/material (Drawer, Dialog, AppBar, Toolbar, Button, IconButton, Icon).
+- If a named import is missing, add the correct import — do not delete the feature.
 - Output ONLY valid JSON, no markdown fences.`;
 
   const systemInstruction = `You are an expert ${targetTech} developer. Your job is to fix build/compilation errors in a migrated project. Output ONLY a valid JSON object with a "files" array.`;
@@ -2852,20 +2981,46 @@ IMPORTANT RULES:
  * On failure: asks AI to fix errors, retries up to MAX_BUILD_RETRIES times.
  * Returns { verified: boolean }.
  */
-async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel, sourceFilesMap = null) {
+async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel, sourceFilesMap = null, sourcePackageJson = null) {
   let lastErrors = '';
+  const isReact = String(targetTech).toLowerCase().includes('react');
+  const isAngular = String(targetTech).toLowerCase().includes('angular');
+  let skipNpmInstall = false;
+
   for (let attempt = 1; attempt <= MAX_BUILD_FIX_ATTEMPTS; attempt++) {
+    if (isReact) {
+      const renamed = renameJsxTsFilesToTsx(workspacePath);
+      if (renamed > 0) {
+        console.log(`[${sessionId}] Renamed ${renamed} JSX .ts file(s) to .tsx before build`);
+      }
+    }
     console.log(`[${sessionId}] Final build verification attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS}...`);
-    // Skip npm install - node_modules should already exist from incremental builds
-    const result = await verifyBuild(workspacePath, targetTech, sessionId, true);
+    const result = await verifyBuild(workspacePath, targetTech, sessionId, skipNpmInstall);
+    if (result.installOk) skipNpmInstall = true;
     if (result.success) {
       return { verified: true, errors: '' };
     }
     lastErrors = result.errors || '';
 
     if (attempt < MAX_BUILD_FIX_ATTEMPTS) {
+      if (isReact) {
+        const repairedPkgs = repairReactWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson }) || 0;
+        const addedPkgs = addPackagesFromBuildErrors(workspacePath, result.errors);
+        const typeFixed = fixReactTypeErrors(workspacePath, result.errors);
+        const missingModule = /Cannot find module/.test(result.errors || '');
+        if (repairedPkgs > 0 || addedPkgs > 0 || (missingModule && typeFixed === 0)) {
+          console.log(`[${sessionId}] Installing dependencies after postprocess/package fixes...`);
+          await runCommand('npm', ['install'], workspacePath, 300000);
+          skipNpmInstall = true;
+          continue;
+        }
+        if (typeFixed > 0) {
+          console.log(`[${sessionId}] Mechanically fixed type errors in ${typeFixed} file(s). Retrying build...`);
+          continue;
+        }
+      }
       console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
-      if (String(targetTech).toLowerCase().includes('angular')) {
+      if (isAngular) {
         const envPatched = patchEnvironmentMissingProps(workspacePath, result.errors);
         if (envPatched > 0) {
           console.log(`[${sessionId}] Patched ${envPatched} environment file(s). Retrying build...`);
@@ -2874,6 +3029,11 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
       }
       const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
       if (fixes.length === 0) {
+        // Mechanical JSX rename may still save the build on the next attempt.
+        if (isReact && renameJsxTsFilesToTsx(workspacePath) > 0) {
+          console.log(`[${sessionId}] AI returned no fixes; renamed JSX .ts files and retrying.`);
+          continue;
+        }
         console.warn(`[${sessionId}] AI returned no fixes. Skipping remaining retries.`);
         break;
       }
@@ -2886,15 +3046,28 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         if (safePath.relative !== fix.relativePath.replace(/\\/g, '/').replace(/^\.?\//, '')) {
           console.log(`[${sessionId}] Remapped fix path ${fix.relativePath} → ${safePath.relative}`);
         }
-        ensureDirectoryExists(path.dirname(safePath.full));
-        fs.writeFileSync(safePath.full, sanitizeGeneratedContent(safePath.relative, fix.content), 'utf-8');
-        console.log(`[${sessionId}] Fixed: ${safePath.relative}`);
+        let sanitized = sanitizeGeneratedContent(safePath.relative, fix.content);
+        if (isReact && /\.(ts|tsx|js|jsx)$/i.test(safePath.relative)) {
+          sanitized = rewriteReactAngularLeftovers(sanitized);
+        }
+        let destRel = safePath.relative;
+        let destFull = safePath.full;
+        if (isReact) {
+          const dest = reactDestinationForContent(workspacePath, safePath.relative, sanitized);
+          destRel = dest.relative;
+          destFull = dest.full;
+          if (dest.staleTsFull && dest.staleTsFull !== destFull) unlinkIfExists(dest.staleTsFull);
+          if (destRel.endsWith('.tsx')) unlinkIfExists(destFull.replace(/\.tsx$/, '.ts'));
+        }
+        ensureDirectoryExists(path.dirname(destFull));
+        fs.writeFileSync(destFull, sanitized, 'utf-8');
+        console.log(`[${sessionId}] Fixed: ${destRel}`);
       }
       // Re-run post-process repairs after AI fixes
-      if (targetTech.toLowerCase().includes('angular')) {
+      if (isAngular) {
         repairAngularWorkspace(workspacePath, { sourceFilesMap });
-      } else if (targetTech.toLowerCase().includes('react')) {
-        repairReactWorkspace(workspacePath, {});
+      } else if (isReact) {
+        repairReactWorkspace(workspacePath, { sourceFilesMap });
       }
     }
   }
@@ -3544,7 +3717,7 @@ ${enhancedPrompt}`
 
     // 2. Extract file paths from text using regex (works with simple list responses)
     if (!success) {
-      const filePathRegex = /(?:src\/[\w./-]+\.(?:ts|html|css|scss|json))/g;
+      const filePathRegex = /(?:src\/[\w./-]+\.(?:tsx|jsx|ts|html|css|scss|json))/g;
       const matches = blueprintText.match(filePathRegex);
       if (matches && matches.length > 0) {
         // Deduplicate
@@ -3613,6 +3786,23 @@ ${enhancedPrompt}`
           if (re.test(u)) { u = u.replace(re, to); break; }
         }
         item.unit = u;
+      }
+    }
+
+    if (targetLower.includes('react')) {
+      const remapped = normalizeReactPlanPath(planned);
+      if (remapped == null) {
+        console.log(`[${sessionId}] Skipping Angular HTML triad file in React plan: ${planned}`);
+        return false;
+      }
+      if (remapped !== planned) {
+        console.log(`[${sessionId}] Remapped React plan path ${planned} → ${remapped}`);
+        planned = remapped;
+        item.newPath = planned;
+        if (item.unit && typeof item.unit === 'string') {
+          const u = normalizeReactPlanPath(item.unit);
+          if (u) item.unit = u;
+        }
       }
     }
 
@@ -3700,7 +3890,7 @@ PER-FILE TYPE RULES:
 - Angular .html: HTML only with Tailwind utility classes. No TypeScript, no CSS/SCSS.
 - Angular .scss: SCSS/CSS only. Prefer empty/minimal SCSS — styling belongs in Tailwind in the HTML. Empty files: /* component */
 - Angular layout: keep converted files under src/app (pages, components, services, lib). Do not invent a starter-kit core/shared/store tree.
-- React component: functional + hooks + TypeScript. Tailwind className utilities; companion styles use .scss only.
+- React component: functional + hooks + TypeScript in a .tsx file. Tailwind className utilities; companion styles use .scss only.
 - React .scss: minimal SCSS only; prefer Tailwind in JSX.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.
 
@@ -3708,7 +3898,7 @@ CRITICAL RULES:
 0. USER PROMPT FIRST: obey the user's migration mandate exactly (titles, colors, themes, branding, scope). Do NOT hallucinate packages, exports, APIs, files, or features that are not real / not requested / not required by the source conversion.
 1. You are ONLY generating source code files (components, styles, utilities). Configuration files like package.json, tsconfig.json, vite.config.ts, angular.json are ALREADY provided and should NOT be generated.
 2. For React: The main App component MUST be at src/App.tsx (NOT src/app/app.tsx). Import it as 'import App from "./App"' (NOT './app/app').
-3. For React: components are .tsx; utils/hooks/services may be .ts; companion styles are .scss — never force every file to .tsx.
+3. For React: pages, components, layouts, and ANY file that returns JSX MUST be .tsx — never .ts. Only utils, hooks, services, stores, and types stay .ts. If a listed path ends in .ts but the code has JSX, write it as the same path with .tsx.
 4. DO NOT create Angular-style directory structures (src/app/ subdirectory) for React projects.
 5. MANDATORY USER REQUIREMENTS override source defaults: if the user specifies titles, colors, theme values, or branding, apply those exact values in these files. Do NOT keep old source titles/colors when the user asked to change them.
 6. For Angular components: use templateUrl and styleUrl in the .ts file. Put ALL HTML markup in the .html file (with Tailwind classes) and ALL leftover styles in the .scss file (styleUrl: './name.component.scss'). NEVER use .css, inline template, or styles property.
@@ -3743,11 +3933,24 @@ CRITICAL RULES:
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
 36. COMPLETE CONVERSION: There is NO starter-kit template. Convert every source feature into real target files. Do not skip CRUD/admin/settings pages. You may overwrite stub app.component / app.routes / App.tsx.
 37. ENVIRONMENTS: src/environments/environment*.ts start as { production }. Extend with keys the converted code needs in the SAME unit.
+38. For React: @ngxs/store → zustand (\`import { create } from 'zustand'\`). No @State, @Action, Store.dispatch(new X()), or provideStore. Export a useXStore hook with the same CRUD methods.
+39. For React: @angular/material → @mui/material. MatSidenav → Drawer, MatDialog → Dialog/DialogTitle/DialogContent/DialogActions, MatToolbar → AppBar+Toolbar, mat-icon → Icon (Material Icons font) or lucide-react, mat-button → Button, mat-icon-button → IconButton. Do not leave mat-* tags or @angular/material imports in React files.
+40. Write COMPLETE files. Never truncate, never end with "...", never skip a listed unit. If a file uses JSX it MUST be .tsx.
 `;
 
   const generatedFiles = {};
   let npmInstallDone = false;
   const skippedUnits = [];
+  let indexesToWrite = [];
+  for (let i = startUnitIndex; i < migrationUnits.length; i += 1) indexesToWrite.push(i);
+  const sourceStack = detectSourceStack(essentialFilesMap, sourcePackageJson);
+  const stackMappingHint = targetLower.includes('react')
+    ? `
+[SOURCE STACK → REACT MAPPING — MANDATORY]
+${sourceStack.ngxs ? '- NGXS (@ngxs/store, @State, actions) → zustand create() store hook. Same CRUD methods, no decorators, no dispatch(new Action()).' : '- No NGXS in source.'}
+${sourceStack.material ? '- Angular Material → @mui/material (Drawer, Dialog, AppBar, Toolbar, Button, IconButton, Icon). No mat-* tags, no @angular/material imports.' : '- No Angular Material in source.'}
+`
+    : '';
 
   const unitWriterSystemInstruction = `${fileWriterSystemInstruction}
 
@@ -3760,8 +3963,22 @@ Write EVERY file in the unit in ONE response using this exact marker format (not
 ===== END =====
 Do not wrap the whole response in markdown fences. Each file must be complete.`;
 
-  for (let unitIndex = startUnitIndex; unitIndex < migrationUnits.length; unitIndex++) {
+  for (let pass = 0; pass < 2; pass += 1) {
+    if (pass === 1) {
+      if (skippedUnits.length === 0) break;
+      indexesToWrite = skippedUnits.map((s) => (typeof s === 'object' ? s.index : -1)).filter((i) => i >= 0);
+      if (indexesToWrite.length === 0) break;
+      console.log(`[${sessionId}] Retrying ${indexesToWrite.length} skipped unit(s)...`);
+      report('unit', `Retrying ${indexesToWrite.length} skipped unit(s)...`);
+      skippedUnits.length = 0;
+    }
+
+  for (const unitIndex of indexesToWrite) {
     const unit = migrationUnits[unitIndex];
+    if (targetLower.includes('react') && (unit.files || []).every((f) => isReactScaffoldPath(f.newPath))) {
+      console.log(`[${sessionId}] Skipping React scaffold unit ${unit.label} (workspace template provides it)`);
+      continue;
+    }
     report(
       'unit',
       `Converting unit ${unitIndex + 1}/${migrationUnits.length}: ${unit.label}`,
@@ -3787,9 +4004,9 @@ ${userPrompt}
 [PURPOSE]
 ${unit.files.map((f) => `- ${f.newPath}: ${f.explanationOfSource || unit.label}`).join('\n')}
 ${isSameFramework ? 'Keep the same framework. Convert fully — do not strip features.' : `Target framework: ${toTech}`}
-
+${stackMappingHint}
 Write ALL files listed above in one response using ===== FILE: path ===== markers.
-Each marker body is ONLY that file's contents (ts stays ts, html stays html, scss stays scss).
+Each marker body is ONLY that file's contents (tsx stays tsx, ts stays ts UNLESS it contains JSX — then use .tsx, html stays html, scss stays scss).
 Never write placeholder pages (no "HomeComponent placeholder", no empty stub classes). Convert the real source UI, including lucide-react icons as inline SVG.
 `;
 
@@ -3813,6 +4030,7 @@ Never write placeholder pages (no "HomeComponent placeholder", no empty stub cla
           unitPromptAttempt = `${unitPrompt}
 
 CRITICAL: Do NOT write placeholder text like "HomeComponent placeholder" or empty stub classes.
+Do NOT truncate files (unbalanced braces or trailing "..."). Write COMPLETE source.
 Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-react icons as inline <svg>, real state and handlers.`;
           continue;
         }
@@ -3849,7 +4067,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       console.warn(
         `[${sessionId}] Unit ${unit.label} failed after ${maxUnitAttempts} attempts — will not ship a stub.`
       );
-      skippedUnits.push(unit.label);
+      skippedUnits.push({ index: unitIndex, label: unit.label });
       report(
         'unit',
         `Unit ${unitIndex + 1}/${migrationUnits.length} (${unit.label}) did not convert — continuing remaining units, then failing if incomplete.`,
@@ -3876,31 +4094,73 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       continue;
     }
 
-    const byPath = new Map(parsedFiles.map((f) => [f.path.replace(/\\/g, '/').replace(/^\.?\//, ''), f]));
     let wroteAllExpected = true;
     for (const fileTarget of unit.files) {
-      const match =
-        byPath.get(fileTarget.newPath.replace(/\\/g, '/')) ||
-        parsedFiles.find((f) => f.path.endsWith(path.posix.basename(fileTarget.newPath)));
-      if (!match) {
-        console.warn(`[${sessionId}] Unit bundle missing ${fileTarget.newPath} — incomplete unit`);
-        wroteAllExpected = false;
+      const expected = fileTarget.newPath.replace(/\\/g, '/');
+      const expectedExt = path.posix.extname(expected).toLowerCase();
+      if (targetLower.includes('react') && isReactScaffoldPath(expected)) {
         continue;
       }
-      const safePath = resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
+      if (targetLower.includes('react') && expectedExt === '.html') {
+        continue;
+      }
+      const match = matchUnitBundleFile(parsedFiles, expected);
+      if (!match) {
+        if (expectedExt === '.scss' || expectedExt === '.css') {
+          const scssHint = expected.replace(/\.css$/i, '.scss');
+          const safeScss = resolveSafeWritePath(migrationWorkspacePath, scssHint) ||
+            resolveSafeWritePath(migrationWorkspacePath, expected);
+          if (safeScss) {
+            ensureDirectoryExists(path.dirname(safeScss.full));
+            const scssBody = '/* component */\n';
+            fs.writeFileSync(safeScss.full, scssBody, 'utf-8');
+            generatedFiles[safeScss.relative] = scssBody;
+            console.log(`[${sessionId}]   Wrote ${safeScss.relative} (empty SCSS companion)`);
+            continue;
+          }
+        }
+        const requiredCode = /\.(tsx|ts|jsx|js)$/i.test(expected) && !isReactScaffoldPath(expected);
+        if (requiredCode) {
+          console.warn(`[${sessionId}] Unit bundle missing ${fileTarget.newPath} — incomplete unit`);
+          wroteAllExpected = false;
+        } else {
+          console.warn(`[${sessionId}] Unit bundle missing optional ${fileTarget.newPath} — continuing`);
+        }
+        continue;
+      }
+      let body = match.content;
+      if (targetLower.includes('react') && /\.(ts|tsx|js|jsx)$/i.test(expected)) {
+        body = rewriteReactAngularLeftovers(body);
+      }
+      const writeHint = targetLower.includes('react') && fileContainsJsx(body)
+        ? expected.replace(/\.ts$/, '.tsx')
+        : fileTarget.newPath;
+      const safePath = resolveSafeWritePath(migrationWorkspacePath, writeHint) ||
+        resolveSafeWritePath(migrationWorkspacePath, fileTarget.newPath);
       if (!safePath) {
         console.log(`[${sessionId}] Refusing unsafe write path: ${fileTarget.newPath}`);
         wroteAllExpected = false;
         continue;
       }
-      ensureDirectoryExists(path.dirname(safePath.full));
-      const trimmedContent = sanitizeGeneratedContent(safePath.relative, match.content);
-      fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
-      generatedFiles[safePath.relative] = trimmedContent;
-      console.log(`[${sessionId}]   Wrote ${safePath.relative}`);
+      const trimmedContent = sanitizeGeneratedContent(safePath.relative, body);
+      let destRel = safePath.relative;
+      let destFull = safePath.full;
+      if (targetLower.includes('react')) {
+        const dest = reactDestinationForContent(migrationWorkspacePath, safePath.relative, trimmedContent);
+        destRel = dest.relative;
+        destFull = dest.full;
+        ensureDirectoryExists(path.dirname(destFull));
+        if (dest.staleTsFull && dest.staleTsFull !== destFull) unlinkIfExists(dest.staleTsFull);
+        if (destRel.endsWith('.tsx')) unlinkIfExists(destFull.replace(/\.tsx$/, '.ts'));
+      } else {
+        ensureDirectoryExists(path.dirname(destFull));
+      }
+      fs.writeFileSync(destFull, trimmedContent, 'utf-8');
+      generatedFiles[destRel] = trimmedContent;
+      console.log(`[${sessionId}]   Wrote ${destRel}`);
     }
     if (!wroteAllExpected) {
-      skippedUnits.push(`${unit.label} (incomplete file set)`);
+      skippedUnits.push({ index: unitIndex, label: `${unit.label} (incomplete file set)` });
     }
 
     writeCheckpoint(sessionId, {
@@ -3941,14 +4201,20 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
           (buildResult.errors || '').slice(-800)
         );
         if (targetLower.includes('angular')) repairAngularWorkspace(migrationWorkspacePath, {});
-        else if (targetLower.includes('react')) repairReactWorkspace(migrationWorkspacePath, {});
+        else if (targetLower.includes('react')) {
+          repairReactWorkspace(migrationWorkspacePath, {
+            sourcePackageJson,
+            sourceFilesMap: essentialFilesMap
+          });
+        }
       }
     }
 
-    if (unitIndex < migrationUnits.length - 1) {
+    if (pass === 0 && unitIndex < migrationUnits.length - 1) {
       console.log(`[Rate Limiter] Cooling down for ${RATE_LIMIT_PAUSE_MS / 1000}s before next unit...`);
       await pause(RATE_LIMIT_PAUSE_MS);
     }
+  }
   }
 
   // -----------------------------------------------------------------------
@@ -3972,7 +4238,10 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react, { preserveSrc: true });
     ensureReactRuntimeFiles(migrationWorkspacePath);
     console.log(`[${sessionId}] Running React post-generation repairs...`);
-    repairReactWorkspace(migrationWorkspacePath, { sourcePackageJson });
+    repairReactWorkspace(migrationWorkspacePath, {
+      sourcePackageJson,
+      sourceFilesMap: essentialFilesMap
+    });
     enforceReactPackageVersions(migrationWorkspacePath, targetVersions.react);
   } else if (targetLower.includes('angular')) {
     console.log(
@@ -4028,9 +4297,10 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     }
 
     // Remove any src/app directory if it was created (Angular-style structure)
+    // Remove leftover src/app only after files have been hoisted into src/
     const srcAppDir = path.join(migrationWorkspacePath, 'src', 'app');
     if (fs.existsSync(srcAppDir)) {
-      console.log(`[${sessionId}] Removing Angular-style src/app directory from React project`);
+      console.log(`[${sessionId}] Cleaning leftover Angular-style src/app after hoist`);
       fs.rmSync(srcAppDir, { recursive: true, force: true });
     }
   }
@@ -4043,7 +4313,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     const missingPages = collectMissingSourcePages(migrationWorkspacePath, essentialFilesMap);
     const problems = [];
     if (skippedUnits.length) {
-      problems.push(`skipped units: ${skippedUnits.join(', ')}`);
+      problems.push(`skipped units: ${skippedUnits.map((s) => s.label || s).join(', ')}`);
     }
     if (defects.placeholders.length) {
       problems.push(`placeholder templates: ${defects.placeholders.join(', ')}`);
@@ -4059,7 +4329,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     }
   } else if (skippedUnits.length) {
     throw new ConversionIncompleteError(
-      `Conversion incomplete — skipped units: ${skippedUnits.join(', ')}. Refusing to ship a partial project.`
+      `Conversion incomplete — skipped units: ${skippedUnits.map((s) => s.label || s).join(', ')}. Refusing to ship a partial project.`
     );
   }
 
@@ -4069,7 +4339,8 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     toTech,
     aiProvider,
     aiModel || undefined,
-    essentialFilesMap
+    essentialFilesMap,
+    sourcePackageJson
   );
   if (!buildCheck.verified) {
     const tail = String(buildCheck.errors || '').trim().slice(-1200);

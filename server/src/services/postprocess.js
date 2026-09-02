@@ -1738,12 +1738,15 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     '@lucide/angular',
     // Tailwind v4-only CSS packages break Angular Sass (@theme / @utility / @property)
     'tw-animate-css',
-    'tailwindcss-animate'
+    'tailwindcss-animate',
+    '@types/jasmine', 'jasmine-core', 'karma', 'karma-chrome-launcher',
+    'karma-coverage', 'karma-jasmine', 'karma-jasmine-html-reporter'
   ]);
 
   for (const [name, version] of Object.entries(srcDeps)) {
     if (skip.has(name)) continue;
     if (name.startsWith('@angular/')) continue;
+    if (name.startsWith('@ngxs/')) continue;
     if (name.startsWith('@types/') && targetFramework === 'angular') continue;
     if (targetFramework === 'angular' && isReactEcosystemPackage(name)) continue;
     if (pkg.dependencies[name] || pkg.devDependencies[name]) continue;
@@ -1795,12 +1798,17 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
     delete pkg.devDependencies.lucide;
   }
 
-  if (targetFramework === 'react') {
+    if (targetFramework === 'react') {
     if (srcDeps['react-router-dom'] || walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx') || n.endsWith('.jsx')).some((f) => /react-router-dom/.test(fs.readFileSync(f, 'utf-8')))) {
       pkg.dependencies['react-router-dom'] = srcDeps['react-router-dom'] || '^7.18.1';
     }
     delete pkg.dependencies['lucide-angular'];
     delete pkg.dependencies['@lucide/angular'];
+    delete pkg.dependencies['@ngxs/store'];
+    delete pkg.dependencies['@ngxs/logger-plugin'];
+    for (const name of Object.keys(pkg.dependencies)) {
+      if (name.startsWith('@angular/') || name.startsWith('@ngxs/')) delete pkg.dependencies[name];
+    }
     if (srcDeps['lucide-react'] || srcDeps['lucide-angular'] || srcDeps['@lucide/angular']) {
       pkg.dependencies['lucide-react'] = srcDeps['lucide-react'] || '^0.468.0';
     }
@@ -2472,22 +2480,2673 @@ export default defineConfig({
   fs.writeFileSync(vitePath, viteConfig, 'utf-8');
 }
 
+const REACT_KNOWN_PACKAGES = {
+  '@mui/material': '^6.4.8',
+  '@mui/icons-material': '^6.4.8',
+  '@emotion/react': '^11.14.0',
+  '@emotion/styled': '^11.14.0',
+  zustand: '^5.0.3',
+  'react-router-dom': '^7.18.1',
+  'react-hook-form': '^7.54.2',
+  'lucide-react': '^0.468.0',
+  '@reduxjs/toolkit': '^2.5.0',
+  'react-redux': '^9.2.0'
+};
+
+const MUI_JSX_NAMES = [
+  'AppBar', 'Toolbar', 'Box', 'Drawer', 'Icon', 'Dialog', 'DialogTitle',
+  'DialogContent', 'DialogActions', 'FormControl', 'InputLabel', 'FormHelperText',
+  'Select', 'MenuItem', 'Button', 'IconButton', 'TextField', 'Card', 'CardHeader',
+  'CardContent', 'CardActions', 'CircularProgress', 'Divider'
+];
+
+/**
+ * Detect NGXS / Angular Material in the uploaded source so React conversion
+ * can map them automatically.
+ */
+export function detectSourceStack(filesMap = {}, sourcePackageJson = null) {
+  const pkgBlob = JSON.stringify(sourcePackageJson || {});
+  const fileBlob = Object.values(filesMap || {}).join('\n');
+  const blob = `${pkgBlob}\n${fileBlob}`;
+  return {
+    material: /@angular\/material/.test(blob) || /\bMat(Button|Icon|Sidenav|Dialog|Toolbar|FormField)/.test(blob),
+    ngxs: /@ngxs\/store/.test(blob) || /\b(StateContext|provideStore|@State)\b/.test(blob),
+    lucide: /lucide-angular|@lucide\/angular|lucide-react/.test(blob)
+  };
+}
+
+/**
+ * True when generated source looks truncated (unbalanced braces / trailing ellipsis).
+ */
+export function isTruncatedSource(content) {
+  const text = String(content || '');
+  if (!text.trim()) return true;
+  if (/\n\s*\.\.\.\s*$/.test(text) && text.length < 400) return true;
+  if (/\/\/\s*(TODO|rest of|implement later)\b/i.test(text) && text.length < 600) return true;
+  let curly = 0;
+  let paren = 0;
+  let square = 0;
+  let inStr = null;
+  let escape = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      continue;
+    }
+    if (ch === '{') curly += 1;
+    else if (ch === '}') curly -= 1;
+    else if (ch === '(') paren += 1;
+    else if (ch === ')') paren -= 1;
+    else if (ch === '[') square += 1;
+    else if (ch === ']') square -= 1;
+    if (curly < 0 || paren < 0 || square < 0) return true;
+  }
+  if (inStr) return true;
+  return curly !== 0 || paren !== 0 || square !== 0;
+}
+
+function packageNameFromSpecifier(spec) {
+  const s = String(spec || '');
+  if (!s || s.startsWith('.') || s.startsWith('/') || s.startsWith('@/')) return '';
+  if (s.startsWith('@')) {
+    const parts = s.split('/');
+    return parts.slice(0, 2).join('/');
+  }
+  return s.split('/')[0];
+}
+
+function collectBareImportPackages(destPath) {
+  const specs = new Set();
+  const srcRoot = path.join(destPath, 'src');
+  for (const file of walkFiles(srcRoot, (n) =>
+    n.endsWith('.ts') || n.endsWith('.tsx') || n.endsWith('.js') || n.endsWith('.jsx')
+  )) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const m of content.matchAll(/from\s+['"]([^'"]+)['"]/g)) {
+      const pkg = packageNameFromSpecifier(m[1]);
+      if (pkg) specs.add(pkg);
+    }
+  }
+  return specs;
+}
+
+function findMatchingDelimiter(text, openIdx) {
+  const open = text[openIdx];
+  const close = open === '(' ? ')' : open === '{' ? '}' : open === '[' ? ']' : null;
+  if (!close) return -1;
+  let depth = 0;
+  let inStr = null;
+  let escape = false;
+  for (let i = openIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function hookNameFromStateClass(name) {
+  const base = String(name || '').replace(/State$/, '');
+  return `use${base || 'App'}Store`;
+}
+
+function rewriteNgxsActionBody(body) {
+  return String(body || '')
+    .replace(/\bctx\.patchState\(/g, 'set(')
+    .replace(/\bctx\.setState\(/g, 'set(')
+    .replace(/\bctx\.getState\(\)/g, 'get()')
+    .replace(/\bctx\.dispatch\(/g, 'get(); /* dispatch */(');
+}
+
+function methodParamsFromNgxsAction(params, body) {
+  const usesPayload = /\baction\.payload\b/.test(body);
+  const usesId = /\baction\.id\b/.test(body);
+  if (usesPayload && !usesId) return { params: 'payload', body: body.replace(/\baction\.payload\b/g, 'payload') };
+  if (usesId && !usesPayload) return { params: 'id', body: body.replace(/\baction\.id\b/g, 'id') };
+  if (/\baction\b/.test(body)) return { params: 'action', body };
+  const extra = String(params || '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => p && !/\bctx\b/.test(p));
+  if (extra.length === 0) return { params: '', body };
+  return { params: extra.map((p) => p.split(':')[0].replace(/^(public|private|readonly)\s+/, '').trim()).join(', '), body };
+}
+
+/**
+ * Convert a leftover NGXS @State class into a zustand create() store.
+ */
+export function rewriteNgxsStateToZustand(content) {
+  const text = String(content || '');
+  if (!/@State\s*(?:<[^>]+>)?\s*\(/.test(text) && !/@Action\s*\(/.test(text)) return text;
+  if (/from\s+['"]zustand['"]/.test(text) && /\bcreate\s*\(/.test(text)) return text;
+
+  const classMatch = text.match(/export\s+class\s+(\w+)/);
+  if (!classMatch) return text;
+  const className = classMatch[1];
+  const hookName = hookNameFromStateClass(className);
+  const classIdx = text.indexOf(classMatch[0]);
+  let decoStart = classIdx;
+  const stateDeco = text.lastIndexOf('@State', classIdx);
+  if (stateDeco >= 0) decoStart = stateDeco;
+  const injDeco = text.lastIndexOf('@Injectable', classIdx);
+  if (injDeco >= 0 && injDeco < decoStart) decoStart = injDeco;
+
+  let fields = '';
+  const defaultsKey = text.indexOf('defaults', decoStart >= 0 ? decoStart : 0);
+  if (defaultsKey >= 0 && defaultsKey < classIdx) {
+    const after = text.slice(defaultsKey);
+    const ident = after.match(/^defaults\s*:\s*([A-Za-z_][\w]*)/);
+    const braceRel = after.search(/defaults\s*:\s*\{/);
+    if (braceRel >= 0) {
+      const braceAbs = defaultsKey + after.slice(braceRel).indexOf('{');
+      const objEnd = findMatchingDelimiter(text, braceAbs);
+      if (objEnd > braceAbs) fields = text.slice(braceAbs + 1, objEnd).trim();
+    } else if (ident) {
+      fields = `...${ident[1]}`;
+    }
+  }
+
+  const actions = [];
+  const actionRe = /@Action\s*\(\s*(\w+)\s*\)/g;
+  let am;
+  while ((am = actionRe.exec(text))) {
+    const after = text.slice(am.index + am[0].length);
+    const sig = after.match(/^\s*(\w+)\s*\(([^)]*)\)\s*(?::\s*[^\{]+)?\s*\{/);
+    if (!sig) continue;
+    const methodName = sig[1];
+    const openBrace = am.index + am[0].length + sig[0].length - 1;
+    const closeBrace = findMatchingDelimiter(text, openBrace);
+    if (closeBrace < 0) continue;
+    const rawBody = text.slice(openBrace + 1, closeBrace);
+    const rewritten = rewriteNgxsActionBody(rawBody);
+    const shaped = methodParamsFromNgxsAction(sig[2], rewritten);
+    actions.push({ methodName, ...shaped });
+  }
+
+  let head = text.slice(0, decoStart).trimEnd();
+  head = head.replace(/import\s+[^;]*from\s+['"]@ngxs\/[^'"]+['"]\s*;?\s*/g, '');
+  head = head.replace(/import\s+[^;]*from\s+['"]@angular\/[^'"]+['"]\s*;?\s*/g, '');
+  head = head.replace(/import\s+\{[^}]*\}\s+from\s+['"][^'"]*actions['"]\s*;?\s*/g, '');
+  if (!/from\s+['"]zustand['"]/.test(head)) {
+    head = `import { create } from 'zustand';\n${head}`.replace(/\n{3,}/g, '\n\n');
+  }
+
+  const methodBlock = actions
+    .map((a) => `  ${a.methodName}: (${a.params}) => {${a.body}  }`)
+    .join(',\n');
+  const parts = [];
+  if (fields) parts.push(fields.replace(/,?\s*$/, ''));
+  if (methodBlock) parts.push(methodBlock);
+  return `${head}\n\nexport const ${hookName} = create((set, get) => ({\n${parts.join(',\n')}\n}));\n`;
+}
+
+function rewriteNgxsActionFile(content) {
+  const text = String(content || '');
+  if (!/static\s+readonly\s+type\s*=/.test(text)) return text;
+  if (/from\s+['"]zustand['"]/.test(text) || /@State\s*\(/.test(text)) return text;
+  return text.replace(
+    /export\s+class\s+(\w+)\s*\{[\s\S]*?constructor\s*\(([^)]*)\)\s*\{\s*\}[\s\S]*?\}/g,
+    (_, name, ctor) => {
+      const typed = String(ctor || '').match(/:\s*([\w<>,\s\[\]|&]+)/);
+      const payloadType = typed ? typed[1].trim() : 'unknown';
+      return `export type ${name} = ${payloadType};`;
+    }
+  );
+}
+
+function inferZustandHook(content) {
+  const select = String(content || '').match(/\b([A-Z]\w*State)\./);
+  if (select) return hookNameFromStateClass(select[1]);
+  const imported = String(content || '').match(/import\s+\{[^}]*\b([A-Z]\w*State)\b/);
+  if (imported) return hookNameFromStateClass(imported[1]);
+  return 'useAppStore';
+}
+
+function rewriteNgxsDispatchAndSelect(content) {
+  let c = String(content || '');
+  const fallbackHook = inferZustandHook(c);
+
+  c = c.replace(
+    /(?:this\.)?store\.dispatch\(\s*new\s+(\w+)\s*\(([\s\S]*?)\)\s*\)/g,
+    (_, action, args) => {
+      const method = `${action.charAt(0).toLowerCase()}${action.slice(1)}`;
+      return `${fallbackHook}.getState().${method}(${args})`;
+    }
+  );
+  c = c.replace(
+    /(?:(?:readonly|public|private)\s+)?(?:readonly\s+)?(\w+)\$?\s*=\s*(?:this\.)?store\.select\(\s*(\w+)\.(\w+)\s*\)/g,
+    (_, name, stateClass, field) =>
+      `const ${String(name).replace(/\$$/, '')} = ${hookNameFromStateClass(stateClass)}((s) => s.${field})`
+  );
+  c = c.replace(
+    /(?:this\.)?store\.selectSnapshot\(\s*(\w+)\.(\w+)\s*\)/g,
+    (_, stateClass, field) => `${hookNameFromStateClass(stateClass)}.getState().${field}`
+  );
+  c = c.replace(
+    /(?:this\.)?store\.select\(\s*(\w+)\.(\w+)\s*\)/g,
+    (_, stateClass, field) => `${hookNameFromStateClass(stateClass)}((s) => s.${field})`
+  );
+  c = c.replace(
+    /@Select\(\s*(\w+)\.(\w+)\s*\)\s*(?:readonly\s+)?(\w+)\$?\s*;?/g,
+    (_, stateClass, field, name) =>
+      `const ${String(name).replace(/\$$/, '')} = ${hookNameFromStateClass(stateClass)}((s) => s.${field});`
+  );
+  c = c.replace(
+    /^[ \t]*(?:private|public|protected|readonly)\s+(?:readonly\s+)?(?:store\s*=\s*)?inject\(\s*Store\s*\)\s*;?[ \t]*\n/gm,
+    ''
+  );
+  c = c.replace(/^[ \t]*(?:const|let)\s+\w+\s*=\s*inject\(\s*Store\s*\)\s*;?[ \t]*\n/gm, '');
+  c = c.replace(/\bprovideStore\s*\((?:[^)(]|\([^)(]*\))*\)\s*,?/g, '');
+  return c;
+}
+
+function rewriteAngularControlFlow(content) {
+  const text = String(content || '');
+  if (!/@if\s*\(|@for\s*\(|@else\b/.test(text)) return text;
+
+  let i = 0;
+  let out = '';
+  let inStr = null;
+  let escape = false;
+  const stack = [];
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (inStr) {
+      out += ch;
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === inStr) inStr = null;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    if (text.startsWith('@if', i) && /^@if\s*\(/.test(text.slice(i))) {
+      const parenStart = text.indexOf('(', i);
+      const parenEnd = findMatchingDelimiter(text, parenStart);
+      if (parenEnd < 0) {
+        out += ch;
+        i += 1;
+        continue;
+      }
+      let cond = text.slice(parenStart + 1, parenEnd).trim();
+      const asMatch = cond.match(/;\s*as\s+(\w+)\s*$/);
+      const alias = asMatch?.[1];
+      if (asMatch) cond = cond.slice(0, asMatch.index).trim();
+      cond = cond.replace(/\|\s*async/g, '').trim();
+      i = parenEnd + 1;
+      while (i < text.length && /\s/.test(text[i])) i += 1;
+      if (text[i] === '{') i += 1;
+      if (alias) {
+        out += `{(() => { const ${alias} = ${cond}; return ${alias} ? (`;
+        stack.push({ close: ') : null})()}', depth: 1, hasElse: false });
+      } else {
+        out += `{${cond} ? (`;
+        stack.push({ close: ') : null)}', depth: 1, hasElse: false });
+      }
+      continue;
+    }
+
+    if (text.startsWith('@for', i) && /^@for\s*\(/.test(text.slice(i))) {
+      const parenStart = text.indexOf('(', i);
+      const parenEnd = findMatchingDelimiter(text, parenStart);
+      if (parenEnd < 0) {
+        out += ch;
+        i += 1;
+        continue;
+      }
+      const inner = text.slice(parenStart + 1, parenEnd);
+      const loop = inner.match(/(\w+)\s+of\s+([^;]+)/);
+      i = parenEnd + 1;
+      while (i < text.length && /\s/.test(text[i])) i += 1;
+      if (text[i] === '{') i += 1;
+      if (loop) {
+        out += `{${loop[2].trim()}.map((${loop[1]}) => (`;
+        stack.push({ close: '))}', depth: 1 });
+      }
+      continue;
+    }
+
+    if (ch === '}' && stack.length) {
+      const rest = text.slice(i);
+      if (/^\}\s*@else\s*\{/.test(rest)) {
+        const top = stack[stack.length - 1];
+        if (top) {
+          top.hasElse = true;
+          top.close = top.close.includes('})()}') ? '))})()}' : ')}';
+        }
+        out += ') : (';
+        i += rest.match(/^\}\s*@else\s*\{/)[0].length;
+        stack[stack.length - 1].depth = 1;
+        continue;
+      }
+      const top = stack[stack.length - 1];
+      if (top.depth <= 1) {
+        out += top.close;
+        stack.pop();
+        i += 1;
+        continue;
+      }
+      top.depth -= 1;
+      out += '}';
+      i += 1;
+      continue;
+    }
+
+    if (ch === '{' && stack.length) {
+      stack[stack.length - 1].depth += 1;
+    }
+
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+function repairBrokenJsxObjectLiterals(content) {
+  return String(content || '').replace(
+    /(\s)([A-Za-z_][\w]*)=\{(\w+\s*:\s*[^}]+)\}/g,
+    '$1$2={{ $3 }}'
+  );
+}
+
+function rewriteAngularJsxBindings(content) {
+  let c = String(content || '');
+  // Angular {{ expr }} in template text — NOT React prop={{ object }} (MUI PaperProps, sx, style, etc.)
+  c = c.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (match, expr, offset, full) => {
+    const before = full.slice(Math.max(0, offset - 32), offset);
+    if (/=\s*$/.test(before)) return match;
+    return `{${expr}}`;
+  });
+  c = repairBrokenJsxObjectLiterals(c);
+  c = c.replace(/\bformControlName=["']([^"']+)["']/g, 'name="$1"');
+  c = c.replace(/\[(\w+)\]="([^"]*)"/g, (_, prop, val) => {
+    if (prop === 'formGroup') return '';
+    const mapped = { opened: 'open', ngClass: 'className', class: 'className', ngStyle: 'style' }[prop] || prop;
+    return `${mapped}={${val}}`;
+  });
+  const eventMap = {
+    click: 'onClick',
+    submit: 'onSubmit',
+    change: 'onChange',
+    input: 'onChange',
+    openedChange: 'onClose',
+    close: 'onClose',
+    save: 'onSave',
+    cancel: 'onCancel',
+    edit: 'onEdit',
+    remove: 'onRemove',
+    delete: 'onDelete',
+    ngSubmit: 'onSubmit'
+  };
+  c = c.replace(/\((\w+)\)="([^"]*)"/g, (_, ev, handler) => {
+    const name = eventMap[ev] || `on${ev.charAt(0).toUpperCase()}${ev.slice(1)}`;
+    const h = handler.replace(/\$event/g, 'event').trim();
+    if (/^[\w.]+$/.test(h)) return `${name}={${h}}`;
+    if (/^[\w.]+\(\)$/.test(h)) return `${name}={${h.slice(0, -2)}}`;
+    return `${name}={() => ${h}}`;
+  });
+  c = c.replace(/(<[^>/][^>]*?)\sclass=/g, '$1 className=');
+  c = c.replace(/\s\*ngIf="[^"]*"/g, '');
+  c = c.replace(/\s\*ngFor="[^"]*"/g, '');
+  c = c.replace(/\bcolor=["']warn["']/g, 'color="error"');
+  return c;
+}
+
+function rewriteAppSelectorTags(content) {
+  const imported = new Map();
+  for (const m of String(content || '').matchAll(/import\s+\{([^}]+)\}\s+from/g)) {
+    for (const part of m[1].split(',')) {
+      const name = part.trim().split(/\s+as\s+/).pop().trim();
+      if (!name) continue;
+      imported.set(name.toLowerCase(), name);
+      imported.set(name.replace(/Component$/, '').toLowerCase(), name);
+    }
+  }
+  const pascalFor = (kebab) => {
+    const pascal = toPascalCase(kebab);
+    return imported.get(pascal.toLowerCase()) || imported.get(kebab.replace(/-/g, '')) || pascal;
+  };
+  return String(content || '')
+    .replace(/<app-([a-z0-9-]+)/gi, (_, k) => `<${pascalFor(k.toLowerCase())}`)
+    .replace(/<\/app-([a-z0-9-]+)/gi, (_, k) => `</${pascalFor(k.toLowerCase())}`);
+}
+
+function rewriteMatTagsToMui(content) {
+  let c = String(content || '');
+  c = c.replace(
+    /<(button|a)([^>]*?)\bmat-icon-button\b([^>]*)>([\s\S]*?)<\/\1>/gi,
+    '<IconButton$2$3>$4</IconButton>'
+  );
+  c = c.replace(
+    /<(button|a)([^>]*?)\bmat-(?:flat|raised)-button\b([^>]*)>([\s\S]*?)<\/\1>/gi,
+    '<Button variant="contained"$2$3>$4</Button>'
+  );
+  c = c.replace(
+    /<(button|a)([^>]*?)\bmat-stroked-button\b([^>]*)>([\s\S]*?)<\/\1>/gi,
+    '<Button variant="outlined"$2$3>$4</Button>'
+  );
+  c = c.replace(
+    /<(button|a)([^>]*?)\bmat-button\b([^>]*)>([\s\S]*?)<\/\1>/gi,
+    '<Button$2$3>$4</Button>'
+  );
+  c = c.replace(/<mat-toolbar\b([^>]*)>/gi, '<AppBar position="static"$1><Toolbar>');
+  c = c.replace(/<\/mat-toolbar>/gi, '</Toolbar></AppBar>');
+  c = c.replace(/<mat-sidenav-container\b([^>]*)>/gi, '<Box sx={{ display: "flex", minHeight: "100vh" }}$1>');
+  c = c.replace(/<\/mat-sidenav-container>/gi, '</Box>');
+  c = c.replace(/<mat-sidenav-content\b([^>]*)>/gi, '<Box component="main" sx={{ flex: 1 }}$1>');
+  c = c.replace(/<\/mat-sidenav-content>/gi, '</Box>');
+  c = c.replace(/<mat-sidenav\b([^>]*)>/gi, (_, attrs) => {
+    let a = attrs || '';
+    a = a.replace(/\bposition=["']end["']/i, 'anchor="right"');
+    a = a.replace(/\bposition=["']start["']/i, 'anchor="left"');
+    a = a.replace(/\bmode=["']over["']/i, 'variant="temporary"');
+    a = a.replace(/\bmode=["']side["']/i, 'variant="persistent"');
+    a = a.replace(/\bopened=/g, 'open=');
+    a = a.replace(/\[opened\]=/g, 'open=');
+    return `<Drawer${a}>`;
+  });
+  c = c.replace(/<\/mat-sidenav>/gi, '</Drawer>');
+  c = c.replace(/<mat-icon\b([^>]*)>/gi, '<Icon$1>');
+  c = c.replace(/<\/mat-icon>/gi, '</Icon>');
+  c = c.replace(/<mat-dialog-content\b([^>]*)>/gi, '<DialogContent$1>');
+  c = c.replace(/<\/mat-dialog-content>/gi, '</DialogContent>');
+  c = c.replace(/<mat-dialog-actions\b([^>]*)>/gi, '<DialogActions$1>');
+  c = c.replace(/<\/mat-dialog-actions>/gi, '</DialogActions>');
+  c = c.replace(/<h2\s+mat-dialog-title\b([^>]*)>([\s\S]*?)<\/h2>/gi, '<DialogTitle$1>$2</DialogTitle>');
+  c = c.replace(/<mat-form-field\b([^>]*)>/gi, (_, attrs) => {
+    const a = String(attrs || '').replace(/\sappearance=["'][^"']*["']/g, '');
+    return `<FormControl fullWidth margin="normal"${a}>`;
+  });
+  c = c.replace(/<\/mat-form-field>/gi, '</FormControl>');
+  c = c.replace(/<mat-label\b([^>]*)>/gi, '<InputLabel$1>');
+  c = c.replace(/<\/mat-label>/gi, '</InputLabel>');
+  c = c.replace(/<mat-error\b([^>]*)>/gi, '<FormHelperText error$1>');
+  c = c.replace(/<\/mat-error>/gi, '</FormHelperText>');
+  c = c.replace(/<mat-select\b([^>]*)>/gi, '<Select$1>');
+  c = c.replace(/<\/mat-select>/gi, '</Select>');
+  c = c.replace(/<mat-option\b([^>]*)>/gi, '<MenuItem$1>');
+  c = c.replace(/<\/mat-option>/gi, '</MenuItem>');
+  c = c.replace(/<mat-card-content\b([^>]*)>/gi, '<CardContent$1>');
+  c = c.replace(/<\/mat-card-content>/gi, '</CardContent>');
+  c = c.replace(/<mat-card-actions\b([^>]*)>/gi, '<CardActions$1>');
+  c = c.replace(/<\/mat-card-actions>/gi, '</CardActions>');
+  c = c.replace(/<mat-card-header\b([^>]*)>/gi, '<CardHeader$1>');
+  c = c.replace(/<\/mat-card-header>/gi, '</CardHeader>');
+  c = c.replace(/<mat-card\b([^>]*)>/gi, '<Card$1>');
+  c = c.replace(/<\/mat-card>/gi, '</Card>');
+  c = c.replace(/<mat-(?:progress-)?spinner\b[^>]*\/?>/gi, '<CircularProgress />');
+  c = c.replace(/<mat-divider\b[^>]*\/?>/gi, '<Divider />');
+  c = c.replace(/\smatInput\b/g, '');
+  c = c.replace(/\smat-dialog-title\b/g, '');
+  return c;
+}
+
+function camelFromDialogComponent(name) {
+  const base = String(name || '').replace(/Component$/, '');
+  return `${base.charAt(0).toLowerCase()}${base.slice(1)}`;
+}
+
+function extractObjectField(objSrc, field) {
+  const text = String(objSrc || '');
+  const m = text.match(new RegExp(`\\b${field}\\s*:`));
+  if (!m) return null;
+  const start = m.index + m[0].length;
+  let i = start;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  const ch = text[i];
+  if (ch === '{' || ch === '[' || ch === '(') {
+    const end = findMatchingDelimiter(text, i);
+    return end >= 0 ? text.slice(i, end + 1).trim() : null;
+  }
+  const ident = text.slice(i).match(/^[\w.$]+/);
+  return ident ? ident[0] : null;
+}
+
+function rewriteAngularInjects(content) {
+  let c = String(content || '');
+  c = c.replace(
+    /^[ \t]*(?:private|public|protected|readonly)\s+(?:readonly\s+)*(?:\w+\s*=\s*)?inject\(\s*(?:MatDialog|Store|Router)\s*\)\s*;?[ \t]*\n/gm,
+    ''
+  );
+  c = c.replace(/^[ \t]*(?:const|let)\s+\w+\s*=\s*inject\(\s*\w+\s*\)\s*;?[ \t]*\n/gm, '');
+  c = c.replace(/\binject\(\s*(?:MatDialog|Store|Router)\s*\)/g, 'undefined');
+  return c;
+}
+
+function stripThisInFunctionComponents(content) {
+  const text = String(content || '');
+  if (!/export\s+(?:default\s+)?function\s+|=\s*\([^)]*\)\s*=>/.test(text)) return text;
+  if (/export\s+class\s+/.test(text) && !/export\s+(?:default\s+)?function\s+/.test(text)) return text;
+  return text.replace(/\bthis\./g, '');
+}
+
+function ensureReactHookImports(content) {
+  const hooks = ['useState', 'useEffect', 'useMemo', 'useCallback', 'useRef'].filter((h) =>
+    new RegExp(`\\b${h}\\s*\\(`).test(content)
+  );
+  if (hooks.length === 0) return content;
+  let c = content;
+  for (const h of hooks) {
+    if (new RegExp(`import\\s+[^;]*\\b${h}\\b`).test(c)) continue;
+    c = ensureImport(c, h, 'react');
+  }
+  return c;
+}
+
+function findComponentBodyOpen(content) {
+  const patterns = [
+    /export\s+default\s+function\s+\w+\s*\([^)]*\)\s*\{/,
+    /export\s+function\s+\w+\s*\([^)]*\)\s*\{/,
+    /(?:export\s+(?:default\s+)?)?(?:const|let)\s+\w+\s*=\s*(?:\([^)]*\)|\w+)\s*=>\s*\{/
+  ];
+  for (const re of patterns) {
+    const m = content.match(re);
+    if (m) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+function insertAfterComponentBrace(content, snippet) {
+  const marker = snippet.replace(/\s+/g, ' ').slice(0, 48);
+  if (content.replace(/\s+/g, ' ').includes(marker.trim())) return content;
+  const at = findComponentBodyOpen(content);
+  if (at < 0) return content;
+  return `${content.slice(0, at)}\n  ${snippet}\n${content.slice(at)}`;
+}
+
+function insertBeforeReturnClose(content, jsx) {
+  const key = jsx.match(/<(\w+)/)?.[1];
+  if (key && new RegExp(`<${key}\\b[^>]*\\bopen=`).test(content)) return content;
+  const matches = [...content.matchAll(/return\s*\(/g)];
+  if (matches.length === 0) return content;
+  const last = matches[matches.length - 1];
+  const parenStart = last.index + last[0].length - 1;
+  const parenEnd = findMatchingDelimiter(content, parenStart);
+  if (parenEnd < 0) return content;
+  return `${content.slice(0, parenEnd)}\n      ${jsx}\n    ${content.slice(parenEnd)}`;
+}
+
+function convertDialogClassToFunction(content) {
+  const classMatch = content.match(/export\s+class\s+(\w+)\s*\{/);
+  if (!classMatch) return content;
+  const name = classMatch[1];
+  const braceStart = content.indexOf('{', classMatch.index + classMatch[0].length - 1);
+  const braceEnd = findMatchingDelimiter(content, braceStart);
+  if (braceEnd < 0) return content;
+  let body = content.slice(braceStart + 1, braceEnd);
+  body = body.replace(/constructor\s*\((?:[^)(]|\([^)(]*\))*\)\s*\{\s*\}/g, '');
+  body = body.replace(/(?:public|private|protected|readonly)\s+(?:readonly\s+)?/g, '');
+  body = body.replace(
+    /(\n\s*)(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>,\s\[\]|&]+)?\s*\{/g,
+    '$1const $2 = ($3) => {'
+  );
+  const head = content.slice(0, classMatch.index);
+  const tail = content.slice(braceEnd + 1);
+  return `${head}export function ${name}({ open = false, onClose = () => {}, data } = {}) {\n${body}\n}\n${tail}`;
+}
+
+function wrapReturnWithDialog(content) {
+  const idx = content.search(/return\s*\(/);
+  if (idx < 0) return content;
+  const parenStart = content.indexOf('(', idx);
+  const parenEnd = findMatchingDelimiter(content, parenStart);
+  if (parenEnd < 0) return content;
+  const inner = content.slice(parenStart + 1, parenEnd);
+  if (/<Dialog\b/.test(inner)) return content;
+  const wrapped = `(\n    <Dialog open={Boolean(open)} onClose={() => onClose(false)}>\n      ${inner.trim()}\n    </Dialog>\n  )`;
+  return content.slice(0, parenStart) + wrapped + content.slice(parenEnd + 1);
+}
+
+function ensureDialogComponentProps(content) {
+  if (/function\s+\w+\s*\(\s*\{\s*open\b/.test(content)) return content;
+  let c = content;
+  c = c.replace(
+    /export\s+(?:default\s+)?function\s+(\w+)\s*\(\s*\)/,
+    'export function $1({ open = false, onClose = () => {}, data } = {})'
+  );
+  c = c.replace(
+    /export\s+(?:default\s+)?function\s+(\w+)\s*\(\s*\{\s*([^}]*)\}\s*(?:=\s*\{\s*\})?\s*\)/,
+    (_, name, props) => {
+      const parts = String(props)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const names = new Set(parts.map((p) => p.split(/[:=]/)[0].trim()));
+      if (!names.has('open')) parts.unshift('open = false');
+      if (!names.has('onClose')) parts.push('onClose = () => {}');
+      if (!names.has('data')) parts.push('data');
+      return `export function ${name}({ ${parts.join(', ')} } = {})`;
+    }
+  );
+  return c;
+}
+
+/**
+ * MatDialog child: dialogRef / MAT_DIALOG_DATA → { open, onClose, data } + MUI Dialog.
+ */
+export function rewriteMatDialogComponent(content) {
+  let c = String(content || '');
+  const looksLikeDialog =
+    /MatDialogRef|MAT_DIALOG_DATA|dialogRef\.close|<DialogTitle\b|<DialogContent\b|<DialogActions\b/.test(c);
+  if (!looksLikeDialog) return c;
+  if (/<Dialog\b/.test(c) && /\bonClose\b/.test(c) && !/dialogRef/.test(c) && !/MAT_DIALOG/.test(c)) {
+    return c;
+  }
+
+  if (/export\s+class\s+\w+/.test(c)) {
+    c = convertDialogClassToFunction(c);
+  }
+  c = c.replace(/(?:this\.)?dialogRef\.close\s*\(/g, 'onClose(');
+  c = ensureDialogComponentProps(c);
+  if ((/<DialogTitle\b/.test(c) || /<DialogContent\b/.test(c) || /<DialogActions\b/.test(c)) && !/<Dialog\b/.test(c)) {
+    c = wrapReturnWithDialog(c);
+  }
+  return c;
+}
+
+/**
+ * MatDialog.open(...).afterClosed() → useState + render the dialog component.
+ */
+export function rewriteMatDialogOpen(content) {
+  let c = String(content || '');
+  if (!/\.open\s*\(/.test(c)) return c;
+
+  const injected = [];
+  let searchFrom = 0;
+  while (true) {
+    const dot = c.indexOf('.open(', searchFrom);
+    if (dot < 0) break;
+    const recvStart = Math.max(0, dot - 48);
+    const receiver = c.slice(recvStart, dot);
+    if (!/dialog/i.test(receiver)) {
+      searchFrom = dot + 5;
+      continue;
+    }
+    const openParen = dot + 5;
+    const closeParen = findMatchingDelimiter(c, openParen);
+    if (closeParen < 0) break;
+    const args = c.slice(openParen + 1, closeParen);
+    const commaAt = (() => {
+      let depth = 0;
+      let inStr = null;
+      let escape = false;
+      for (let i = 0; i < args.length; i += 1) {
+        const ch = args[i];
+        if (inStr) {
+          if (escape) {
+            escape = false;
+            continue;
+          }
+          if (ch === '\\') {
+            escape = true;
+            continue;
+          }
+          if (ch === inStr) inStr = null;
+          continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') {
+          inStr = ch;
+          continue;
+        }
+        if (ch === '(' || ch === '{' || ch === '[') depth += 1;
+        else if (ch === ')' || ch === '}' || ch === ']') depth -= 1;
+        else if (ch === ',' && depth === 0) return i;
+      }
+      return -1;
+    })();
+    const compName = (commaAt >= 0 ? args.slice(0, commaAt) : args).trim();
+    if (!/^[A-Z]\w*$/.test(compName)) {
+      searchFrom = closeParen + 1;
+      continue;
+    }
+    const opts = commaAt >= 0 ? args.slice(commaAt + 1).trim() : '{}';
+    const dataExpr = extractObjectField(opts, 'data') || 'undefined';
+
+    let stmtStart = dot;
+    while (stmtStart > 0 && /[\w.]/.test(c[stmtStart - 1])) stmtStart -= 1;
+    const beforeEq = c.slice(0, stmtStart);
+    const decl = beforeEq.match(/(?:const|let|var)\s+\w+\s*=\s*$/);
+    if (decl) stmtStart = beforeEq.length - decl[0].length;
+
+    const assignMatch = c.slice(Math.max(0, stmtStart - 80), dot + 6).match(/(?:const|let|var)\s+(\w+)\s*=\s*(?:this\.)?\w+\.open\($/);
+    let stmtEnd = closeParen + 1;
+    const after = c.slice(closeParen + 1);
+    const chained = after.match(/^\s*\.afterClosed\s*\(\s*\)\s*\.subscribe\s*\(/);
+    let callback = '';
+    if (chained) {
+      const subParen = closeParen + 1 + chained[0].length - 1;
+      const subEnd = findMatchingDelimiter(c, subParen);
+      if (subEnd >= 0) {
+        const rawCb = c.slice(subParen + 1, subEnd).trim();
+        const arrow = rawCb.match(/^(?:\(?\s*(\w+)\s*\)?)\s*=>\s*(\{[\s\S]*\}|[\s\S]+)$/);
+        callback = arrow ? rawCb : rawCb;
+        stmtEnd = subEnd + 1;
+        if (c[stmtEnd] === ';') stmtEnd += 1;
+      }
+    } else if (assignMatch) {
+      const refName = assignMatch[1];
+      const rest = c.slice(stmtEnd);
+      const sub = rest.match(new RegExp(`^\\s*;?\\s*${refName}\\.afterClosed\\s*\\(\\s*\\)\\s*\\.subscribe\\s*\\(`));
+      if (sub) {
+        const subParen = stmtEnd + sub[0].length - 1;
+        const subEnd = findMatchingDelimiter(c, subParen);
+        if (subEnd >= 0) {
+          callback = c.slice(subParen + 1, subEnd).trim();
+          stmtEnd = subEnd + 1;
+          if (c[stmtEnd] === ';') stmtEnd += 1;
+        }
+      }
+    } else if (/^\s*;/.test(after)) {
+      stmtEnd = closeParen + 1;
+      if (c[stmtEnd] === ';') stmtEnd += 1;
+    }
+
+    const stateName = `${camelFromDialogComponent(compName)}State`;
+    const setter = `set${stateName.charAt(0).toUpperCase()}${stateName.slice(1)}`;
+    let onCloseBody = `() => ${setter}({ open: false, data: null })`;
+    if (callback) {
+      const arrow = callback.match(/^(?:\(?\s*(\w+)\s*\)?)\s*=>\s*(\{[\s\S]*\}|[\s\S]+)$/);
+      if (arrow) {
+        const param = arrow[1];
+        let body = arrow[2].trim();
+        if (body.startsWith('{')) {
+          body = body.replace(/^\{\s*/, '').replace(/\s*\}$/, '');
+        } else {
+          body = `void (${body});`;
+        }
+        onCloseBody = `(${param}) => {\n      ${setter}({ open: false, data: null });\n      ${body}\n    }`;
+      } else {
+        onCloseBody = `(result) => {\n      ${setter}({ open: false, data: null });\n      (${callback})(result);\n    }`;
+      }
+    }
+
+    const replacement = `${setter}({\n      open: true,\n      data: ${dataExpr},\n      onClose: ${onCloseBody}\n    })`;
+    c = `${c.slice(0, stmtStart)}${replacement}${c.slice(stmtEnd)}`;
+    injected.push({ compName, stateName, setter });
+    searchFrom = stmtStart + replacement.length;
+  }
+
+  if (injected.length === 0) return c;
+
+  const unique = [];
+  const seen = new Set();
+  for (const item of injected) {
+    if (seen.has(item.compName)) continue;
+    seen.add(item.compName);
+    unique.push(item);
+  }
+  for (const item of unique) {
+    c = insertAfterComponentBrace(
+      c,
+      `const [${item.stateName}, ${item.setter}] = useState({ open: false, data: null, onClose: undefined });`
+    );
+    c = insertBeforeReturnClose(
+      c,
+      `<${item.compName} open={Boolean(${item.stateName}.open)} data={${item.stateName}.data} onClose={${item.stateName}.onClose || (() => ${item.setter}({ open: false, data: null }))} />`
+    );
+  }
+  return c;
+}
+
+function parseTscErrors(buildErrors) {
+  const byFile = new Map();
+  const patterns = [
+    /([^\s(:]+\.(?:tsx|ts|jsx|js))\((\d+),(\d+)\):\s*error TS(\d+):\s*([^\n]+)/g,
+    /([^\s:]+\.(?:tsx|ts|jsx|js)):(\d+):(\d+)\s*-\s*error TS(\d+):\s*([^\n]+)/g
+  ];
+  const text = String(buildErrors || '');
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      const rel = m[1].replace(/\\/g, '/').replace(/^\.?\//, '');
+      const rec = { code: m[4], message: m[5] };
+      if (!byFile.has(rel)) byFile.set(rel, []);
+      byFile.get(rel).push(rec);
+    }
+  }
+  return byFile;
+}
+
+function indexWorkspaceExports(destPath) {
+  const map = new Map();
+  const srcRoot = path.join(destPath, 'src');
+  for (const file of walkFiles(srcRoot, (n) =>
+    n.endsWith('.ts') || n.endsWith('.tsx') || n.endsWith('.js') || n.endsWith('.jsx')
+  )) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const m of content.matchAll(/export\s+(?:default\s+)?(?:function|const|class|type|interface|enum)\s+(\w+)/g)) {
+      if (!map.has(m[1])) map.set(m[1], file);
+    }
+    for (const m of content.matchAll(/export\s+\{([^}]+)\}/g)) {
+      for (const part of m[1].split(',')) {
+        const name = part.trim().split(/\s+as\s+/).pop()?.trim();
+        if (name && !map.has(name)) map.set(name, file);
+      }
+    }
+  }
+  return map;
+}
+
+const DROP_TYPE_NAMES = new Set([
+  'inject', 'Injectable', 'Component', 'NgModule', 'ViewChild', 'Output', 'Input',
+  'HostListener', 'ElementRef', 'ChangeDetectorRef', 'NgZone', 'AsyncPipe',
+  'CommonModule', 'Store', 'MatDialog', 'MatDialogRef', 'StateContext', 'Actions',
+  'Selector', 'State', 'OnInit', 'AfterViewInit', 'OnDestroy'
+]);
+
+function toKebabCase(name) {
+  return String(name || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/_/g, '-')
+    .toLowerCase();
+}
+
+function srcRootFromFile(fromFile) {
+  const norm = fromFile.replace(/\\/g, '/');
+  const idx = norm.indexOf('/src/');
+  if (idx >= 0) return norm.slice(0, idx + 4);
+  return path.join(path.dirname(fromFile), '..');
+}
+
+function moduleRelFrom(fromFile, file) {
+  let rel = path.relative(path.dirname(fromFile), file).replace(/\\/g, '/');
+  rel = rel.replace(/\.(tsx|ts|jsx|js)$/, '');
+  if (!rel.startsWith('.')) rel = `./${rel}`;
+  return rel;
+}
+
+function stemMatchesWanted(stem, basename) {
+  const a = String(stem || '').toLowerCase();
+  const b = String(basename || '').toLowerCase();
+  if (!a || !b) return 0;
+  if (a === b || toKebabCase(stem) === toKebabCase(basename)) return 1;
+  if (a === `${b}.model` || a.replace(/\.model$/, '') === b) return 2;
+  return 0;
+}
+
+function findModuleByBasename(fromFile, basename) {
+  const srcRoot = srcRootFromFile(fromFile);
+  if (!fs.existsSync(srcRoot)) return null;
+  let fallback = null;
+  for (const file of walkFiles(srcRoot, (n) => /\.(tsx|ts|jsx|js)$/i.test(n))) {
+    const stem = path.basename(file, path.extname(file));
+    const score = stemMatchesWanted(stem, basename);
+    if (score === 1) return moduleRelFrom(fromFile, file);
+    if (score === 2 && !fallback) fallback = moduleRelFrom(fromFile, file);
+  }
+  return fallback;
+}
+
+function resolveRelativeModule(fromFile, spec) {
+  if (!spec.startsWith('.')) return null;
+  const fromDir = path.dirname(fromFile);
+  const normalized = spec.replace(/\\/g, '/');
+  const exts = ['', '.tsx', '.ts', '.jsx', '.js', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
+  for (const ext of exts) {
+    const candidate = path.normalize(path.join(fromDir, `${normalized}${ext}`));
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      let rel = path.relative(fromDir, candidate).replace(/\\/g, '/');
+      rel = rel.replace(/\.(tsx|ts|jsx|js)$/, '');
+      if (!rel.startsWith('.')) rel = `./${rel}`;
+      return rel;
+    }
+  }
+  const wanted = path.basename(normalized);
+  const targetDir = path.normalize(path.join(fromDir, path.dirname(normalized)));
+  if (fs.existsSync(targetDir)) {
+    for (const entry of fs.readdirSync(targetDir)) {
+      if (!/\.(tsx|ts|jsx|js)$/i.test(entry)) continue;
+      const stem = entry.replace(/\.(tsx|ts|jsx|js)$/i, '');
+      if (
+        stem === wanted ||
+        stem.toLowerCase() === wanted.toLowerCase() ||
+        toKebabCase(stem) === wanted ||
+        toKebabCase(stem) === toKebabCase(wanted)
+      ) {
+        let rel = path.posix.join(path.dirname(normalized), stem);
+        if (!rel.startsWith('.')) rel = `./${rel}`;
+        return rel;
+      }
+    }
+  }
+  return findModuleByBasename(fromFile, wanted);
+}
+
+function readModuleExportInfo(filePath) {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const named = new Set();
+  for (const m of content.matchAll(/export\s+(?:const|function|class|interface|type|enum)\s+(\w+)/g)) {
+    named.add(m[1]);
+  }
+  for (const m of content.matchAll(/export\s+\{([^}]+)\}/g)) {
+    for (const part of m[1].split(',')) {
+      const name = part.trim().split(/\s+as\s+/).pop()?.trim();
+      if (name) named.add(name);
+    }
+  }
+  const defFn = content.match(/export\s+default\s+function\s+(\w+)/);
+  const defClass = content.match(/export\s+default\s+class\s+(\w+)/);
+  const hasDefault = /export\s+default\b/.test(content);
+  return {
+    named,
+    defaultName: defFn?.[1] || defClass?.[1] || null,
+    hasDefault
+  };
+}
+
+function resolveModuleFile(fromFile, spec) {
+  const rel = resolveRelativeModule(fromFile, spec);
+  if (!rel) return null;
+  const fromDir = path.dirname(fromFile);
+  for (const ext of ['.tsx', '.ts', '.jsx', '.js']) {
+    const full = path.join(fromDir, `${rel}${ext}`);
+    if (fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
+function parseImportedBindingNames(binding) {
+  const names = [];
+  const raw = String(binding || '').trim();
+  if (!raw || raw.startsWith('*')) return names;
+  const inner = raw.startsWith('{') ? raw.slice(1, -1) : raw;
+  for (const part of inner.split(',')) {
+    let name = part.trim();
+    if (!name) continue;
+    name = name.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+    if (/^[A-Za-z_$][\w$]*$/.test(name)) names.push(name);
+  }
+  return names;
+}
+
+function localSpecFromAlias(fromFile, spec) {
+  const raw = String(spec || '').replace(/\\/g, '/');
+  if (raw.startsWith('.')) return raw;
+  if (raw.startsWith('@/')) {
+    const abs = path.join(srcRootFromFile(fromFile), raw.slice(2));
+    return moduleRelFrom(fromFile, abs);
+  }
+  return null;
+}
+
+function resolvePhantomDomainImport(fromFile, spec, binding, modelTypes) {
+  const norm = localSpecFromAlias(fromFile, spec) || String(spec || '').replace(/\\/g, '/');
+  const names = parseImportedBindingNames(binding);
+  if (modelTypes instanceof Map) {
+    for (const name of names) {
+      const file = modelTypes.get(name);
+      if (file && fs.existsSync(file)) return moduleRelFrom(fromFile, file);
+    }
+  }
+
+  const hallucinatedFolder = /\/(services|types|interfaces|typings|models)\b/i.test(norm);
+  if (!hallucinatedFolder && !/[\w-]+\.service$/i.test(norm)) return null;
+
+  const candidates = [
+    norm.replace(/services\/[\w-]+\.service$/i, 'models/task.model'),
+    norm.replace(/services\/([\w-]+)\.service$/i, 'models/$1.model'),
+    norm.replace(/\/(?:types|interfaces|typings)\/([^/]+)$/i, '/models/$1.model'),
+    norm.replace(/\/(?:types|interfaces|typings)$/i, '/models/task.model'),
+    norm.replace(/\/models\/([^/.]+)$/i, '/models/$1.model')
+  ];
+  for (const cand of candidates) {
+    if (cand === norm) continue;
+    const resolved = resolveRelativeModule(fromFile, cand);
+    if (resolved && resolveModuleFile(fromFile, resolved)) return resolved;
+  }
+
+  const wanted = path.basename(norm).replace(/\.(tsx|ts)$/i, '');
+  const byName = findModuleByBasename(fromFile, wanted === 'types' || wanted === 'index' ? 'task.model' : wanted);
+  if (byName && resolveModuleFile(fromFile, byName)) return byName;
+
+  const srcRoot = srcRootFromFile(fromFile);
+  const modelsDir = path.join(srcRoot, 'models');
+  if (fs.existsSync(modelsDir)) {
+    for (const file of walkFiles(modelsDir, (n) => /\.(tsx|ts)$/i.test(n))) {
+      return moduleRelFrom(fromFile, file);
+    }
+  }
+  return null;
+}
+
+function resolveHookStoreModule(fromFile, spec, hookName) {
+  let resolved = resolveRelativeModule(fromFile, spec);
+  if (resolved && resolveModuleFile(fromFile, resolved)) return resolved;
+
+  if (hookName?.startsWith('use') && hookName.endsWith('Store')) {
+    const altSpec = spec.replace(/[^/]+$/, hookName);
+    resolved = resolveRelativeModule(fromFile, altSpec);
+    if (resolved && resolveModuleFile(fromFile, resolved)) return resolved;
+
+    const srcRoot = srcRootFromFile(fromFile);
+    const storeDir = path.join(srcRoot, 'store');
+    if (fs.existsSync(storeDir)) {
+      for (const file of walkFiles(storeDir, (n) => /\.(tsx|ts)$/i.test(n))) {
+        const fileContent = fs.readFileSync(file, 'utf-8');
+        if (!new RegExp(`export const ${hookName}\\s*=`).test(fileContent)) continue;
+        let rel = path.relative(path.dirname(fromFile), file).replace(/\\/g, '/');
+        rel = rel.replace(/\.(tsx|ts)$/, '');
+        if (!rel.startsWith('.')) rel = `./${rel}`;
+        return rel;
+      }
+    }
+    const byName = findModuleByBasename(fromFile, hookName);
+    if (byName && resolveModuleFile(fromFile, byName)) return byName;
+  }
+  return null;
+}
+
+function fixReactModuleImportsInFile(filePath, modelTypes) {
+  let content = fs.readFileSync(filePath, 'utf-8');
+  const original = content;
+  content = content.replace(
+    /import\s*\(\s*['"](\.[^'"]+|@\/[^'"]+)['"]\s*\)/g,
+    (full, spec) => {
+      const localSpec = localSpecFromAlias(filePath, spec) || spec;
+      let resolvedSpec = resolveRelativeModule(filePath, localSpec);
+      if (!resolvedSpec || !resolveModuleFile(filePath, resolvedSpec)) {
+        const hookMatch = spec.match(/(use\w+Store)/);
+        if (hookMatch) resolvedSpec = resolveHookStoreModule(filePath, localSpec, hookMatch[1]);
+      }
+      if (!resolvedSpec || resolvedSpec === spec) return full;
+      return full.replace(spec, resolvedSpec);
+    }
+  );
+  content = content.replace(
+    /import\s+(?:type\s+)?(\{[^}]+\}|\*\s+as\s+\w+|\w+)\s+from\s+['"](\.[^'"]+|@\/[^'"]+)['"]\s*;?/g,
+    (full, binding, spec) => {
+      const localSpec = localSpecFromAlias(filePath, spec) || spec;
+      let resolvedSpec = resolveRelativeModule(filePath, localSpec);
+      if (!resolvedSpec || !resolveModuleFile(filePath, resolvedSpec)) {
+        const hookMatch =
+          binding.match(/\{\s*(use\w+Store)\s*\}/) ||
+          binding.match(/^(use\w+Store)$/);
+        if (hookMatch) {
+          resolvedSpec = resolveHookStoreModule(filePath, localSpec, hookMatch[1]);
+        } else {
+          resolvedSpec = resolvePhantomDomainImport(filePath, localSpec, binding, modelTypes);
+        }
+      }
+      if (!resolvedSpec) return full;
+      const targetFile = resolveModuleFile(filePath, resolvedSpec);
+      if (!targetFile) return full.replace(spec, resolvedSpec);
+      const info = readModuleExportInfo(targetFile);
+      const typePrefix = /^import\s+type\s+/.test(full) ? 'import type ' : 'import ';
+      const fixedFrom = `from '${resolvedSpec}'`;
+
+      if (/^\{/.test(binding)) {
+        const names = binding
+          .slice(1, -1)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (names.length === 1) {
+          const name = names[0].replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+          if (info.hasDefault && info.defaultName === name && !info.named.has(name)) {
+            return `${typePrefix}${name} ${fixedFrom};`;
+          }
+        }
+        return full.replace(spec, resolvedSpec);
+      }
+
+      if (info.named.has(binding) && !info.hasDefault) {
+        return `${typePrefix}{ ${binding} } ${fixedFrom};`;
+      }
+      return full.replace(spec, resolvedSpec);
+    }
+  );
+  if (content !== original) {
+    fs.writeFileSync(filePath, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Fix wrong relative paths (task-list vs TaskList) and default/named import mismatches.
+ */
+export function fixReactModuleImports(destPath) {
+  const modelTypes = collectModelTypeExports(destPath);
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.ts') || n.endsWith('.tsx') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    changed += fixReactModuleImportsInFile(file, modelTypes);
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Fixed module imports in ${changed} React file(s)`);
+  }
+  return changed;
+}
+
+function collectModelTypeExports(destPath) {
+  const modelTypes = new Map();
+  for (const file of walkFiles(path.join(destPath, 'src'), (name, full) =>
+    /(^|\/)models?\//.test(full.replace(/\\/g, '/')) || /\.model\.(ts|tsx)$/i.test(name)
+  )) {
+    const content = fs.readFileSync(file, 'utf-8');
+    for (const m of content.matchAll(/export\s+(?:interface|type|const|enum)\s+(\w+)/g)) {
+      modelTypes.set(m[1], file);
+    }
+  }
+  return modelTypes;
+}
+
+function stripExportedTypeBlock(content, typeName) {
+  let c = content;
+  c = c.replace(
+    new RegExp(`export\\s+interface\\s+${typeName}\\s*(?:extends\\s+[^{]+)?\\{[\\s\\S]*?\\}\\s*\\n?`, 'g'),
+    ''
+  );
+  c = c.replace(new RegExp(`export\\s+type\\s+${typeName}\\s*=\\s*[^;]+;\\s*\\n?`, 'g'), '');
+  return c;
+}
+
+/**
+ * Store files must not re-declare model types — import from src/models instead.
+ */
+export function dedupeStoreModelTypes(destPath) {
+  const modelTypes = collectModelTypeExports(destPath);
+  if (modelTypes.size === 0) return 0;
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (name, full) =>
+    /(^|\/)store\//.test(full.replace(/\\/g, '/')) && /\.(ts|tsx)$/.test(name)
+  )) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    const toImport = new Set();
+    for (const [typeName, modelFile] of modelTypes) {
+      if (!new RegExp(`export\\s+(?:interface|type)\\s+${typeName}\\b`).test(content)) continue;
+      content = stripExportedTypeBlock(content, typeName);
+      toImport.add(typeName);
+      if (typeName === 'Task' && modelTypes.has('TaskDraft')) toImport.add('TaskDraft');
+    }
+    if (toImport.size > 0) {
+      for (const sym of [...toImport]) {
+        if (!new RegExp(`\\b${sym}\\b`).test(content)) toImport.delete(sym);
+      }
+      for (const sym of toImport) {
+        const modelFile = modelTypes.get(sym);
+        if (!modelFile) continue;
+        content = ensureImport(content, sym, relativeModulePath(file, modelFile));
+      }
+    }
+    content = content.replace(/\n{3,}/g, '\n\n');
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Deduped model types in ${changed} store file(s)`);
+  }
+  return changed;
+}
+
+function readTaskInterfaceShape(destPath) {
+  const candidates = walkFiles(path.join(destPath, 'src'), (name) =>
+    /task\.model\.(ts|tsx)$/i.test(name) || name === 'task.ts'
+  );
+  for (const file of candidates) {
+    const content = fs.readFileSync(file, 'utf-8');
+    const iface = content.match(/export interface Task\s*\{([\s\S]*?)\}/);
+    if (!iface) continue;
+    const fields = new Set([...iface[1].matchAll(/(\w+)\??\s*:/g)].map((m) => m[1]));
+    const statusType = content.match(/export type TaskStatus\s*=\s*([^;]+);/)?.[1] || '';
+    return {
+      file,
+      fields,
+      hasStatus: fields.has('status'),
+      hasCompleted: fields.has('completed'),
+      statusType,
+      usesHyphenStatus: statusType.includes("'in-progress'") && !statusType.includes('in_progress')
+    };
+  }
+  return null;
+}
+
+const INVENTED_TASK_FIELDS = [
+  'completed',
+  'priority',
+  'dueDate',
+  'due',
+  'assignee',
+  'tags',
+  'category'
+];
+
+function stripUnknownTaskFieldsInFile(content, shape) {
+  if (!shape?.fields) return content;
+  let c = String(content || '');
+  const unknown = INVENTED_TASK_FIELDS.filter((f) => !shape.fields.has(f));
+  if (unknown.length === 0) {
+    return c.replace(/;\s*\|[^;\n]+;/g, ';');
+  }
+
+  for (const field of unknown) {
+    const cap = field.charAt(0).toUpperCase() + field.slice(1);
+    c = c.replace(new RegExp(`^\\s*const \\[${field}, set${cap}\\][^\\n]+\\n`, 'gm'), '');
+    c = c.replace(new RegExp(`\\s*set${cap}\\([^)]*\\);\\n`, 'g'), '');
+    c = c.replace(new RegExp(`^\\s*${field}\\??\\s*:[^;\\n]+;\\s*\\n`, 'gm'), '');
+    c = c.replace(new RegExp(`,?\\s*${field}\\??\\s*:\\s*[^,}\\n]+`, 'g'), '');
+    c = c.replace(new RegExp(`\\s*<th[^>]*>\\s*${cap}\\s*</th>\\s*`, 'gi'), '');
+    c = c.replace(
+      new RegExp(
+        `\\s*<td[^>]*>\\s*<span[\\s\\S]*?\\{task\\.${field}\\}[\\s\\S]*?</span>\\s*</td>\\s*`,
+        'g'
+      ),
+      ''
+    );
+    c = c.replace(
+      new RegExp(
+        `\\n\\s*<div>\\s*\\n\\s*<label[^>]*>\\s*\\n\\s*${cap}[\\s\\S]*?</select>\\s*\\n\\s*</div>`,
+        'g'
+      ),
+      ''
+    );
+    // Drop member access as a whole (`task.priority` → `task`), never leave `task.`.
+    c = c.replace(new RegExp(`\\.${field}\\b`, 'g'), '');
+    c = c.replace(new RegExp(`(?:,\\s*)?(?<!\\.)\\b${field}\\b(?=\\s*[,}])`, 'g'), '');
+  }
+  c = c.replace(/;\s*\|[^;\n]+;/g, ';');
+  c = c.replace(/\{\s*(\w+)\.\s*\}/g, '{$1}');
+  c = c.replace(/(\w+)\.\s*(?=[,};)])/g, '$1');
+  c = c.replace(/\{\s*,/g, '{');
+  c = c.replace(/,\s*(\n\s*\})/g, '$1');
+  return c;
+}
+
+function sourceAppIsRouterShell(sourceFilesMap) {
+  if (!sourceFilesMap || typeof sourceFilesMap !== 'object') return false;
+  let ts = '';
+  let html = '';
+  for (const [rel, content] of Object.entries(sourceFilesMap)) {
+    const n = String(rel).replace(/\\/g, '/');
+    if (/(^|\/)app\.component\.ts$/i.test(n)) ts = String(content || '');
+    if (/(^|\/)app\.component\.html$/i.test(n)) html = String(content || '');
+  }
+  const htmlBody = html.replace(/<!--[\s\S]*?-->/g, '').trim();
+  const htmlIsOutlet =
+    /<router-outlet\b/i.test(htmlBody) &&
+    !/<[a-z][\w-]*/i.test(htmlBody.replace(/<router-outlet\b[^>]*\/?>/gi, ''));
+  const classEmpty = /export class AppComponent\s*\{\s*\}/.test(ts);
+  return htmlIsOutlet || (/RouterOutlet/.test(ts) && classEmpty);
+}
+
+function appHasBrokenSyntax(existing) {
+  return (
+    /;\s*\|/.test(existing) ||
+    /\{\s*\w+\.\s*\}/.test(existing) ||
+    /\w+\.\s*[,};)]/.test(existing) ||
+    !/\breturn\b/.test(existing)
+  );
+}
+
+function appAlreadyThinRouter(existing, pageIdent) {
+  const lines = existing.split('\n').length;
+  const importsPage = new RegExp(`from\\s+['"][^'"]*${pageIdent}['"]`).test(existing);
+  const rendersPage = new RegExp(`<${pageIdent}\\b`).test(existing);
+  return (
+    lines <= 40 &&
+    importsPage &&
+    rendersPage &&
+    /react-router-dom/.test(existing) &&
+    !/(?:export\s+)?(?:interface|type)\s+Task\b/.test(existing) &&
+    !appHasBrokenSyntax(existing)
+  );
+}
+
+/**
+ * Angular AppComponent is a router outlet. If a page exists, App.tsx must mount it —
+ * never keep a hallucinated second task app or a broken Task interface.
+ */
+export function ensureReactAppShell(destPath, sourceFilesMap = null, options = {}) {
+  const src = path.join(destPath, 'src');
+  const pagesDir = path.join(src, 'pages');
+  if (!fs.existsSync(pagesDir)) return 0;
+  const pageFiles = walkFiles(pagesDir, (n) => n.endsWith('.tsx'));
+  if (pageFiles.length === 0) return 0;
+
+  const preferred =
+    pageFiles.find((p) => /task-list|TaskList/i.test(path.basename(p))) || pageFiles[0];
+  const appPath = path.join(src, 'App.tsx');
+  const existing = fs.existsSync(appPath) ? fs.readFileSync(appPath, 'utf-8') : '';
+  const info = readModuleExportInfo(preferred);
+  const ident =
+    info.defaultName || (info.named.has('TaskList') ? 'TaskList' : [...info.named][0]) || 'TaskList';
+
+  const force = options.force === true;
+  const mountsPage =
+    new RegExp(`from\\s+['"][^'"]*${ident}['"]`).test(existing) &&
+    new RegExp(`<${ident}\\b`).test(existing);
+  const hallucinated =
+    /(?:export\s+)?(?:interface|type)\s+Task\b/.test(existing) ||
+    existing.split('\n').length > 80;
+  if (!force && appAlreadyThinRouter(existing, ident)) return 0;
+  if (
+    !force &&
+    !sourceAppIsRouterShell(sourceFilesMap) &&
+    mountsPage &&
+    !appHasBrokenSyntax(existing) &&
+    !hallucinated
+  ) {
+    return 0;
+  }
+
+  const rel = relativeModulePath(appPath, preferred);
+  const importLine = info.hasDefault
+    ? `import ${ident} from '${rel}';`
+    : `import { ${ident} } from '${rel}';`;
+  const shell = `import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+${importLine}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<${ident} />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+`;
+  fs.mkdirSync(path.dirname(appPath), { recursive: true });
+  fs.writeFileSync(appPath, shell, 'utf-8');
+  console.log(`[postprocess] Wrote App.tsx shell mounting ${path.relative(src, preferred)}`);
+  return 1;
+}
+
+function alignTaskStatusLiteralsInFile(content, shape) {
+  const lits = [...String(shape?.statusType || '').matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  if (lits.length === 0) return content;
+  let c = String(content || '');
+  for (const lit of lits) {
+    const underscored = lit.replace(/-/g, '_');
+    if (underscored !== lit) {
+      c = c.replace(new RegExp(underscored.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), lit);
+    }
+  }
+  if (/\bTaskStatus\b/.test(c) || /from ['"][^'"]*task\.model['"]/.test(c)) {
+    c = c.replace(
+      /useState<\s*'todo'\s*\|\s*'in-progress'\s*\|\s*'done'\s*>/g,
+      'useState<TaskStatus>'
+    );
+    if (/useState<TaskStatus>/.test(c) && !/import[^;]*\bTaskStatus\b/.test(c)) {
+      c = c.replace(
+        /(import\s+\{[^}]*)(}\s+from\s+['"][^'"]*task\.model['"])/,
+        (full, head, tail) => (/\bTaskStatus\b/.test(head) ? full : `${head}, TaskStatus${tail}`)
+      );
+    }
+  }
+  return c;
+}
+
+/** Normalize TaskStatus literals (in_progress → in-progress) to match models/task.model.ts. */
+export function alignTaskStatusLiterals(destPath) {
+  const shape = readTaskInterfaceShape(destPath);
+  if (!shape?.statusType) return 0;
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const fixed = alignTaskStatusLiteralsInFile(content, shape);
+    if (fixed !== content) {
+      fs.writeFileSync(file, fixed.endsWith('\n') ? fixed : `${fixed}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Aligned TaskStatus literals in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+function buildScaffoldTaskStoreContent(modelImport = '../models/task.model') {
+  return `import { create } from 'zustand';
+import { Task, TaskDraft } from '${modelImport}';
+
+export interface TaskStoreState {
+  items: Task[];
+  addTask: (draft: TaskDraft) => void;
+  updateTask: (task: Task) => void;
+  deleteTask: (id: string) => void;
+}
+
+const INITIAL_TASKS: Task[] = [
+  {
+    id: '1',
+    title: 'Design login screen',
+    description: 'Match the Figma layout and spacing',
+    status: 'done'
+  },
+  {
+    id: '2',
+    title: 'Wire NGXS store',
+    description: 'Add, update, and delete task actions',
+    status: 'in-progress'
+  },
+  {
+    id: '3',
+    title: 'Prepare React conversion',
+    description: 'Keep each Angular component 1:1 with a React file',
+    status: 'todo'
+  }
+];
+
+export const useTaskStore = create<TaskStoreState>((set) => ({
+  items: INITIAL_TASKS,
+
+  addTask: (draft: TaskDraft) => {
+    const newTask: Task = {
+      ...draft,
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString()
+    };
+    set((state) => ({ items: [...state.items, newTask] }));
+  },
+
+  updateTask: (task: Task) => {
+    set((state) => ({
+      items: state.items.map((t) => (t.id === task.id ? task : t))
+    }));
+  },
+
+  deleteTask: (id: string) => {
+    set((state) => ({
+      items: state.items.filter((t) => t.id !== id)
+    }));
+  }
+}));
+`;
+}
+
+/** Create missing zustand store when barrel re-exports a non-existent taskStore module. */
+export function ensureZustandStoreScaffold(destPath) {
+  if (findZustandStoreFiles(destPath).length > 0) return 0;
+  const srcRoot = path.join(destPath, 'src');
+  const sources = walkFiles(srcRoot, (n) => n.endsWith('.ts') || n.endsWith('.tsx'))
+    .map((f) => fs.readFileSync(f, 'utf-8'))
+    .join('\n');
+  if (!/\buseTaskStore\b/.test(sources)) return 0;
+
+  const storePath = path.join(srcRoot, 'store', 'taskStore.ts');
+  const barrelPath = path.join(srcRoot, 'store', 'useTaskStore.ts');
+  if (!fs.existsSync(storePath)) {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, buildScaffoldTaskStoreContent('../models/task.model'), 'utf-8');
+    console.log('[postprocess] Scaffolded missing zustand store: src/store/taskStore.ts');
+  }
+
+  if (fs.existsSync(barrelPath)) {
+    const barrel = fs.readFileSync(barrelPath, 'utf-8');
+    if (/^export\s+\{\s*useTaskStore\s*\}\s+from\s+['"]\.\/taskStore['"]/.test(barrel.trim())) {
+      /* already correct */
+    } else if (/^export\s+\{/.test(barrel.trim()) && !/export const useTaskStore/.test(barrel)) {
+      fs.writeFileSync(barrelPath, "export { useTaskStore } from './taskStore';\n", 'utf-8');
+    }
+  } else {
+    fs.mkdirSync(path.dirname(barrelPath), { recursive: true });
+    fs.writeFileSync(barrelPath, "export { useTaskStore } from './taskStore';\n", 'utf-8');
+  }
+  return 1;
+}
+
+/**
+ * Overwrite dest models from the Angular source, and write a zustand store
+ * from source NGXS @State when the converted app has no real create() export.
+ */
+export function pinSourceDomainArtifacts(destPath, sourceFilesMap) {
+  if (!sourceFilesMap || typeof sourceFilesMap !== 'object') return 0;
+  let changed = 0;
+  const modelsDir = path.join(destPath, 'src', 'models');
+
+  for (const [rel, content] of Object.entries(sourceFilesMap)) {
+    const norm = String(rel).replace(/\\/g, '/');
+    if (!/(^|\/)models\/.+\.ts$/i.test(norm) && !/\.model\.ts$/i.test(norm)) continue;
+    if (typeof content !== 'string' || !content.trim()) continue;
+    fs.mkdirSync(modelsDir, { recursive: true });
+    const dest = path.join(modelsDir, path.basename(norm));
+    const body = content.endsWith('\n') ? content : `${content}\n`;
+    fs.writeFileSync(dest, body, 'utf-8');
+    changed += 1;
+    console.log(`[postprocess] Pinned source model: src/models/${path.basename(norm)}`);
+  }
+
+  if (findZustandStoreFiles(destPath).length === 0) {
+    for (const [rel, content] of Object.entries(sourceFilesMap)) {
+      const norm = String(rel).replace(/\\/g, '/');
+      if (!/\.state\.ts$/i.test(norm) || !/@State/.test(String(content || ''))) continue;
+      const converted = rewriteNgxsStateToZustand(content);
+      if (!/export const use\w+Store\s*=\s*create/.test(converted)) continue;
+      const storePath = path.join(destPath, 'src', 'store', 'taskStore.ts');
+      fs.mkdirSync(path.dirname(storePath), { recursive: true });
+      const out = converted.replace(
+        /from\s+['"][^'"]*models\/([^'"]+)['"]/g,
+        "from '../models/$1'"
+      );
+      fs.writeFileSync(storePath, out.endsWith('\n') ? out : `${out}\n`, 'utf-8');
+      fs.writeFileSync(
+        path.join(destPath, 'src', 'store', 'useTaskStore.ts'),
+        "export { useTaskStore } from './taskStore';\n",
+        'utf-8'
+      );
+      changed += 1;
+      console.log('[postprocess] Wrote zustand store from source NGXS state');
+      break;
+    }
+  }
+  return changed;
+}
+
+function fixTaskModelFieldMismatchesInFile(content, shape) {
+  if (!shape) return content;
+  let c = String(content || '');
+  c = stripUnknownTaskFieldsInFile(c, shape);
+  if (!shape.hasStatus || shape.hasCompleted) return c;
+  if (!/(?:import\s+[^;]*\bTask\b|:\s*Task\b|Task\[\])/.test(c)) return c;
+
+  c = c.replace(/,?\s*completed\s*:\s*(?:true|false|null|undefined)\s*(?=,|\n|\})/g, '');
+  c = c.replace(/(\w+)\.completed\b/g, "($1.status === 'done')");
+  c = c.replace(/\bcompleted\s*=\{([^}]+)\.completed\}/g, "data-status={$1.status === 'done'}");
+  c = c.replace(/\{\s*,/g, '{');
+  c = c.replace(/,\s*(\n\s*\})/g, '$1');
+  return c;
+}
+
+/** Drop `completed` fields when canonical Task model uses `status` instead. */
+export function fixTaskModelFieldMismatches(destPath) {
+  const shape = readTaskInterfaceShape(destPath);
+  if (!shape) return 0;
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.tsx') || n.endsWith('.ts')
+  )) {
+    if (/task\.model\.(ts|tsx)$/i.test(path.basename(file))) continue;
+    let content = fs.readFileSync(file, 'utf-8');
+    const fixed = fixTaskModelFieldMismatchesInFile(content, shape);
+    if (fixed !== content) {
+      fs.writeFileSync(file, fixed.endsWith('\n') ? fixed : `${fixed}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Aligned Task model fields in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
+ * Remove orphaned NGXS shard files (task.state.ts / task.actions.ts) when unused.
+ */
+export function removeUnusedStoreShards(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const sources = walkFiles(srcRoot, (n) => n.endsWith('.ts') || n.endsWith('.tsx'))
+    .map((f) => fs.readFileSync(f, 'utf-8'))
+    .join('\n');
+  let removed = 0;
+  for (const file of walkFiles(path.join(srcRoot, 'store'), (n, full) => {
+    const rel = full.replace(/\\/g, '/');
+    // NGXS shards live under store/<module>/<module>.state.ts — not top-level store/*.ts
+    return /\/store\/[^/]+\/[^/]+\.(state|actions)\.ts$/i.test(rel);
+  })) {
+    const relImport = path
+      .relative(srcRoot, file)
+      .replace(/\\/g, '/')
+      .replace(/\.ts$/, '');
+    const patterns = [
+      relImport,
+      path.basename(file, '.ts'),
+      path.basename(file, '.state.ts'),
+      path.basename(file, '.actions.ts')
+    ];
+    const referenced = patterns.some((p) => new RegExp(`['"][^'"]*${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`).test(sources));
+    if (!referenced) {
+      try {
+        fs.unlinkSync(file);
+        removed += 1;
+        console.log(`[postprocess] Removed unused store shard: ${path.relative(destPath, file)}`);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return removed;
+}
+
+function stripUnusedReactDefaultImport(content) {
+  const usesReact = /React\.[A-Za-z]|<React[\s./]|\bReact\.FC\b/.test(content);
+  if (usesReact) return content;
+  let c = String(content || '');
+  if (/import\s+React\s+from\s+['"]react['"]/.test(c)) {
+    c = c.replace(/import\s+React\s+from\s+['"]react['"]\s*;?\s*\n?/, '');
+  }
+  if (/import\s+React\s*,\s*\{/.test(c)) {
+    c = c.replace(/import\s+React\s*,\s*(\{[^}]+\})\s+from\s+['"]react['"]\s*;?/, 'import $1 from \'react\';');
+  }
+  return c;
+}
+
+function pruneUnusedNamedImports(content) {
+  return String(content || '').replace(
+    /import\s+\{([^}]+)\}\s+from\s+(['"][^'"]+['"])\s*;?/g,
+    (full, names, fromPart) => {
+      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
+      const without = content.replace(full, '');
+      const kept = parts.filter((part) => {
+        const name = part.split(/\s+as\s+/).pop()?.trim();
+        if (!name || name === 'type') return true;
+        return new RegExp(`\\b${name}\\b`).test(without);
+      });
+      if (kept.length === 0) return '';
+      if (kept.length === parts.length) return full;
+      return `import { ${kept.join(', ')} } from ${fromPart};`;
+    }
+  );
+}
+
+function removeAngularLeftoverReactFiles(destPath) {
+  const candidates = walkFiles(path.join(destPath, 'src'), (n) =>
+    /^app\.config\.(ts|tsx)$/.test(n) || /^main\.ts$/.test(n)
+  );
+  let removed = 0;
+  for (const file of candidates) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    const isAngular =
+      /ApplicationConfig|provideZoneChangeDetection|provideRouter|@angular\/|bootstrapApplication/.test(content);
+    if (!isAngular) continue;
+    try {
+      fs.unlinkSync(file);
+      removed += 1;
+      console.log(`[postprocess] Removed Angular leftover: ${path.relative(destPath, file)}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  return removed;
+}
+
+function stripAngularTestDepsFromReactPackage(destPath) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg?.dependencies) return 0;
+  const drop = [
+    '@types/jasmine', 'jasmine-core', 'karma', 'karma-chrome-launcher',
+    'karma-coverage', 'karma-jasmine', 'karma-jasmine-html-reporter'
+  ];
+  let removed = 0;
+  for (const name of drop) {
+    if (pkg.dependencies[name]) {
+      delete pkg.dependencies[name];
+      removed += 1;
+    }
+    if (pkg.devDependencies?.[name]) {
+      delete pkg.devDependencies[name];
+      removed += 1;
+    }
+  }
+  if (removed) writeJson(pkgPath, pkg);
+  return removed;
+}
+
+/**
+ * Fix leftover Angular identifiers, missing React hooks, and missing local imports
+ * from tsc output — no AI required.
+ */
+export function fixReactTypeErrors(destPath, buildErrors) {
+  const errorText = String(buildErrors || '');
+  let changedFiles = 0;
+  if (/Types of property/.test(errorText) && /\/models\//.test(errorText) && /\/store\//.test(errorText)) {
+    changedFiles += dedupeStoreModelTypes(destPath);
+  }
+  if (/Cannot find module/.test(errorText) || /Did you mean to use 'import/.test(errorText)) {
+    changedFiles += fixReactModuleImports(destPath);
+  }
+  if (/Individual declarations in merged declaration 'use\w+Store'/.test(errorText)) {
+    changedFiles += consolidateDuplicateZustandStores(destPath);
+  }
+  if (
+    /Property 'open' is missing/.test(errorText) ||
+    /Property 'open' does not exist/.test(errorText) ||
+    /Property 'onClose' does not exist/.test(errorText) ||
+    /Property 'onConfirm' does not exist/.test(errorText) ||
+    /TS2741/.test(errorText) ||
+    /TS2322/.test(errorText)
+  ) {
+    changedFiles += syncComponentCallSiteProps(destPath);
+  }
+  if (
+    /state\.tasks/.test(errorText) ||
+    /Property 'tasks' does not exist/.test(errorText) ||
+    /Cannot redeclare block-scoped variable/.test(errorText) ||
+    /TS7006.*state/.test(errorText) ||
+    /TS2451/.test(errorText)
+  ) {
+    changedFiles += fixZustandSelectorFields(destPath);
+    changedFiles += fixZustandHookUsage(destPath);
+  }
+  if (/Cannot find module.*store/.test(errorText) || /taskStore/.test(errorText)) {
+    changedFiles += fixReactModuleImports(destPath);
+    changedFiles += fixZustandHookUsage(destPath);
+  }
+  if (/TS2353/.test(errorText) || /'completed' does not exist/.test(errorText) || /Property 'priority' does not exist/.test(errorText)) {
+    changedFiles += fixTaskModelFieldMismatches(destPath);
+  }
+  if (/in_progress/.test(errorText) || /is not assignable to type 'TaskStatus'/.test(errorText)) {
+    changedFiles += alignTaskStatusLiterals(destPath);
+  }
+  if (/Cannot find module.*service/.test(errorText) || /task\.service/.test(errorText)) {
+    changedFiles += fixReactModuleImports(destPath);
+  }
+  if (/Cannot find module.*taskStore/.test(errorText) || /'\.\/taskStore'/.test(errorText)) {
+    changedFiles += ensureZustandStoreScaffold(destPath);
+    changedFiles += fixReactModuleImports(destPath);
+    changedFiles += fixZustandHookUsage(destPath);
+  }
+  if (
+    /App\.tsx/.test(errorText) &&
+    /TS1003|TS1005|TS1109|TS1128|TS1131|TS1161|Identifier expected|Expression expected|Property or signature expected/.test(
+      errorText
+    )
+  ) {
+    changedFiles += ensureReactAppShell(destPath, null, { force: true });
+  } else if (
+    /TS1131|TS1109|TS1128|TS1005|TS1003/.test(errorText) ||
+    /Property or signature expected|Identifier expected/.test(errorText)
+  ) {
+    changedFiles += ensureReactAppShell(destPath);
+  }
+  if (/TS6133.*React/.test(errorText)) {
+    for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+      let content = fs.readFileSync(file, 'utf-8');
+      const patched = stripUnusedReactDefaultImport(content);
+      if (patched !== content) {
+        fs.writeFileSync(file, patched.endsWith('\n') ? patched : `${patched}\n`, 'utf-8');
+        changedFiles += 1;
+      }
+    }
+  }
+
+  const byFile = parseTscErrors(buildErrors);
+  if (byFile.size === 0) return changedFiles;
+  const exportIndex = indexWorkspaceExports(destPath);
+  const hookNames = new Set(['useState', 'useEffect', 'useMemo', 'useCallback', 'useRef', 'useContext', 'useReducer', 'useId']);
+
+  for (const [rel, errors] of byFile) {
+    const full = path.isAbsolute(rel) ? rel : path.join(destPath, rel.replace(/^.*?\/src\//, 'src/'));
+    const candidates = [
+      full,
+      path.join(destPath, rel),
+      path.join(destPath, rel.replace(/^.*?(src\/)/, '$1'))
+    ];
+    const filePath = candidates.find((p) => fs.existsSync(p));
+    if (!filePath) continue;
+    let content = fs.readFileSync(filePath, 'utf-8');
+    const original = content;
+    const hasJsxParseError = errors.some((e) =>
+      ['1381', '1382', '17002', '1005', '1109', '1128', '2657'].includes(String(e.code))
+    );
+    if (hasJsxParseError) {
+      content = repairBrokenJsxObjectLiterals(content);
+    }
+
+    const missingHooks = [];
+    for (const err of errors) {
+      const nameMatch = err.message.match(/Cannot find name '(\w+)'/);
+      const memberMatch = err.message.match(/has no exported member '(\w+)'/);
+      const modMatch = err.message.match(/Module ['"]([^'"]+)['"] has no exported member/);
+      if (err.code === '2304' && nameMatch) {
+        const name = nameMatch[1];
+        if (hookNames.has(name)) missingHooks.push(name);
+        else if (DROP_TYPE_NAMES.has(name)) {
+          content = content.replace(new RegExp(`\\b${name}\\b`, 'g'), (hit, offset) => {
+            const slice = content.slice(Math.max(0, offset - 20), offset);
+            if (/import\s+[^;]*$/.test(slice) || /from\s+['"][^'"]*$/.test(slice)) return hit;
+            if (name === 'inject') return 'undefined';
+            return hit;
+          });
+          if (name === 'inject') {
+            content = content.replace(/^[ \t]*(?:const|let|var|[a-z].*=\s*)inject\([^)]*\)\s*;?[ \t]*\n/gm, '');
+            content = content.replace(/\binject\([^)]*\)/g, 'undefined');
+          }
+        } else if (exportIndex.has(name)) {
+          const from = relativeModulePath(filePath, exportIndex.get(name));
+          content = ensureImport(content, name, from);
+        }
+      }
+      if ((err.code === '2305' || err.code === '2614') && memberMatch) {
+        const member = memberMatch[1];
+        const spec = modMatch?.[1] || '';
+        if (spec.startsWith('.')) {
+          const fixedSpec = resolveRelativeModule(filePath, spec);
+          const target = fixedSpec ? resolveModuleFile(filePath, fixedSpec) : null;
+          if (target) {
+            const info = readModuleExportInfo(target);
+            if (info.hasDefault && info.defaultName === member) {
+              content = content.replace(
+                new RegExp(`import\\s+\\{\\s*${member}\\s*\\}\\s+from\\s+['"]${spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`),
+                `import ${member} from '${fixedSpec}'`
+              );
+              continue;
+            }
+          }
+        }
+        if (spec) content = removeNamedImport(content, member, spec);
+        else {
+          content = content.replace(
+            new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"][^'"]+['"]`, 'g'),
+            (fullImp, names) => {
+              if (!names.includes(member)) return fullImp;
+              return fullImp.replace(new RegExp(`\\b${member}\\b\\s*,?\\s*`), '').replace(/,\s*\}/, ' }');
+            }
+          );
+        }
+      }
+    }
+    for (const h of missingHooks) content = ensureImport(content, h, 'react');
+    if (/\bthis\./.test(content) && /export\s+(?:default\s+)?function\s+/.test(content)) {
+      content = content.replace(/\bthis\./g, '');
+    }
+    content = content.replace(/: Observable<([^>]+)>/g, ': $1');
+    content = rewriteReactAngularLeftovers(content);
+    content = stripUnusedReactDefaultImport(content);
+
+    if (content !== original) {
+      fs.writeFileSync(filePath, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      changedFiles += 1;
+    }
+  }
+  return changedFiles;
+}
+
+function ensureMuiNamedImports(content) {
+  const used = MUI_JSX_NAMES.filter((name) => new RegExp(`<${name}\\b`).test(content));
+  if (used.length === 0) return content;
+  if (/from\s+['"]@mui\/material['"]/.test(content)) {
+    return content.replace(
+      /import\s+\{([^}]*)\}\s+from\s+['"]@mui\/material['"]/,
+      (full, inner) => {
+        const have = new Set(
+          String(inner)
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        );
+        used.forEach((n) => have.add(n));
+        return `import { ${[...have].join(', ')} } from '@mui/material'`;
+      }
+    );
+  }
+  return `import { ${used.join(', ')} } from '@mui/material';\n${content}`;
+}
+
+/**
+ * Rewrite leftover Angular / NGXS / Material APIs in a React source file.
+ */
+export function rewriteReactAngularLeftovers(content) {
+  let c = String(content || '');
+  c = c.replace(/from\s+['"]lucide-angular['"]/g, "from 'lucide-react'");
+  c = c.replace(/from\s+['"]@lucide\/angular['"]/g, "from 'lucide-react'");
+  c = rewriteNgxsStateToZustand(c);
+  c = rewriteNgxsDispatchAndSelect(c);
+  c = rewriteNgxsActionFile(c);
+  c = rewriteMatDialogOpen(c);
+  c = rewriteAngularInjects(c);
+  c = stripThisInFunctionComponents(c);
+  c = c.replace(/from\s+(['"])([^'"]+)\.component(?:\.js)?\1/g, 'from $1$2$1');
+  c = rewriteAppSelectorTags(c);
+  c = rewriteAngularControlFlow(c);
+  c = rewriteMatTagsToMui(c);
+  c = rewriteAngularJsxBindings(c);
+  c = rewriteMatDialogComponent(c);
+  c = c.replace(/import\s+[^;]*from\s+['"]@angular\/[^'"]+['"]\s*;?\s*/g, '');
+  c = c.replace(/import\s+[^;]*from\s+['"]@ngxs\/[^'"]+['"]\s*;?\s*/g, '');
+  c = ensureMuiNamedImports(c);
+  c = ensureReactHookImports(c);
+  c = c.replace(/templateUrl\s*:\s*['"][^'"]+['"]\s*,?/g, '');
+  c = c.replace(/styleUrl(?:s)?\s*:\s*(?:['"][^'"]+['"]|\[[^\]]+\])\s*,?/g, '');
+  return c;
+}
+
+function ensureReactPackagesFromImports(destPath, sourceStack = {}) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+
+  let added = 0;
+  const imported = collectBareImportPackages(destPath);
+  if (sourceStack.material) {
+    imported.add('@mui/material');
+    imported.add('@emotion/react');
+    imported.add('@emotion/styled');
+  }
+  if (sourceStack.ngxs) imported.add('zustand');
+  if (sourceStack.lucide) imported.add('lucide-react');
+
+  for (const spec of imported) {
+    if (spec.startsWith('@angular/') || spec.startsWith('@ngxs/')) {
+      delete pkg.dependencies[spec];
+      continue;
+    }
+    const version = REACT_KNOWN_PACKAGES[spec];
+    if (!version) continue;
+    if (!pkg.dependencies[spec] && !pkg.devDependencies?.[spec]) {
+      pkg.dependencies[spec] = version;
+      added += 1;
+    }
+  }
+
+  // MUI always needs emotion peers
+  if (pkg.dependencies['@mui/material']) {
+    if (!pkg.dependencies['@emotion/react']) pkg.dependencies['@emotion/react'] = REACT_KNOWN_PACKAGES['@emotion/react'];
+    if (!pkg.dependencies['@emotion/styled']) pkg.dependencies['@emotion/styled'] = REACT_KNOWN_PACKAGES['@emotion/styled'];
+  }
+
+  writeJson(pkgPath, pkg);
+  return added;
+}
+
+function ensureMaterialIconsLink(destPath) {
+  const indexPath = path.join(destPath, 'index.html');
+  if (!fs.existsSync(indexPath)) return;
+  let html = fs.readFileSync(indexPath, 'utf-8');
+  if (/fonts\.googleapis\.com\/icon\?family=Material\+Icons/.test(html)) return;
+  if (!html.includes('</head>')) return;
+  html = html.replace(
+    '</head>',
+    '  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">\n</head>'
+  );
+  fs.writeFileSync(indexPath, html, 'utf-8');
+}
+
+/**
+ * Pull missing npm packages out of tsc/vite "Cannot find module" errors.
+ * Returns how many packages were added.
+ */
+export function addPackagesFromBuildErrors(destPath, buildErrors) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+  let added = 0;
+  const text = String(buildErrors || '');
+  for (const m of text.matchAll(/Cannot find module ['"]([^'"]+)['"]/g)) {
+    const pkgName = packageNameFromSpecifier(m[1]);
+    if (!pkgName || pkgName.startsWith('@angular/') || pkgName.startsWith('@ngxs/')) continue;
+    const version = REACT_KNOWN_PACKAGES[pkgName];
+    if (!version) continue;
+    if (pkgName === 'react' || pkgName === 'react-dom' || pkgName === 'vite') continue;
+    if (!pkg.dependencies[pkgName] && !pkg.devDependencies?.[pkgName]) {
+      pkg.dependencies[pkgName] = version;
+      added += 1;
+    }
+  }
+  if (added) writeJson(pkgPath, pkg);
+  return added;
+}
+
+export function fileContainsJsx(content) {
+  const text = String(content || '');
+  if (!text) return false;
+  if (/return\s*\(\s*</.test(text)) return true;
+  if (/<>[\s\S]*<\/>/.test(text)) return true;
+  // PascalCase tags, but not TypeScript generics (Promise<User>, StateContext<Model>)
+  if (/(?<![A-Za-z0-9_])<[A-Z][A-Za-z0-9.]*(\s|\/|>)/.test(text)) return true;
+  if (
+    /<\/?(?:div|span|button|form|main|section|header|footer|nav|table|thead|tbody|tr|td|th|ul|ol|li|p|h[1-6]|input|label|select|option|textarea|img|svg|path|a|fragment)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  if (/\bclassName\s*=/.test(text) && /(?<![A-Za-z0-9_])<\w/.test(text)) return true;
+  return false;
+}
+
+/**
+ * Rename src .ts files that contain JSX to .tsx (and drop the .ts sibling).
+ * Returns how many files were renamed or removed.
+ */
+export function renameJsxTsFilesToTsx(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  if (!fs.existsSync(srcRoot)) return 0;
+
+  let renamed = 0;
+  const files = walkFiles(
+    srcRoot,
+    (name) =>
+      (name.endsWith('.ts') || name.endsWith('.js')) &&
+      !name.endsWith('.d.ts') &&
+      !name.endsWith('.spec.ts') &&
+      !name.endsWith('.spec.js')
+  );
+
+  for (const file of files) {
+    let content;
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (!fileContainsJsx(content)) continue;
+
+    const destFile = file.endsWith('.js')
+      ? file.replace(/\.js$/, '.jsx')
+      : file.replace(/\.ts$/, '.tsx');
+    try {
+      if (fs.existsSync(destFile)) {
+        fs.unlinkSync(file);
+      } else {
+        fs.renameSync(file, destFile);
+      }
+      renamed += 1;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return renamed;
+}
+
+function relativeModulePath(fromFile, toFile) {
+  let rel = path.relative(path.dirname(fromFile), toFile).replace(/\\/g, '/');
+  rel = rel.replace(/\.(tsx|ts|jsx|js)$/i, '');
+  if (!rel.startsWith('.')) rel = `./${rel}`;
+  return rel;
+}
+
+function hoistReactSrcApp(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const srcApp = path.join(srcRoot, 'app');
+  if (!fs.existsSync(srcApp)) return 0;
+  let moved = 0;
+  for (const file of walkFiles(srcApp, () => true)) {
+    const rel = path.relative(srcApp, file);
+    const dest = path.join(srcRoot, rel);
+    try {
+      if (fs.existsSync(dest)) {
+        const destSize = fs.statSync(dest).size;
+        const srcSize = fs.statSync(file).size;
+        if (srcSize > destSize + 40) {
+          fs.copyFileSync(file, dest);
+          moved += 1;
+        }
+        continue;
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.renameSync(file, dest);
+      moved += 1;
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    fs.rmSync(srcApp, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+  if (moved > 0) {
+    console.log(`[postprocess] Hoisted ${moved} file(s) from src/app/ into src/`);
+  }
+  return moved;
+}
+
+function ensureZustandHookImports(contents) {
+  const hookExports = [];
+  for (const [file, content] of contents) {
+    for (const m of String(content).matchAll(/export const (use\w+Store)\s*=/g)) {
+      hookExports.push({ hook: m[1], file });
+    }
+  }
+  if (hookExports.length === 0) return;
+
+  for (const [file, content] of contents) {
+    let c = content;
+    const selfExported = new Set(
+      [...String(content).matchAll(/export const (use\w+Store)\s*=/g)].map((m) => m[1])
+    );
+    for (const { hook, file: expFile } of hookExports) {
+      if (file === expFile) continue;
+      if (selfExported.has(hook)) continue;
+      if (!new RegExp(`\\b${hook}\\b`).test(c)) continue;
+      if (new RegExp(`import\\s+[^;]*\\b${hook}\\b`).test(c)) continue;
+      const rel = relativeModulePath(file, expFile);
+      c = `import { ${hook} } from '${rel}';\n${c}`;
+    }
+    contents.set(file, c);
+  }
+}
+
+function findZustandStoreFiles(destPath) {
+  const stores = [];
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts') || n.endsWith('.tsx'))) {
+    const content = fs.readFileSync(file, 'utf-8');
+    const hookMatch = content.match(/export const (use\w+Store)\s*=\s*create/);
+    if (!hookMatch) continue;
+    stores.push({
+      file,
+      hook: hookMatch[1],
+      content,
+      importsSameHook: new RegExp(`import\\s+\\{\\s*${hookMatch[1]}\\s*\\}\\s+from`).test(content)
+    });
+  }
+  return stores;
+}
+
+function scoreZustandStoreFile(entry) {
+  let score = 0;
+  const rel = entry.file.replace(/\\/g, '/');
+  if (/\.store\.ts$/.test(rel)) score += 10;
+  if (/Store\.ts$/.test(rel) && !/\.state\.ts$/.test(rel)) score += 8;
+  if (!entry.importsSameHook) score += 6;
+  if (/TaskDraft|interface \w+Model/.test(entry.content)) score += 3;
+  if (/\.state\.ts$/.test(rel)) score -= 4;
+  return score;
+}
+
+function stripSelfHookImports(content, hook) {
+  return String(content || '').replace(
+    new RegExp(`import\\s+\\{\\s*${hook}\\s*\\}\\s+from\\s+['"][^'"]+['"]\\s*;?\\s*\\n`, 'g'),
+    ''
+  );
+}
+
+/**
+ * One zustand hook per name — drop circular task.state.ts / task.store.ts duplicates.
+ */
+export function consolidateDuplicateZustandStores(destPath) {
+  const stores = findZustandStoreFiles(destPath);
+  const byHook = new Map();
+  for (const entry of stores) {
+    if (!byHook.has(entry.hook)) byHook.set(entry.hook, []);
+    byHook.get(entry.hook).push(entry);
+  }
+
+  let changed = 0;
+  for (const [hook, entries] of byHook) {
+    if (entries.length === 1) {
+      const only = entries[0];
+      const cleaned = stripSelfHookImports(only.content, hook);
+      if (cleaned !== only.content) {
+        fs.writeFileSync(only.file, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`, 'utf-8');
+        changed += 1;
+      }
+      continue;
+    }
+
+    entries.sort((a, b) => scoreZustandStoreFile(b) - scoreZustandStoreFile(a));
+    const winner = entries[0];
+    let winnerContent = stripSelfHookImports(winner.content, hook);
+    fs.writeFileSync(winner.file, winnerContent.endsWith('\n') ? winnerContent : `${winnerContent}\n`, 'utf-8');
+
+    for (const loser of entries.slice(1)) {
+      try {
+        fs.unlinkSync(loser.file);
+        changed += 1;
+        console.log(`[postprocess] Removed duplicate zustand store: ${path.relative(destPath, loser.file)}`);
+      } catch {
+        /* ignore */
+      }
+    }
+    fixZustandImportPaths(destPath, winner.file, hook);
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Consolidated zustand store(s) (${changed} change(s))`);
+  }
+  return changed;
+}
+
+function fixZustandImportPaths(destPath, canonicalFile, hook) {
+  const srcRoot = path.join(destPath, 'src');
+  const canonicalImport = relativeModulePath(canonicalFile, canonicalFile).replace(/\\/g, '/');
+  const canonicalNoExt = canonicalImport.replace(/\.(tsx|ts)$/, '');
+
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts') || n.endsWith('.tsx'))) {
+    if (file === canonicalFile) continue;
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    content = content.replace(
+      new RegExp(`import\\s+\\{\\s*${hook}\\s*\\}\\s+from\\s+['"]([^'"]+)['"]`, 'g'),
+      (full, spec) => {
+        const resolved = resolveModuleFile(file, spec);
+        if (resolved && fs.existsSync(resolved)) return full;
+        const rel = relativeModulePath(file, canonicalFile).replace(/\.(tsx|ts)$/, '');
+        return `import { ${hook} } from '${rel}'`;
+      }
+    );
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+    }
+  }
+
+  const hookFileName = `${hook}.ts`;
+  const useHookBarrel = path.join(srcRoot, 'store', hookFileName);
+  const exportPath = `./${path
+    .relative(path.join(srcRoot, 'store'), canonicalFile)
+    .replace(/\\/g, '/')
+    .replace(/\.ts$/, '')}`;
+  const exportLine = `export { ${hook} } from '${exportPath}';\n`;
+  if (!fs.existsSync(useHookBarrel)) {
+    fs.mkdirSync(path.dirname(useHookBarrel), { recursive: true });
+    fs.writeFileSync(useHookBarrel, exportLine, 'utf-8');
+  }
+  const legacyBarrel = path.join(srcRoot, 'store', `${hook.replace(/^use/, '').charAt(0).toLowerCase()}${hook.replace(/^use/, '').slice(1)}.ts`);
+  if (legacyBarrel !== useHookBarrel && fs.existsSync(legacyBarrel)) {
+    try {
+      const legacyContent = fs.readFileSync(legacyBarrel, 'utf-8');
+      const isRealStore = new RegExp(`export const ${hook}\\s*=\\s*create`).test(legacyContent);
+      if (!isRealStore) {
+        fs.unlinkSync(legacyBarrel);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function cleanupStoreBarrelFiles(destPath) {
+  const srcRoot = path.join(destPath, 'src', 'store');
+  if (!fs.existsSync(srcRoot)) return 0;
+  let fixed = 0;
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts') && !n.endsWith('.store.ts') && !n.endsWith('.state.ts'))) {
+    const base = path.basename(file);
+    if (!/Store\.ts$/.test(base) && base !== 'useTaskStore.ts') continue;
+    let content = fs.readFileSync(file, 'utf-8');
+    if (!/^export\s+\{/.test(content.trim()) && !/export\s+\{/.test(content)) continue;
+    const original = content;
+    content = content.replace(/^import\s+\{[^}]+\}\s+from\s+[^;]+;\s*\n?/m, '');
+    content = content.trimEnd();
+    if (!content.endsWith('\n')) content += '\n';
+    if (content !== original) {
+      fs.writeFileSync(file, content, 'utf-8');
+      fixed += 1;
+    }
+  }
+  return fixed;
+}
+
+function fixCnUtilityFile(destPath) {
+  const utilsPath = path.join(destPath, 'src', 'lib', 'utils.ts');
+  if (!fs.existsSync(utilsPath)) return 0;
+  let content = fs.readFileSync(utilsPath, 'utf-8');
+  if (!/\bClassValue\b/.test(content)) return 0;
+  if (/import\s+type\s+\{\s*ClassValue\s*\}/.test(content)) return 0;
+  content = ensureImport(content, 'ClassValue', 'clsx');
+  content = content.replace(
+    /import\s+\{\s*ClassValue\s*\}\s+from\s+['"]clsx['"]/,
+    "import { type ClassValue } from 'clsx'"
+  );
+  fs.writeFileSync(utilsPath, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+  return 1;
+}
+
+function getZustandStateFields(storeContent) {
+  const fields = new Set();
+  const iface = storeContent.match(/interface\s+\w+\s*\{([\s\S]*?)\}/);
+  if (iface) {
+    for (const m of iface[1].matchAll(/^\s*(\w+)\??\s*:/gm)) fields.add(m[1]);
+  }
+  for (const m of storeContent.matchAll(/^\s{2,}(\w+)\s*:/gm)) {
+    if (!['set', 'get'].includes(m[1])) fields.add(m[1]);
+  }
+  return fields;
+}
+
+function fixZustandStoreDestructuring(content, hook, stateField, aliasField) {
+  const re = new RegExp(`const\\s+\\{\\s*([^}]+)\\s*\\}\\s*=\\s*${hook}\\s*\\(\\s*\\)`, 'g');
+  return content.replace(re, (full, inner) => {
+    const parts = inner.split(',').map((s) => s.trim()).filter(Boolean);
+    const hasStateField = parts.some(
+      (p) =>
+        p === stateField ||
+        p.startsWith(`${stateField}:`) ||
+        new RegExp(`^${stateField}:\\s*${aliasField}$`).test(p)
+    );
+    const hasBareAlias = parts.some((p) => p === aliasField);
+    if (hasBareAlias && !hasStateField) {
+      const newParts = parts.map((p) => (p === aliasField ? `${stateField}: ${aliasField}` : p));
+      return `const { ${newParts.join(', ')} } = ${hook}()`;
+    }
+    return full;
+  });
+}
+
+function consolidateZustandHookUsage(content, hook) {
+  if (!content.includes(hook)) return content;
+
+  const selectorRe = new RegExp(
+    `^\\s*const\\s+(\\w+)\\s*=\\s*${hook}\\(\\(state(?:\\s*:\\s*\\w+)?\\)\\s*=>\\s*state\\.(\\w+)\\)\\s*;\\s*$`
+  );
+  const destructRe = new RegExp(
+    `^\\s*const\\s+\\{\\s*([^}]+)\\s*\\}\\s*=\\s*${hook}\\(\\s*\\)\\s*;\\s*$`
+  );
+
+  const fieldMap = new Map();
+  const linesToRemove = new Set();
+
+  for (const line of content.split('\n')) {
+    const sel = line.match(selectorRe);
+    if (sel) {
+      linesToRemove.add(line);
+      fieldMap.set(sel[2], sel[1]);
+      continue;
+    }
+    const dest = line.match(destructRe);
+    if (dest) {
+      linesToRemove.add(line);
+      for (const part of dest[1].split(',')) {
+        const p = part.trim();
+        if (!p) continue;
+        const alias = p.match(/^(\w+)\s*:\s*(\w+)$/);
+        if (alias) fieldMap.set(alias[1], alias[2]);
+        else fieldMap.set(p, p);
+      }
+    }
+  }
+
+  const hookUsageCount = (content.match(new RegExp(`\\b${hook}\\b`, 'g')) || []).length;
+  if (fieldMap.size === 0) return content;
+  if (linesToRemove.size <= 1 && linesToRemove.size < hookUsageCount) return content;
+
+  const parts = [...fieldMap.entries()].map(([field, local]) =>
+    field === local ? field : `${field}: ${local}`
+  );
+  const consolidated = `  const { ${parts.join(', ')} } = ${hook}();`;
+  const filtered = content
+    .split('\n')
+    .filter((line) => !linesToRemove.has(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n');
+
+  if (new RegExp(`const\\s+\\{\\s*[^}]+\\}\\s*=\\s*${hook}\\(\\s*\\)`).test(filtered)) {
+    return filtered;
+  }
+  return filtered.replace(
+    /(export\s+(?:default\s+)?function\s+\w+[^{]*\{)/,
+    `$1\n${consolidated}`
+  );
+}
+
+/** Collapse duplicate zustand selectors/destructuring into one hook call per file. */
+export function fixZustandHookUsage(destPath) {
+  ensureZustandStoreScaffold(destPath);
+  const stores = findZustandStoreFiles(destPath);
+  if (stores.length === 0) return 0;
+  let changed = 0;
+  const srcRoot = path.join(destPath, 'src');
+
+  for (const store of stores) {
+    fixZustandImportPaths(destPath, store.file, store.hook);
+    const fields = getZustandStateFields(store.content);
+    for (const file of walkFiles(srcRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+      let content = fs.readFileSync(file, 'utf-8');
+      if (!content.includes(store.hook)) continue;
+      const original = content;
+      if (fields.has('items') && !fields.has('tasks')) {
+        content = fixZustandStoreDestructuring(content, store.hook, 'items', 'tasks');
+      }
+      content = consolidateZustandHookUsage(content, store.hook);
+      if (content !== original) {
+        fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+        changed += 1;
+      }
+    }
+  }
+  return changed;
+}
+
+/** Align selector fields (state.tasks → state.items when store uses items). */
+export function fixZustandSelectorFields(destPath) {
+  const stores = findZustandStoreFiles(destPath);
+  if (stores.length === 0) return 0;
+  let changed = 0;
+  const srcRoot = path.join(destPath, 'src');
+
+  for (const store of stores) {
+    const fields = getZustandStateFields(store.content);
+    if (!fields.has('items') || fields.has('tasks')) continue;
+    for (const file of walkFiles(srcRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+      let content = fs.readFileSync(file, 'utf-8');
+      if (!content.includes(store.hook)) continue;
+      const original = content;
+      content = content.replace(/\bstate\.tasks\b/g, 'state.items');
+      content = fixZustandStoreDestructuring(content, store.hook, 'items', 'tasks');
+      content = consolidateZustandHookUsage(content, store.hook);
+      if (content !== original) {
+        fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+        changed += 1;
+      }
+    }
+  }
+  return changed;
+}
+
+function indexComponentPropInterfaces(destPath) {
+  const map = new Map();
+  const componentsRoot = path.join(destPath, 'src', 'components');
+  if (!fs.existsSync(componentsRoot)) return map;
+  for (const file of walkFiles(componentsRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+    const content = fs.readFileSync(file, 'utf-8');
+    for (const m of content.matchAll(/export interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
+      const name = m[1].replace(/Props$/, '');
+      const props = new Set(
+        [...m[2].matchAll(/(\w+)\??\s*:/g)].map((x) => x[1])
+      );
+      map.set(name, props);
+    }
+    const fnMatch = content.match(/export (?:const|function) (\w+)\s*[:=][^{]*\{([^}]+)\}/);
+    if (fnMatch && !map.has(fnMatch[1])) {
+      const props = new Set(
+        [...fnMatch[2].matchAll(/\b(\w+)\s*(?:=|,|\})/g)]
+          .map((x) => x[1])
+          .filter((n) => n !== 'null' && n !== 'false' && n !== 'true')
+      );
+      if (props.size) map.set(fnMatch[1], props);
+    }
+  }
+  return map;
+}
+
+function mergeDeleteDialogCallbacks(content, compName, props) {
+  if (!props.has('onClose') || props.has('onConfirm')) return content;
+  if (!content.includes(`<${compName}`) || !/\bonConfirm=/.test(content)) return content;
+
+  const tagRe = new RegExp(`<${compName}\\b([\\s\\S]*?)/>`, 'g');
+  return content.replace(tagRe, (tag, inner) => {
+    if (!/\bonConfirm=/.test(tag)) return tag;
+    const confirmFn = inner.match(/\bonConfirm=\{([^}]+)\}/)?.[1]?.trim();
+    const closeFn = inner.match(/\bonClose=\{([^}]+)\}/)?.[1]?.trim();
+    if (!confirmFn) return tag;
+
+    let newInner = inner
+      .replace(/\s*onConfirm=\{[^}]+\}\s*/g, '\n')
+      .replace(/\s*onClose=\{[^}]+\}\s*/g, '\n');
+    const elseBody = closeFn?.includes('=>')
+      ? closeFn.replace(/^[^=]+=>\s*/, '').replace(/;$/, '')
+      : closeFn
+        ? `${closeFn}()`
+        : null;
+    const merged = elseBody
+      ? `(confirmed) => {\n        if (confirmed) ${confirmFn}();\n        else { ${elseBody}; }\n      }`
+      : `(confirmed) => { if (confirmed) ${confirmFn}(); }`;
+    return `<${compName}${newInner}        onClose={${merged}}\n      />`;
+  });
+}
+
+function removeUnusedArrowHandlers(content) {
+  return String(content || '').replace(
+    /^\s*const\s+(handle\w+)\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n\s*\};\s*\n/gm,
+    (block, name) => {
+      const without = String(content).replace(block, '');
+      if (new RegExp(`\\b${name}\\b`).test(without)) return block;
+      return '';
+    }
+  );
+}
+function stripJsxProp(content, componentName, propName) {
+  return String(content || '').replace(
+    new RegExp(`(<${componentName}\\b[^>]*?)\\s+${propName}=\\{[^}]+\\}`, 'gs'),
+    '$1'
+  );
+}
+
+function renameJsxPropInComponent(content, componentName, fromProp, toProp) {
+  const tagRe = new RegExp(`<${componentName}\\b[\\s\\S]*?(/?>)`, 'g');
+  return String(content || '').replace(tagRe, (tag) => {
+    if (!new RegExp(`\\b${fromProp}=`).test(tag)) return tag;
+    if (new RegExp(`\\b${toProp}=`).test(tag)) {
+      return tag.replace(new RegExp(`\\s+${fromProp}=\\{[^}]+\\}`), '');
+    }
+    return tag.replace(new RegExp(`\\b${fromProp}=`), `${toProp}=`);
+  });
+}
+
+/** Align JSX call sites with exported component prop interfaces. */
+export function syncComponentCallSiteProps(destPath) {
+  const componentProps = indexComponentPropInterfaces(destPath);
+  if (componentProps.size === 0) return 0;
+  const srcRoot = path.join(destPath, 'src');
+  let changed = 0;
+
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.tsx'))) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+    for (const [compName, props] of componentProps) {
+      if (!content.includes(`<${compName}`)) continue;
+      if (!props.has('open')) content = stripJsxProp(content, compName, 'open');
+      if (props.has('onCancel') && !props.has('onClose')) {
+        content = renameJsxPropInComponent(content, compName, 'onClose', 'onCancel');
+      }
+      if (props.has('onClose') && !props.has('onCancel')) {
+        content = renameJsxPropInComponent(content, compName, 'onCancel', 'onClose');
+      }
+      content = mergeDeleteDialogCallbacks(content, compName, props);
+    }
+    content = removeUnusedArrowHandlers(content);
+    content = injectMissingComponentProps(content, componentProps);
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
+/** Inject required props only when the component interface declares them. */
+export function injectMissingComponentProps(content, componentProps = null) {
+  let c = String(content || '');
+  const sidebarProps = componentProps?.get?.('TaskFormSidebar');
+  const needsOpen = sidebarProps ? sidebarProps.has('open') : false;
+  if (needsOpen && /<TaskFormSidebar\b/.test(c) && !/<TaskFormSidebar[^>]*\bopen=/.test(c)) {
+    const sidebarVar =
+      c.match(/\[(\w+),\s*set\w+\]\s*=\s*useState\([^)]*\)/)?.[1] ||
+      (/\bsidebarOpen\b/.test(c) ? 'sidebarOpen' : null);
+    if (sidebarVar) {
+      c = c.replace(/<TaskFormSidebar(\s*)/, `<TaskFormSidebar open={${sidebarVar}}$1`);
+    }
+  }
+  return c;
+}
+
+function dedupeMuiImports(content) {
+  const text = String(content || '');
+  const barrelMatch = text.match(/import\s+\{([^}]+)\}\s+from\s+['"]@mui\/material['"]/);
+  if (!barrelMatch) return text;
+  const barrelNames = new Set(
+    barrelMatch[1]
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+  const lines = text.split('\n');
+  const out = [];
+  for (const line of lines) {
+    const defMatch = line.match(/^import\s+(\w+)\s+from\s+['"]@mui\/material\/(\w+)['"]/);
+    if (defMatch && barrelNames.has(defMatch[1])) continue;
+    if (/^import\s+\{[^}]+\}\s+from\s+['"]@mui\/material['"]/.test(line) && out.some((l) => /^import\s+\{[^}]+\}\s+from\s+['"]@mui\/material['"]/.test(l))) {
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 function repairReactSourceFiles(destPath) {
   const files = walkFiles(path.join(destPath, 'src'), (name) =>
     name.endsWith('.tsx') || name.endsWith('.ts') || name.endsWith('.jsx') || name.endsWith('.js')
   );
 
+  const contents = new Map();
   for (const file of files) {
-    let content = fs.readFileSync(file, 'utf-8');
-    const original = content;
+    const original = fs.readFileSync(file, 'utf-8');
+    let content = rewriteReactAngularLeftovers(original);
+    content = stripUnusedReactDefaultImport(content);
+    content = pruneUnusedNamedImports(content);
+    content = removeUnusedArrowHandlers(content);
+    content = dedupeMuiImports(content);
+    contents.set(file, content);
+  }
+  ensureZustandHookImports(contents);
 
-    content = content.replace(/from\s*['"]lucide-angular['"]/g, "from 'lucide-react'");
-    content = content.replace(/from\s*['"]@lucide\/angular['"]/g, "from 'lucide-react'");
-    content = content.replace(/from\s*['"]@angular\/core['"]/g, "from 'react'");
-    // Angular leftover selectors / templateUrl should not remain
-    content = content.replace(/templateUrl\s*:\s*['"][^'"]+['"]\s*,?/g, '');
-    content = content.replace(/styleUrl\s*:\s*['"][^'"]+['"]\s*,?/g, '');
-
+  for (const [file, content] of contents) {
+    let original = '';
+    try {
+      original = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
     if (content !== original) {
       fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
     }
@@ -2498,11 +5157,38 @@ function repairReactSourceFiles(destPath) {
  * Full React workspace repair after AI generation.
  */
 export function repairReactWorkspace(destPath, options = {}) {
-  const { sourcePackageJson = null } = options;
+  const { sourcePackageJson = null, sourceFilesMap = null } = options;
+  const sourceStack = detectSourceStack(sourceFilesMap || {}, sourcePackageJson);
 
+  hoistReactSrcApp(destPath);
   addReactPathAliases(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'react');
   repairReactSourceFiles(destPath);
+  pinSourceDomainArtifacts(destPath, sourceFilesMap);
+  consolidateDuplicateZustandStores(destPath);
+  ensureZustandStoreScaffold(destPath);
+  cleanupStoreBarrelFiles(destPath);
+  fixZustandSelectorFields(destPath);
+  fixZustandHookUsage(destPath);
+  alignTaskStatusLiterals(destPath);
+  syncComponentCallSiteProps(destPath);
+  fixCnUtilityFile(destPath);
+  fixReactModuleImports(destPath);
+  dedupeStoreModelTypes(destPath);
+  fixTaskModelFieldMismatches(destPath);
+  ensureReactAppShell(destPath, sourceFilesMap);
+  removeUnusedStoreShards(destPath);
+  removeAngularLeftoverReactFiles(destPath);
+  stripAngularTestDepsFromReactPackage(destPath);
+  const renamedJsx = renameJsxTsFilesToTsx(destPath);
+  if (renamedJsx > 0) {
+    console.log(`[postprocess] Renamed ${renamedJsx} JSX .ts file(s) to .tsx`);
+  }
+  const addedPkgs = ensureReactPackagesFromImports(destPath, sourceStack);
+  if (addedPkgs > 0) {
+    console.log(`[postprocess] Added ${addedPkgs} missing React package(s) from imports/source stack`);
+  }
+  if (sourceStack.material) ensureMaterialIconsLink(destPath);
 
   // Ensure App.tsx + main.tsx exist (caller also runs ensureReactRuntimeFiles)
   const appPath = path.join(destPath, 'src', 'App.tsx');
@@ -2512,6 +5198,7 @@ export function repairReactWorkspace(destPath, options = {}) {
   }
 
   enforceReactTailwindScss(destPath);
+  return addedPkgs;
 }
 
 function enforceReactTailwindScss(destPath) {

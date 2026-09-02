@@ -33,9 +33,9 @@ export class CreateMigrationComponent implements OnDestroy {
 
   private static readonly RETIRED_GENAI = /gemini-(1\.5|2\.0|2\.5)-/;
   private static readonly PREFERRED_GENAI = [
-    'gemini-3.5-flash-lite',
-    'gemini-3.5-flash',
     'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
   ];
 
   private readonly fileInput = viewChild<ElementRef<HTMLInputElement>>('fileInput');

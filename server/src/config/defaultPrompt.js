@@ -174,7 +174,9 @@ export const ANGULAR_TO_REACT_PROMPT = `
 
 ### Structure (Vite + React 19 + TypeScript)
 - App entry: src/main.tsx boots src/App.tsx (NOT src/app/app.tsx).
-- Use .tsx for components. Functional components + hooks only (React 19).
+- Use .tsx for any file that returns JSX (pages, components, layouts). Never put JSX in a .ts file — that causes TS1161 Unterminated regular expression literal.
+- Utils, hooks, services, stores, and types stay .ts.
+- Functional components + hooks only (React 19).
 - Prefer folders: components/, features/, hooks/, lib/, services/, pages/.
 - Routing: react-router-dom (BrowserRouter or createBrowserRouter).
 - Do NOT generate angular.json, tsconfig.app.json, or Angular workspace files.
@@ -190,6 +192,30 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Every JSX identifier must be imported or defined. No orphan components.
 - No empty handlers or stub "// implement later" for required UI the user asked for.
 - Only real npm deps in package.json; skip @angular/* packages in the React app.
+
+### Domain types & store (MANDATORY — copy source, do not invent)
+- Copy \`models/*.ts\` field-for-field. If Task has \`status: 'todo' | 'in-progress' | 'done'\`,
+  use those literals exactly. Never add fields the source model does not have
+  (no \`priority\`, \`completed\`, \`dueDate\`). Never write \`in_progress\`.
+- NGXS \`TaskState.items\` stays \`items\` on the zustand store. Pages may alias
+  \`const { items: tasks } = useTaskStore()\`. Do not invent \`state.tasks\`.
+- Import \`Task\` / \`TaskDraft\` / \`TaskStatus\` from \`models/task.model\` (the copied source
+  file). Never invent \`types/task\`, \`interfaces/task\`, or \`services/task.service\`.
+- \`useTaskStore\` must be a real \`create()\` export (or a barrel that re-exports that file).
+  Do not emit \`export { useTaskStore } from './taskStore'\` unless \`taskStore.ts\` exists.
+
+### Library mapping (MANDATORY)
+- @ngxs/store → zustand. \`create((set, get) => ({ ... }))\`. No @State/@Action/dispatch(new X()).
+  Export \`useXStore\` with the same CRUD methods. Selectors become \`useXStore((s) => s.field)\`.
+- @angular/material → @mui/material (+ @emotion/react, @emotion/styled).
+  MatSidenav → Drawer, MatDialog → Dialog, MatToolbar → AppBar+Toolbar,
+  mat-icon → Icon, mat-button → Button, mat-icon-button → IconButton,
+  mat-form-field → FormControl/TextField, mat-select → Select.
+  MatDialog.open(Foo, { data }).afterClosed() → useState + \`<Foo open data onClose />\`.
+  Dialog components take \`{ open, onClose, data }\` — never MatDialogRef / MAT_DIALOG_DATA.
+- Angular template leftovers are forbidden in React: no mat-* tags, no (click)/[opened]/{{ }},
+  no @if/@for, no app-* selectors, no @angular/* or @ngxs/* imports.
+- lucide-angular / @lucide/angular → lucide-react.
 `;
 
 /**
@@ -378,7 +404,7 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
 - "complexity" must be one of: "low", "medium", "high"
 - Include ALL needed app files for the FULL source project (not config: package.json, tsconfig, angular.json, vite.config)
 - For Angular: always plan full .ts + .html + .scss triads with matching names
-- For React: plan .tsx (+ optional .scss)
+- For React: plan .tsx for pages/components (never .ts if the file has JSX) + optional .scss
 - Convert every source feature. Do NOT omit pages unless the user explicitly asked to delete them.
 - Cover every file required for a runnable result with the same functionality as the source
 - Output ONLY raw JSON — no markdown, no explanation, no backticks

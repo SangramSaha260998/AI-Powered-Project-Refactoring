@@ -314,9 +314,9 @@ router.get('/models/genai', async (req, res) => {
     }
 
     const PREFERRED_GENAI = [
-      'gemini-3.5-flash-lite',
-      'gemini-3.5-flash',
       'gemini-3.6-flash',
+      'gemini-3.5-flash',
+      'gemini-3.5-flash-lite',
     ];
     const RETIRED_GENAI = /gemini-(1\.5|2\.0|2\.5)-/;
 
@@ -472,8 +472,8 @@ const EXCLUDED_TOKENROUTER_MODELS = new Set([
  */
 const FALLBACK_TOKENROUTER_MODELS = [
   'deepseek/deepseek-v4-pro-0813-free',
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
   'qwen/qwen3.8-max-free',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
 ];
 
 /**

@@ -29,7 +29,8 @@ import {
   alignTaskStatusLiterals,
   ensureZustandStoreScaffold,
   pinSourceDomainArtifacts,
-  ensureReactAppShell
+  ensureReactAppShell,
+  fixAngularCompileErrors
 } from '../src/services/postprocess.js';
 import { rewriteHtmlLucideToInlineSvg } from '../src/services/lucideInlineSvg.js';
 import {
@@ -1193,6 +1194,68 @@ const t: Task = { id: '1', title: 'a', description: '', status: 'todo', priority
   const page = fs.readFileSync(path.join(tmp, 'src', 'pages', 'TaskList.tsx'), 'utf-8');
   assert(!/\bpriority\b/.test(page), 'invented priority still stripped from non-model files');
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- NG1010: MatButtonModule / MatIconModule in imports[] without a value import ---
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng1010-material-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'task-list');
+  fs.mkdirSync(dir, { recursive: true });
+  const brokenTs = `import { Component } from '@angular/core';
+import { MatSidenavModule } from '@angular/material/sidenav';
+import { MatToolbarModule } from '@angular/material/toolbar';
+
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [MatSidenavModule, MatToolbarModule, MatButtonModule, MatIconModule],
+  templateUrl: './task-list.component.html',
+  styleUrl: './task-list.component.scss'
+})
+export class TaskListComponent {}
+`;
+  const brokenHtml = `<mat-sidenav-container>
+  <mat-toolbar>
+    <mat-icon>checklist</mat-icon>
+    <button mat-flat-button type="button">Add task</button>
+  </mat-toolbar>
+</mat-sidenav-container>
+`;
+  fs.writeFileSync(path.join(dir, 'task-list.component.ts'), brokenTs);
+  fs.writeFileSync(path.join(dir, 'task-list.component.html'), brokenHtml);
+  fs.writeFileSync(path.join(dir, 'task-list.component.scss'), '/* */\n');
+
+  repairAngularComponentFile(path.join(dir, 'task-list.component.ts'));
+  const ts = fs.readFileSync(path.join(dir, 'task-list.component.ts'), 'utf-8');
+  assert(/from '@angular\/material\/button'/.test(ts), 'NG1010 repair imports MatButtonModule');
+  assert(/from '@angular\/material\/icon'/.test(ts), 'NG1010 repair imports MatIconModule');
+  assert(
+    /import\s*\{[^}]*\bMatButtonModule\b[^}]*\}\s*from\s*'@angular\/material\/button'/.test(ts),
+    'MatButtonModule is a value import'
+  );
+  assert(
+    /imports:\s*\[[^\]]*MatButtonModule/.test(ts),
+    'MatButtonModule stays in the decorator imports array'
+  );
+  assert(!/import type\s*\{[^}]*MatButtonModule/.test(ts), 'MatButtonModule is not import type');
+
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng1010-fixfn-'));
+  const dir2 = path.join(tmp2, 'src', 'app', 'pages', 'task-list');
+  fs.mkdirSync(dir2, { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'task-list.component.ts'), brokenTs);
+  fs.writeFileSync(path.join(dir2, 'task-list.component.html'), brokenHtml);
+  fs.writeFileSync(path.join(dir2, 'task-list.component.scss'), '/* */\n');
+  const n = fixAngularCompileErrors(
+    tmp2,
+    `src/app/pages/task-list/task-list.component.ts:35:48: MatButtonModule Unknown reference. NG1010: 'imports' must be an array of components, directives, pipes, or NgModules. Value could not be determined statically. MatIconModule Unknown reference.`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors reports a changed file');
+  const ts2 = fs.readFileSync(path.join(dir2, 'task-list.component.ts'), 'utf-8');
+  assert(/from '@angular\/material\/button'/.test(ts2), 'fixAngularCompileErrors restores MatButtonModule import');
+  assert(/from '@angular\/material\/icon'/.test(ts2), 'fixAngularCompileErrors restores MatIconModule import');
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp2, { recursive: true, force: true });
 }
 
 if (process.exitCode) {

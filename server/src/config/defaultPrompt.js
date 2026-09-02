@@ -318,6 +318,16 @@ Do NOT use default project names — use the EXTRACTED name.
 - embla-carousel: default \`EmblaCarousel\` + \`EmblaOptionsType\` / \`EmblaCarouselType\`
   — NOT named Embla / EmblaOptions / EmblaApi.
 - Skip @radix-ui/* React packages in Angular package.json.
+- @mui/material → @angular/material (standalone NgModules on the component \`imports\` array).
+  Button / variant contained → \`mat-flat-button\` + \`import { MatButtonModule } from '@angular/material/button'\`.
+  IconButton → \`mat-icon-button\` (same MatButtonModule).
+  \`*Icon\` / Icon → \`<mat-icon>name</mat-icon>\` + \`import { MatIconModule } from '@angular/material/icon'\`.
+  Drawer → \`mat-sidenav\` + MatSidenavModule from '@angular/material/sidenav'.
+  AppBar / Toolbar → \`mat-toolbar\` + MatToolbarModule from '@angular/material/toolbar'.
+  Dialog → MatDialogModule or a template dialog; never leave MUI tags in Angular HTML.
+  EVERY name in \`@Component({ imports: [...] })\` MUST have a matching VALUE import
+  (not \`import type\`). Import each module from its secondary entry
+  (\`@angular/material/button\`, not the \`@angular/material\` barrel).
 `;
 
 /**

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { IGNORED_FOLDERS, TEXT_EXTENSIONS } from '../config/index.js';
+import { angularDestForReactSource, isReactBootstrapPath } from './reactToAngular.js';
 
 /**
  * Analyzer service — implements the "Repository Analyzer" + "Architecture
@@ -382,26 +383,27 @@ export function buildMigrationPlan(sourceAnalysis, referenceAnalysis, fromTech, 
   const plan = [];
 
   if (isAngularTarget) {
-    // Map React components → Angular pages under src/app/pages/admin
+    const seenUnits = new Set();
     for (const comp of sourceAnalysis.components || []) {
-      const base = path.posix.basename(comp.file).replace(/\.(tsx|jsx|ts)$/i, '');
-      const kebab = base
-        .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
-        .replace(/[^a-zA-Z0-9-]+/g, '-')
-        .toLowerCase();
-      const targetDir = `src/app/pages/admin/${kebab}`;
-      const targetBase = `${targetDir}/${kebab}.component`;
+      const file = String(comp.file || '').replace(/\\/g, '/');
+      if (isReactBootstrapPath(file)) continue;
+      const dest = angularDestForReactSource(file);
+      if (!dest || dest.kind !== 'component') continue;
+      if (seenUnits.has(dest.unit)) continue;
+      seenUnits.add(dest.unit);
       mappings.push({
-        source: comp.file,
+        source: file,
         sourceName: comp.name,
-        target: `${targetBase}.ts`,
+        target: dest.files[0],
         type: 'component',
       });
-      plan.push(
-        { newPath: `${targetBase}.ts`, complexity: 'medium', unit: targetBase },
-        { newPath: `${targetBase}.html`, complexity: 'medium', unit: targetBase },
-        { newPath: `${targetBase}.scss`, complexity: 'low', unit: targetBase },
-      );
+      for (const newPath of dest.files) {
+        plan.push({
+          newPath,
+          complexity: newPath.endsWith('.scss') ? 'low' : 'medium',
+          unit: dest.unit,
+        });
+      }
     }
     // Map React hooks → Angular services
     for (const hook of sourceAnalysis.hooks || []) {

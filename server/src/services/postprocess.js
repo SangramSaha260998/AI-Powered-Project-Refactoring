@@ -804,6 +804,231 @@ function sanitizeStandaloneImports(source) {
 }
 
 /**
+ * Secondary-entry map so decorator `imports: [MatButtonModule]` always has a
+ * matching VALUE import. NG1010 "Unknown reference" means the symbol is listed
+ * but not in scope (missing import, `import type`, or the old `@angular/material` barrel).
+ */
+const ANGULAR_NG_IMPORT_MAP = {
+  CommonModule: '@angular/common',
+  NgIf: '@angular/common',
+  NgFor: '@angular/common',
+  NgForOf: '@angular/common',
+  NgClass: '@angular/common',
+  NgStyle: '@angular/common',
+  AsyncPipe: '@angular/common',
+  FormsModule: '@angular/forms',
+  ReactiveFormsModule: '@angular/forms',
+  RouterOutlet: '@angular/router',
+  RouterLink: '@angular/router',
+  RouterLinkActive: '@angular/router',
+  MatButtonModule: '@angular/material/button',
+  MatButton: '@angular/material/button',
+  MatAnchor: '@angular/material/button',
+  MatIconButton: '@angular/material/button',
+  MatFabButton: '@angular/material/button',
+  MatMiniFabButton: '@angular/material/button',
+  MatIconModule: '@angular/material/icon',
+  MatIcon: '@angular/material/icon',
+  MatSidenavModule: '@angular/material/sidenav',
+  MatSidenav: '@angular/material/sidenav',
+  MatSidenavContainer: '@angular/material/sidenav',
+  MatSidenavContent: '@angular/material/sidenav',
+  MatToolbarModule: '@angular/material/toolbar',
+  MatToolbar: '@angular/material/toolbar',
+  MatFormFieldModule: '@angular/material/form-field',
+  MatFormField: '@angular/material/form-field',
+  MatLabel: '@angular/material/form-field',
+  MatInputModule: '@angular/material/input',
+  MatInput: '@angular/material/input',
+  MatSelectModule: '@angular/material/select',
+  MatSelect: '@angular/material/select',
+  MatOption: '@angular/material/core',
+  MatDialogModule: '@angular/material/dialog',
+  MatDialog: '@angular/material/dialog',
+  MatDialogTitle: '@angular/material/dialog',
+  MatDialogContent: '@angular/material/dialog',
+  MatDialogActions: '@angular/material/dialog',
+  MatDialogClose: '@angular/material/dialog',
+  MatTableModule: '@angular/material/table',
+  MatCardModule: '@angular/material/card',
+  MatCheckboxModule: '@angular/material/checkbox',
+  MatMenuModule: '@angular/material/menu',
+  MatListModule: '@angular/material/list',
+  MatDividerModule: '@angular/material/divider',
+  MatProgressSpinnerModule: '@angular/material/progress-spinner',
+  MatSnackBarModule: '@angular/material/snack-bar',
+  MatTooltipModule: '@angular/material/tooltip',
+  MatPaginatorModule: '@angular/material/paginator',
+  MatSortModule: '@angular/material/sort',
+  MatChipsModule: '@angular/material/chips',
+  MatTabsModule: '@angular/material/tabs',
+  MatSlideToggleModule: '@angular/material/slide-toggle',
+  MatRadioModule: '@angular/material/radio',
+  MatDatepickerModule: '@angular/material/datepicker',
+  MatNativeDateModule: '@angular/material/core',
+  MatAutocompleteModule: '@angular/material/autocomplete',
+  MatBadgeModule: '@angular/material/badge',
+  MatExpansionModule: '@angular/material/expansion'
+};
+
+function collectImportedValueNames(source) {
+  const names = new Set();
+  const text = String(source || '');
+  for (const m of text.matchAll(/import\s+(?!type\b)(?:[\w*\s,{}]+)\s+from\s*['"][^'"]+['"]/g)) {
+    const stmt = m[0];
+    const named = stmt.match(/\{([^}]*)\}/);
+    if (named) {
+      for (const part of named[1].split(',')) {
+        const raw = part.trim();
+        if (!raw || /^type\s+/.test(raw)) continue;
+        const bits = raw.split(/\s+as\s+/);
+        const ident = (bits[1] || bits[0]).trim();
+        if (ident) names.add(ident);
+      }
+    }
+    const def = stmt.match(/^import\s+(\w+)\s+from/);
+    if (def) names.add(def[1]);
+  }
+  return names;
+}
+
+function parseDecoratorImportItems(source) {
+  const m = String(source || '').match(
+    /@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[([^\]]*)\]/
+  );
+  if (!m) return [];
+  return m[1]
+    .split(',')
+    .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
+    .filter((s) => s && !s.startsWith('//') && s !== 'forwardRef');
+}
+
+function materialModulesNeededByHtml(html) {
+  const h = String(html || '');
+  const needed = [];
+  const add = (sym) => {
+    if (!needed.includes(sym)) needed.push(sym);
+  };
+  if (/<mat-sidenav\b|<mat-sidenav-container\b/.test(h)) add('MatSidenavModule');
+  if (/<mat-toolbar\b/.test(h)) add('MatToolbarModule');
+  if (
+    /\bmat-button\b|\bmat-flat-button\b|\bmat-icon-button\b|\bmat-raised-button\b|\bmat-stroked-button\b|\bmatButton\b/.test(
+      h
+    )
+  ) {
+    add('MatButtonModule');
+  }
+  if (/<mat-icon\b/.test(h)) add('MatIconModule');
+  if (/<mat-form-field\b|\bmatInput\b|<mat-label\b/.test(h)) {
+    add('MatFormFieldModule');
+    add('MatInputModule');
+  }
+  if (/<mat-select\b|<mat-option\b/.test(h)) add('MatSelectModule');
+  if (/<mat-dialog\b|\bmat-dialog-title\b|\bmat-dialog-content\b|\bmat-dialog-actions\b/.test(h)) {
+    add('MatDialogModule');
+  }
+  if (/<mat-table\b|\bmat-header-cell\b|\bmat-row\b/.test(h)) add('MatTableModule');
+  if (/<mat-card\b/.test(h)) add('MatCardModule');
+  if (/<mat-checkbox\b/.test(h)) add('MatCheckboxModule');
+  if (/<mat-menu\b/.test(h)) add('MatMenuModule');
+  if (/<mat-list\b/.test(h)) add('MatListModule');
+  if (/<mat-divider\b/.test(h)) add('MatDividerModule');
+  if (/<mat-progress-spinner\b|<mat-spinner\b/.test(h)) add('MatProgressSpinnerModule');
+  if (/\bmatTooltip\b/.test(h)) add('MatTooltipModule');
+  if (/<mat-paginator\b/.test(h)) add('MatPaginatorModule');
+  if (/<mat-tab\b|<mat-tab-group\b/.test(h)) add('MatTabsModule');
+  if (/<mat-slide-toggle\b/.test(h)) add('MatSlideToggleModule');
+  if (/<mat-radio-group\b|<mat-radio-button\b/.test(h)) add('MatRadioModule');
+  if (/<mat-chip\b|<mat-chip-set\b/.test(h)) add('MatChipsModule');
+  if (/<mat-accordion\b|<mat-expansion-panel\b/.test(h)) add('MatExpansionModule');
+  return needed;
+}
+
+function rewriteMaterialBarrelImports(source) {
+  return String(source || '').replace(
+    /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/material['"]\s*;?/g,
+    (full, names) => {
+      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
+      if (!parts.length) return full;
+      return parts
+        .map((part) => {
+          const bare = part.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+          const pkg = ANGULAR_NG_IMPORT_MAP[bare];
+          if (!pkg) return `import { ${part} } from '@angular/material';`;
+          return `import { ${bare} } from '${pkg}';`;
+        })
+        .join('\n');
+    }
+  );
+}
+
+function preferImportedMaterialSymbol(source, moduleName) {
+  const imported = collectImportedValueNames(source);
+  if (imported.has(moduleName)) return moduleName;
+  const standalone = String(moduleName).replace(/Module$/, '');
+  if (standalone !== moduleName && imported.has(standalone)) return standalone;
+  return moduleName;
+}
+
+/**
+ * Ensure every Material / Angular declarable used in the template or listed in
+ * `@Component({ imports })` has a value import and is present in that array.
+ */
+function syncNgComponentImports(source, html) {
+  if (!/@Component\s*\(/.test(source)) return source;
+  let updated = rewriteMaterialBarrelImports(source);
+  const imported = () => collectImportedValueNames(updated);
+  const local = new Set(
+    [...String(updated).matchAll(/\b(?:export\s+)?class\s+(\w+)/g)].map((m) => m[1])
+  );
+
+  const needed = [
+    ...materialModulesNeededByHtml(html),
+    ...parseDecoratorImportItems(updated).filter((name) => ANGULAR_NG_IMPORT_MAP[name])
+  ];
+
+  for (const raw of needed) {
+    const symbol = preferImportedMaterialSymbol(updated, raw);
+    const pkg = ANGULAR_NG_IMPORT_MAP[symbol] || ANGULAR_NG_IMPORT_MAP[raw];
+    if (!pkg) continue;
+    if (!imported().has(symbol) && !local.has(symbol)) {
+      updated = ensureImport(updated, symbol, pkg);
+    }
+    updated = ensureDecoratorImport(updated, symbol);
+    if (symbol !== raw) {
+      updated = updated.replace(
+        /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+        (full, start, mid, end) => {
+          const items = mid.split(',').map((s) => s.trim()).filter(Boolean);
+          const next = items.map((item) => (item === raw ? symbol : item));
+          return `${start}${[...new Set(next)].join(', ')}${end}`;
+        }
+      );
+    }
+  }
+
+  // Drop remaining unknown Mat*Module names that still have no value import
+  const stillImported = collectImportedValueNames(updated);
+  updated = updated.replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    (full, start, mid, end) => {
+      const items = mid
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((item) => {
+          const bare = item.split(/\s+as\s+/)[0].trim();
+          if (!/^Mat[A-Z]\w+Module$/.test(bare) && !/^Mat[A-Z]\w+$/.test(bare)) return true;
+          return stillImported.has(bare) || local.has(bare);
+        });
+      return `${start}${[...new Set(items)].join(', ')}${end}`;
+    }
+  );
+
+  return updated;
+}
+
+/**
  * Strip hallucinated React→Angular leftovers that break the compiler.
  */
 function repairHallucinatedAngularApis(source) {
@@ -1155,6 +1380,7 @@ function repairAngularComponentFile(tsPath, options = {}) {
   source = repairEmblaImports(source);
   source = repairHallucinatedAngularApis(source);
   source = sanitizeStandaloneImports(source);
+  source = rewriteMaterialBarrelImports(source);
 
   // import type { X } used as value — promote common Angular DI tokens
   const typeOnlyValueSymbols = ['DestroyRef', 'Injector', 'ElementRef', 'Renderer2', 'ChangeDetectorRef', 'NgZone', 'ViewContainerRef', 'TemplateRef'];
@@ -1389,6 +1615,7 @@ function repairAngularComponentFile(tsPath, options = {}) {
     source = ensureCountWhereHelper(source, html);
     source = repairFormBuilderInit(source);
     source = sanitizeStandaloneImports(source);
+    source = syncNgComponentImports(source, html);
     source = dedupeImports(source);
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
@@ -1396,6 +1623,8 @@ function repairAngularComponentFile(tsPath, options = {}) {
   // Prefer real @Input/@Output over heuristic stubs; fix strict-null field inits
   source = dedupeStubbedClassMembers(source);
   source = repairNullAssignedPrimitives(source);
+  source = syncNgComponentImports(source, readAllTemplates(source, tsPath));
+  source = dedupeImports(source);
 
   // Ensure default sibling css exists / is valid
   const cssFiles = new Set(
@@ -2192,6 +2421,54 @@ export function repairAngularWorkspace(destPath, options = {}) {
       console.warn(`[postprocess] Second-pass repair failed for ${file}: ${err.message}`);
     }
   }
+}
+
+/**
+ * Mechanical Angular compile repairs for NG1010 (unknown @Component imports)
+ * and missing Material modules referenced by the template.
+ */
+export function fixAngularCompileErrors(destPath, buildErrors) {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const needs =
+    /NG1010/.test(text) ||
+    /Unknown reference/.test(text) ||
+    /is not a known element/.test(text) ||
+    /is not a known attribute/.test(text) ||
+    /Cannot find name 'Mat/.test(text) ||
+    /has no exported member 'Mat/.test(text);
+  if (!needs) return 0;
+
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+  }
+
+  const srcRoot = path.join(destPath, 'src');
+  const targets = [];
+  for (const rel of mentioned) {
+    const full = path.join(destPath, rel);
+    if (fs.existsSync(full)) targets.push(full);
+  }
+  if (targets.length === 0) {
+    targets.push(
+      ...walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'))
+    );
+  }
+
+  let changed = 0;
+  for (const file of [...new Set(targets)]) {
+    if (!fs.existsSync(file)) continue;
+    const before = fs.readFileSync(file, 'utf-8');
+    try {
+      repairAngularComponentFile(file, {});
+    } catch (err) {
+      console.warn(`[postprocess] Angular compile repair failed for ${file}: ${err.message}`);
+      continue;
+    }
+    const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
+    if (after !== before) changed += 1;
+  }
+  return changed;
 }
 
 /**

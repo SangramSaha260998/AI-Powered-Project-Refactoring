@@ -27,7 +27,13 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors } from './postprocess.js';
+import {
+  angularDestForReactSource,
+  isReactBootstrapPath,
+  isMisplacedAngularAppComponentPath,
+  synthesizeAngularUnitFromReact
+} from './reactToAngular.js';
 
 // ---------------------------------------------------------------------------
 // Multi-key / multi-provider OpenAI clients — rotate keys, then providers
@@ -606,6 +612,31 @@ function isReactScaffoldPath(plannedPath) {
     /^src\/styles\.(scss|css)$/i.test(p) ||
     /^src\/vite-env\.d\.ts$/i.test(p) ||
     /^src\/app\.config\.(ts|tsx)$/i.test(p)
+  );
+}
+
+function isAngularTemplateOwnedPath(plannedPath) {
+  const p = String(plannedPath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  return (
+    /^src\/app\/app\.component\.(ts|html|scss|css)$/i.test(p) ||
+    /^src\/app\/app\.config\.ts$/i.test(p) ||
+    /^src\/main\.ts$/i.test(p) ||
+    /^src\/index\.html$/i.test(p) ||
+    /^src\/styles\.(scss|css)$/i.test(p)
+  );
+}
+
+function isIgnorableAngularUnit(unit) {
+  const label = String(unit?.label || '').replace(/\\/g, '/');
+  if (isMisplacedAngularAppComponentPath(label) || isAngularTemplateOwnedPath(label)) {
+    return true;
+  }
+  const files = Array.isArray(unit?.files) ? unit.files : [];
+  if (!files.length) return false;
+  return files.every(
+    (f) =>
+      isMisplacedAngularAppComponentPath(f.newPath) ||
+      isAngularTemplateOwnedPath(f.newPath)
   );
 }
 
@@ -1528,40 +1559,35 @@ function ensurePlanCoversAllSourceFiles(plan, filesMap, toTech) {
     if (kebab && coveredStems.has(kebab)) continue;
 
     if (isAngular) {
-      if (/\.(tsx|jsx)$/i.test(n)) {
-        const base = path.posix.basename(n).replace(/\.(tsx|jsx)$/i, '');
-        const kebab = toKebab(base.replace(/\.component$/i, ''));
-        const folder = n.includes('/lib/') || n.includes('/utils/')
-          ? `src/app/lib/${kebab}`
-          : `src/app/pages/${kebab}`;
-        const unit = `${folder}/${kebab}.component`;
-        for (const ext of ['.ts', '.html', '.scss']) {
-          const newPath = `${unit}${ext}`;
+      if (isReactBootstrapPath(n)) continue;
+      const dest = angularDestForReactSource(n);
+      if (!dest || dest.kind === 'style') continue;
+      if (dest.kind === 'component') {
+        for (const newPath of dest.files) {
           if (plannedPaths.has(newPath)) continue;
           plannedPaths.add(newPath);
           extras.push({
             newPath,
             explanationOfSource: `Complete conversion of ${n}`,
             approximateSourceFilesToRead: [rel],
-            complexity: ext === '.scss' ? 'low' : 'medium',
-            unit
+            complexity: newPath.endsWith('.scss') ? 'low' : 'medium',
+            unit: dest.unit
           });
         }
-      } else if (/\.(ts|js)$/i.test(n) && !/\.d\.ts$/i.test(n)) {
-        const base = path.posix.basename(n).replace(/\.(ts|js)$/i, '');
-        const kebab = toKebab(base);
-        const newPath = n.includes('/lib/') || n.includes('/utils/')
-          ? `src/lib/${kebab}.ts`
-          : `src/app/services/${kebab}.ts`;
-        if (plannedPaths.has(newPath)) continue;
-        plannedPaths.add(newPath);
+        if (dest.kebab) coveredStems.add(dest.kebab);
+        continue;
+      }
+      if ((dest.kind === 'model' || dest.kind === 'lib' || dest.kind === 'service') && dest.newPath) {
+        if (plannedPaths.has(dest.newPath)) continue;
+        plannedPaths.add(dest.newPath);
         extras.push({
-          newPath,
+          newPath: dest.newPath,
           explanationOfSource: `Complete conversion of ${n}`,
           approximateSourceFilesToRead: [rel],
           complexity: 'low',
-          unit: newPath
+          unit: dest.newPath
         });
+        continue;
       }
     } else {
       // React target: Angular component triads become one .tsx (+ optional .scss).
@@ -2919,6 +2945,15 @@ async function askAIToFixBuildErrors(sessionId, buildErrors, workspacePath, aiPr
     }
   }
   const filesContext = buildFilesContext(subset);
+  const isReactTarget = String(targetTech).toLowerCase().includes('react');
+  const isAngularTarget = String(targetTech).toLowerCase().includes('angular');
+  const libraryFixRules = isReactTarget
+    ? `- If errors mention @ngxs/store, @State, Store.dispatch, or Action classes: rewrite that store as zustand (\`create\`, useXStore hook). Never keep NGXS in React.
+- If errors mention @angular/material, mat-* tags, or MatDialog/MatSidenav: rewrite to @mui/material (Drawer, Dialog, AppBar, Toolbar, Button, IconButton, Icon).`
+    : isAngularTarget
+      ? `- NG1010 / "Unknown reference" on a name in @Component({ imports }) means that name is not imported as a VALUE. Add \`import { MatButtonModule } from '@angular/material/button'\` (and MatIconModule from '@angular/material/icon', MatSidenavModule, MatToolbarModule, etc.). Never \`import type\` for those symbols.
+- Do NOT rewrite Angular Material to MUI in an Angular project. Keep mat-* templates and @angular/material imports.`
+      : `- If a named import is missing, add the correct import — do not delete the feature.`;
   const fixPrompt = `The migrated ${targetTech} project has BUILD ERRORS. Fix ONLY the files causing errors.
 
 BUILD ERROR OUTPUT:
@@ -2941,8 +2976,7 @@ IMPORTANT RULES:
 - Prefer extending environment with the missing keys rather than casting.
 - Make the minimum changes needed to fix compilation errors.
 - Do NOT delete converted pages/features to silence errors — fix the actual type/template/import issue.
-- If errors mention @ngxs/store, @State, Store.dispatch, or Action classes: rewrite that store as zustand (\`create\`, useXStore hook). Never keep NGXS in React.
-- If errors mention @angular/material, mat-* tags, or MatDialog/MatSidenav: rewrite to @mui/material (Drawer, Dialog, AppBar, Toolbar, Button, IconButton, Icon).
+${libraryFixRules}
 - If a named import is missing, add the correct import — do not delete the feature.
 - Output ONLY valid JSON, no markdown fences.`;
 
@@ -3019,14 +3053,20 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
           continue;
         }
       }
-      console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
       if (isAngular) {
         const envPatched = patchEnvironmentMissingProps(workspacePath, result.errors);
         if (envPatched > 0) {
           console.log(`[${sessionId}] Patched ${envPatched} environment file(s). Retrying build...`);
           continue;
         }
+        const ngFixed = fixAngularCompileErrors(workspacePath, result.errors);
+        if (ngFixed > 0) {
+          repairAngularWorkspace(workspacePath, { sourceFilesMap });
+          console.log(`[${sessionId}] Mechanically fixed Angular compile errors in ${ngFixed} file(s). Retrying build...`);
+          continue;
+        }
       }
+      console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
       const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
       if (fixes.length === 0) {
         // Mechanical JSX rename may still save the build on the next attempt.
@@ -3820,6 +3860,10 @@ ${enhancedPrompt}`
       console.log(`[${sessionId}] Skipping React-shaped path in Angular migration: ${item.newPath}`);
       return false;
     }
+    if (targetLower.includes('angular') && isMisplacedAngularAppComponentPath(item.newPath)) {
+      console.log(`[${sessionId}] Skipping misplaced root App plan path: ${item.newPath}`);
+      return false;
+    }
     item.newPath = safe.relative;
     return true;
   });
@@ -3979,6 +4023,12 @@ Do not wrap the whole response in markdown fences. Each file must be complete.`;
       console.log(`[${sessionId}] Skipping React scaffold unit ${unit.label} (workspace template provides it)`);
       continue;
     }
+    if (targetLower.includes('angular') && isIgnorableAngularUnit(unit)) {
+      console.log(
+        `[${sessionId}] Skipping Angular scaffold/misplaced App unit ${unit.label} (template provides src/app/app.component)`
+      );
+      continue;
+    }
     report(
       'unit',
       `Converting unit ${unitIndex + 1}/${migrationUnits.length}: ${unit.label}`,
@@ -4059,6 +4109,17 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
         );
         if (attempt < maxUnitAttempts) {
           await pause(4000);
+        }
+      }
+    }
+
+    if (!bundleRaw || parsedFiles.length === 0) {
+      if (targetLower.includes('angular')) {
+        const synthesized = synthesizeAngularUnitFromReact(unit, essentialFilesMap);
+        if (synthesized.length > 0) {
+          parsedFiles = synthesized;
+          bundleRaw = 'synthesized-from-react-source';
+          console.log(`[${sessionId}] Synthesized Angular unit from React source: ${unit.label}`);
         }
       }
     }
@@ -4158,6 +4219,32 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       fs.writeFileSync(destFull, trimmedContent, 'utf-8');
       generatedFiles[destRel] = trimmedContent;
       console.log(`[${sessionId}]   Wrote ${destRel}`);
+    }
+    if (!wroteAllExpected && targetLower.includes('angular')) {
+      const synthesized = synthesizeAngularUnitFromReact(unit, essentialFilesMap);
+      for (const fileTarget of unit.files) {
+        const expected = fileTarget.newPath.replace(/\\/g, '/');
+        if (matchUnitBundleFile(parsedFiles, expected)) continue;
+        const syn = matchUnitBundleFile(synthesized, expected);
+        if (!syn) continue;
+        const safePath = resolveSafeWritePath(migrationWorkspacePath, expected);
+        if (!safePath) continue;
+        ensureDirectoryExists(path.dirname(safePath.full));
+        const trimmedContent = sanitizeGeneratedContent(safePath.relative, syn.content);
+        fs.writeFileSync(safePath.full, trimmedContent, 'utf-8');
+        generatedFiles[safePath.relative] = trimmedContent;
+        console.log(`[${sessionId}]   Wrote ${safePath.relative} (synthesized from React source)`);
+        parsedFiles.push(syn);
+      }
+      wroteAllExpected = unit.files.every((f) => {
+        const expected = f.newPath.replace(/\\/g, '/');
+        if (/\.(scss|css)$/i.test(expected)) return true;
+        return Boolean(
+          generatedFiles[expected] ||
+            matchUnitBundleFile(parsedFiles, expected) ||
+            fs.existsSync(path.join(migrationWorkspacePath, expected))
+        );
+      });
     }
     if (!wroteAllExpected) {
       skippedUnits.push({ index: unitIndex, label: `${unit.label} (incomplete file set)` });
@@ -4312,8 +4399,15 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     const defects = collectConversionDefects(migrationWorkspacePath);
     const missingPages = collectMissingSourcePages(migrationWorkspacePath, essentialFilesMap);
     const problems = [];
-    if (skippedUnits.length) {
-      problems.push(`skipped units: ${skippedUnits.map((s) => s.label || s).join(', ')}`);
+    const realSkips = skippedUnits.filter(
+      (s) =>
+        !isIgnorableAngularUnit({
+          label: s.label || s,
+          files: [{ newPath: s.label || s }]
+        })
+    );
+    if (realSkips.length) {
+      problems.push(`skipped units: ${realSkips.map((s) => s.label || s).join(', ')}`);
     }
     if (defects.placeholders.length) {
       problems.push(`placeholder templates: ${defects.placeholders.join(', ')}`);

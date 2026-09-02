@@ -27,7 +27,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages } from './postprocess.js';
 import {
   angularDestForReactSource,
   isReactBootstrapPath,
@@ -3059,9 +3059,17 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
           console.log(`[${sessionId}] Patched ${envPatched} environment file(s). Retrying build...`);
           continue;
         }
+        const materialPkgs = ensureAngularMaterialPackages(workspacePath, sourcePackageJson, sourceFilesMap);
         const ngFixed = fixAngularCompileErrors(workspacePath, result.errors);
+        if (materialPkgs > 0) {
+          console.log(`[${sessionId}] Added Angular Material packages. Installing dependencies...`);
+          await runCommand('npm', ['install'], workspacePath, 300000);
+          skipNpmInstall = true;
+          repairAngularWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson });
+          continue;
+        }
         if (ngFixed > 0) {
-          repairAngularWorkspace(workspacePath, { sourceFilesMap });
+          repairAngularWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson });
           console.log(`[${sessionId}] Mechanically fixed Angular compile errors in ${ngFixed} file(s). Retrying build...`);
           continue;
         }

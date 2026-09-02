@@ -3,6 +3,7 @@
  * Produces a standalone component triad from a function-component TSX file.
  */
 import path from 'path';
+import { declarablesNeededByHtml, inferDeclarablePackage } from './postprocess.js';
 
 export function isReactBootstrapPath(rel) {
   const p = String(rel || '').replace(/\\/g, '/');
@@ -443,20 +444,9 @@ function materialImportsForHtml(html) {
   const add = (mod, pkg) => {
     if (!mods.some((m) => m.mod === mod)) mods.push({ mod, pkg });
   };
-  if (/mat-sidenav/.test(html)) add('MatSidenavModule', '@angular/material/sidenav');
-  if (/mat-toolbar/.test(html)) add('MatToolbarModule', '@angular/material/toolbar');
-  if (/mat-button|mat-flat-button|mat-icon-button|mat-raised-button|mat-stroked-button|matButton/.test(html)) {
-    add('MatButtonModule', '@angular/material/button');
-  }
-  if (/<mat-icon\b/.test(html)) add('MatIconModule', '@angular/material/icon');
-  if (/mat-form-field|matInput|mat-select/.test(html)) {
-    add('MatFormFieldModule', '@angular/material/form-field');
-    add('MatInputModule', '@angular/material/input');
-  }
-  if (/mat-select|mat-option/.test(html)) add('MatSelectModule', '@angular/material/select');
-  if (/mat-dialog/.test(html)) add('MatDialogModule', '@angular/material/dialog');
-  if (/\bform\b/.test(html) && /ngSubmit|formGroup|ngModel/.test(html)) {
-    add('FormsModule', '@angular/forms');
+  for (const mod of declarablesNeededByHtml(html)) {
+    const pkg = inferDeclarablePackage(mod, '');
+    if (pkg) add(mod, pkg);
   }
   return mods;
 }

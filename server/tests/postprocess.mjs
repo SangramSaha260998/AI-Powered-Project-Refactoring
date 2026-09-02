@@ -30,7 +30,10 @@ import {
   ensureZustandStoreScaffold,
   pinSourceDomainArtifacts,
   ensureReactAppShell,
-  fixAngularCompileErrors
+  fixAngularCompileErrors,
+  ensureAngularMaterialPackages,
+  inferDeclarablePackage,
+  declarablesNeededByHtml
 } from '../src/services/postprocess.js';
 import { rewriteHtmlLucideToInlineSvg } from '../src/services/lucideInlineSvg.js';
 import {
@@ -599,6 +602,7 @@ export function TaskList() {
   assert(!isTruncatedSource('export function Foo() { return 1; }\n'), 'balanced file is not truncated');
   assert(detectSourceStack({}, { dependencies: { '@ngxs/store': '20', '@angular/material': '20' } }).ngxs, 'detects NGXS from package.json');
   assert(detectSourceStack({}, { dependencies: { '@angular/material': '20' } }).material, 'detects Material from package.json');
+  assert(detectSourceStack({}, { dependencies: { '@mui/material': '6' } }).material, 'detects Material from MUI package.json');
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-stack-'));
   fs.mkdirSync(path.join(tmp, 'src', 'pages'), { recursive: true });
@@ -1256,6 +1260,156 @@ export class TaskListComponent {}
 
   fs.rmSync(tmp, { recursive: true, force: true });
   fs.rmSync(tmp2, { recursive: true, force: true });
+}
+
+// --- Declarable packages are inferred from names / templates, not an allowlist ---
+{
+  assert(
+    inferDeclarablePackage('MatGridListModule') === '@angular/material/grid-list',
+    'MatGridListModule → @angular/material/grid-list by convention'
+  );
+  assert(
+    inferDeclarablePackage('MatTreeModule') === '@angular/material/tree',
+    'MatTreeModule → @angular/material/tree by convention'
+  );
+  assert(
+    inferDeclarablePackage('MatSidenavContainer') === '@angular/material/sidenav',
+    'MatSidenavContainer shares the sidenav entry'
+  );
+  assert(
+    inferDeclarablePackage('MatButtonModule') === '@angular/material/button',
+    'MatButtonModule → @angular/material/button by convention'
+  );
+  assert(
+    inferDeclarablePackage(
+      'MatBannerModule',
+      "import type { MatBannerModule } from '@angular/material/banner';"
+    ) === '@angular/material/banner',
+    'existing import path wins over name inference'
+  );
+  const htmlNeeded = declarablesNeededByHtml(
+    `<mat-tree></mat-tree><mat-grid-list cols="2"></mat-grid-list><button mat-flat-button type="button">Go</button>`
+  );
+  assert(htmlNeeded.includes('MatTreeModule'), 'template <mat-tree> needs MatTreeModule');
+  assert(htmlNeeded.includes('MatGridListModule'), 'template <mat-grid-list> needs MatGridListModule');
+  assert(htmlNeeded.includes('MatButtonModule'), 'mat-flat-button attribute needs MatButtonModule');
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng-infer-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'board');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'board.component.ts'),
+    `import { Component } from '@angular/core';
+import { type MatGridListModule } from '@angular/material/grid-list';
+import type { MatTreeModule } from '@angular/material/tree';
+
+@Component({
+  selector: 'app-board',
+  standalone: true,
+  imports: [MatGridListModule, MatTreeModule],
+  templateUrl: './board.component.html',
+  styleUrl: './board.component.scss'
+})
+export class BoardComponent {}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'board.component.html'),
+    `<mat-grid-list cols="2"><mat-tree></mat-tree></mat-grid-list>\n`
+  );
+  repairAngularComponentFile(path.join(dir, 'board.component.ts'));
+  const ts = fs.readFileSync(path.join(dir, 'board.component.ts'), 'utf-8');
+  assert(
+    /import\s*\{[^}]*\bMatGridListModule\b[^}]*\}\s*from\s*'@angular\/material\/grid-list'/.test(ts) &&
+      !/import\s*\{[^}]*\btype\s+MatGridListModule\b/.test(ts),
+    'inferred MatGridListModule is a value import'
+  );
+  assert(
+    /import\s*\{[^}]*\bMatTreeModule\b[^}]*\}\s*from\s*'@angular\/material\/tree'/.test(ts) &&
+      !/import\s+type\s*\{[^}]*\bMatTreeModule\b/.test(ts),
+    'inferred MatTreeModule is a value import'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng-packages-from-src-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'app', 'pages', 'board'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'package.json'),
+    JSON.stringify(
+      {
+        name: 'migrated-angular-project',
+        dependencies: { '@angular/core': '22.0.8', '@angular/common': '22.0.8' }
+      },
+      null,
+      2
+    )
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'angular.json'),
+    JSON.stringify(
+      {
+        projects: {
+          app: {
+            architect: {
+              build: { options: { styles: ['src/styles.scss'] } }
+            }
+          }
+        }
+      },
+      null,
+      2
+    )
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'index.html'),
+    `<!doctype html><html><head></head><body><app-root></app-root></body></html>\n`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app', 'pages', 'board', 'board.component.ts'),
+    `import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-board',
+  standalone: true,
+  imports: [MatGridListModule],
+  templateUrl: './board.component.html',
+  styleUrl: './board.component.scss'
+})
+export class BoardComponent {}
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app', 'pages', 'board', 'board.component.html'),
+    `<mat-grid-list cols="3"></mat-grid-list>\n`
+  );
+
+  repairAngularWorkspace(tmp, {
+    sourcePackageJson: { dependencies: { react: '^19.0.0' } },
+    sourceFilesMap: {}
+  });
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
+  assert(pkg.dependencies['@angular/material'], 'generated mat-* usage adds @angular/material');
+  assert(pkg.dependencies['@angular/cdk'], 'generated mat-* usage adds @angular/cdk');
+  assert(!pkg.dependencies['@mui/material'], 'MUI is not injected without MUI source');
+  const ts = fs.readFileSync(path.join(tmp, 'src', 'app', 'pages', 'board', 'board.component.ts'), 'utf-8');
+  assert(/from '@angular\/material\/grid-list'/.test(ts), 'value import inferred for MatGridListModule');
+  const added = ensureAngularMaterialPackages(tmp, {}, {});
+  assert(added === 0, 'material package ensure is idempotent');
+  const aj = JSON.parse(fs.readFileSync(path.join(tmp, 'angular.json'), 'utf-8'));
+  const styles = aj.projects.app.architect.build.options.styles;
+  assert(
+    styles.some((s) => String(s).includes('@angular/material/prebuilt-themes')),
+    'Material prebuilt theme is registered'
+  );
+  const indexHtml = fs.readFileSync(path.join(tmp, 'src', 'index.html'), 'utf-8');
+  assert(/Material\+Icons/.test(indexHtml), 'Material Icons font is linked in Angular index.html');
+
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 if (process.exitCode) {

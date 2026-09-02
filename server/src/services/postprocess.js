@@ -8,7 +8,7 @@ import {
   normalizeLucideSlug,
   resolveLucidePascalName
 } from './lucideInlineSvg.js';
-import { WEB_ANGULAR_PATH_ALIASES } from '../config/webAngular.js';
+import { WEB_ANGULAR_PATH_ALIASES, webAngularNpmDeps } from '../config/webAngular.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
@@ -172,20 +172,49 @@ export function collectMissingSourcePages(destPath, sourceFilesMap) {
 
 function ensureImport(source, symbol, fromModule) {
   const fromRe = fromModule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let updated = String(source || '');
+
+  // `import type { Symbol }` is erased — NG1010 Unknown reference in @Component({ imports }).
+  const typeImportRe = new RegExp(
+    `import\\s+type\\s*\\{([^}]*)\\}\\s*from\\s*['"]${fromRe}['"]\\s*;?`
+  );
+  if (typeImportRe.test(updated)) {
+    updated = updated.replace(typeImportRe, (full, names) => {
+      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
+      const has = parts.some(
+        (n) => n.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim() === symbol
+      );
+      if (!has) return full;
+      const remaining = parts.filter(
+        (n) => n.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim() !== symbol
+      );
+      const lines = [];
+      if (remaining.length) {
+        lines.push(`import type { ${remaining.join(', ')} } from '${fromModule}';`);
+      }
+      lines.push(`import { ${symbol} } from '${fromModule}';`);
+      return lines.join('\n');
+    });
+  }
+
   const existingRe = new RegExp(
     `import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${fromRe}['"]\\s*;?`,
     'g'
   );
 
   let symbolPresent = false;
-  let updated = source.replace(existingRe, (full, names) => {
+  updated = updated.replace(existingRe, (full, names) => {
     const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
     const bareNames = parts.map((n) => n.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim());
     if (bareNames.includes(symbol)) {
       symbolPresent = true;
-      return full;
+      // Promote `import { type Symbol }` to a value import
+      const next = parts.map((n) => {
+        const bare = n.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+        return bare === symbol ? n.replace(/^type\s+/, '') : n;
+      });
+      return `import { ${next.join(', ')} } from '${fromModule}';`;
     }
-    // Only augment the first import from this module
     if (symbolPresent) return full;
     symbolPresent = true;
     return `import { ${parts.concat(symbol).join(', ')} } from '${fromModule}';`;
@@ -194,7 +223,7 @@ function ensureImport(source, symbol, fromModule) {
   if (symbolPresent) return dedupeImports(updated);
 
   const line = `import { ${symbol} } from '${fromModule}';`;
-  const lastImport = [...updated.matchAll(/^import\s.+;$/gm)].pop();
+  const lastImport = [...updated.matchAll(/^import\s.+from\s*['"][^'"]+['"]\s*;?\s*$/gm)].pop();
   if (lastImport && lastImport.index !== undefined) {
     const insertAt = lastImport.index + lastImport[0].length;
     updated = `${updated.slice(0, insertAt)}\n${line}${updated.slice(insertAt)}`;
@@ -804,76 +833,153 @@ function sanitizeStandaloneImports(source) {
 }
 
 /**
- * Secondary-entry map so decorator `imports: [MatButtonModule]` always has a
- * matching VALUE import. NG1010 "Unknown reference" means the symbol is listed
- * but not in scope (missing import, `import type`, or the old `@angular/material` barrel).
+ * Infer the npm specifier for a standalone declarable from its name and any
+ * existing import (including `import type`). Driven by Angular naming rules,
+ * not a per-widget allowlist for a specific migrated app.
  */
-const ANGULAR_NG_IMPORT_MAP = {
+const NG_PLATFORM_PACKAGES = {
   CommonModule: '@angular/common',
   NgIf: '@angular/common',
   NgFor: '@angular/common',
   NgForOf: '@angular/common',
   NgClass: '@angular/common',
   NgStyle: '@angular/common',
+  NgSwitch: '@angular/common',
+  NgTemplateOutlet: '@angular/common',
   AsyncPipe: '@angular/common',
+  JsonPipe: '@angular/common',
+  DatePipe: '@angular/common',
   FormsModule: '@angular/forms',
   ReactiveFormsModule: '@angular/forms',
   RouterOutlet: '@angular/router',
   RouterLink: '@angular/router',
-  RouterLinkActive: '@angular/router',
-  MatButtonModule: '@angular/material/button',
-  MatButton: '@angular/material/button',
-  MatAnchor: '@angular/material/button',
-  MatIconButton: '@angular/material/button',
-  MatFabButton: '@angular/material/button',
-  MatMiniFabButton: '@angular/material/button',
-  MatIconModule: '@angular/material/icon',
-  MatIcon: '@angular/material/icon',
-  MatSidenavModule: '@angular/material/sidenav',
-  MatSidenav: '@angular/material/sidenav',
-  MatSidenavContainer: '@angular/material/sidenav',
-  MatSidenavContent: '@angular/material/sidenav',
-  MatToolbarModule: '@angular/material/toolbar',
-  MatToolbar: '@angular/material/toolbar',
-  MatFormFieldModule: '@angular/material/form-field',
-  MatFormField: '@angular/material/form-field',
-  MatLabel: '@angular/material/form-field',
-  MatInputModule: '@angular/material/input',
-  MatInput: '@angular/material/input',
-  MatSelectModule: '@angular/material/select',
-  MatSelect: '@angular/material/select',
-  MatOption: '@angular/material/core',
-  MatDialogModule: '@angular/material/dialog',
-  MatDialog: '@angular/material/dialog',
-  MatDialogTitle: '@angular/material/dialog',
-  MatDialogContent: '@angular/material/dialog',
-  MatDialogActions: '@angular/material/dialog',
-  MatDialogClose: '@angular/material/dialog',
-  MatTableModule: '@angular/material/table',
-  MatCardModule: '@angular/material/card',
-  MatCheckboxModule: '@angular/material/checkbox',
-  MatMenuModule: '@angular/material/menu',
-  MatListModule: '@angular/material/list',
-  MatDividerModule: '@angular/material/divider',
-  MatProgressSpinnerModule: '@angular/material/progress-spinner',
-  MatSnackBarModule: '@angular/material/snack-bar',
-  MatTooltipModule: '@angular/material/tooltip',
-  MatPaginatorModule: '@angular/material/paginator',
-  MatSortModule: '@angular/material/sort',
-  MatChipsModule: '@angular/material/chips',
-  MatTabsModule: '@angular/material/tabs',
-  MatSlideToggleModule: '@angular/material/slide-toggle',
-  MatRadioModule: '@angular/material/radio',
-  MatDatepickerModule: '@angular/material/datepicker',
-  MatNativeDateModule: '@angular/material/core',
-  MatAutocompleteModule: '@angular/material/autocomplete',
-  MatBadgeModule: '@angular/material/badge',
-  MatExpansionModule: '@angular/material/expansion'
+  RouterLinkActive: '@angular/router'
 };
+
+/** Material symbols whose secondary entry is not `MatFoo` → `@angular/material/foo`. */
+const MATERIAL_ENTRY_EXCEPTIONS = {
+  MatNativeDateModule: '@angular/material/core',
+  MatOption: '@angular/material/core',
+  MatRipple: '@angular/material/core',
+  MatRippleModule: '@angular/material/core',
+  MatLine: '@angular/material/core'
+};
+
+function pascalToKebab(name) {
+  return String(name || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
+    .toLowerCase();
+}
+
+function kebabToPascal(kebab) {
+  return String(kebab || '')
+    .split('-')
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join('');
+}
+
+function findImportPathForSymbol(source, symbol) {
+  const text = String(source || '');
+  const re = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
+  for (const m of text.matchAll(re)) {
+    const names = m[1]
+      .split(',')
+      .map((s) => s.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    if (names.includes(symbol)) return m[2];
+  }
+  return null;
+}
+
+function inferMaterialPackage(symbol) {
+  if (MATERIAL_ENTRY_EXCEPTIONS[symbol]) return MATERIAL_ENTRY_EXCEPTIONS[symbol];
+  if (!/^Mat[A-Z]/.test(symbol)) return null;
+  let rest = symbol.replace(/^Mat/, '').replace(/Module$/, '');
+  if (
+    /^(Button|IconButton|FabButton|MiniFabButton|Anchor|Fab|MiniFab)$/.test(rest)
+  ) {
+    return '@angular/material/button';
+  }
+  rest = rest.replace(
+    /(Container|Content|Title|Actions|Close|Header|Footer|HeaderCell|HeaderRow|FooterCell|FooterRow|Row|Cell|Group|Panel|Item|Trigger|Outlet)$/,
+    ''
+  );
+  if (!rest) return null;
+  if (/^(Chip|Chips|ChipSet|ChipList)$/.test(rest)) return '@angular/material/chips';
+  if (/^(Tab|Tabs|TabGroup)$/.test(rest)) return '@angular/material/tabs';
+  if (/^(Spinner|ProgressSpinner)$/.test(rest)) return '@angular/material/progress-spinner';
+  if (/^(Accordion|ExpansionPanel|Expansion)$/.test(rest)) return '@angular/material/expansion';
+  if (/^(Label|Hint|Error|Prefix|Suffix|FormField)$/.test(rest)) {
+    return '@angular/material/form-field';
+  }
+  if (rest === 'RadioButton') return '@angular/material/radio';
+  const kebab = pascalToKebab(rest);
+  return kebab ? `@angular/material/${kebab}` : null;
+}
+
+export function inferDeclarablePackage(symbol, source = '') {
+  if (!symbol || !/^[A-Z]/.test(symbol)) return null;
+  const existing = findImportPathForSymbol(source, symbol);
+  if (existing && !existing.startsWith('.') && existing !== '@angular/material') {
+    return existing;
+  }
+  if (NG_PLATFORM_PACKAGES[symbol]) return NG_PLATFORM_PACKAGES[symbol];
+  return inferMaterialPackage(symbol);
+}
+
+function moduleFromMatFeature(featureKebab) {
+  let feature = String(featureKebab || '').toLowerCase();
+  if (feature === 'icon-button' || /^(flat|raised|stroked)-button$/.test(feature)) {
+    return 'MatButtonModule';
+  }
+  feature = feature.replace(
+    /-(container|content|title|actions|close|header|footer|header-cell|header-row|footer-cell|footer-row|row|cell|group|panel|item|trigger|outlet)$/,
+    ''
+  );
+  if (feature.endsWith('-button') && feature !== 'icon') {
+    feature = feature.replace(/-button$/, '');
+  }
+  if (/^chip/.test(feature)) return 'MatChipsModule';
+  if (/^tab/.test(feature)) return 'MatTabsModule';
+  if (feature === 'spinner' || feature === 'progress-spinner') return 'MatProgressSpinnerModule';
+  if (feature === 'accordion' || feature === 'expansion-panel') return 'MatExpansionModule';
+  if (['label', 'hint', 'error', 'prefix', 'suffix'].includes(feature)) return 'MatFormFieldModule';
+  if (feature === 'option') return 'MatSelectModule';
+  const pascal = kebabToPascal(feature);
+  return pascal ? `Mat${pascal}Module` : null;
+}
+
+export function declarablesNeededByHtml(html) {
+  const h = String(html || '');
+  const needed = [];
+  const add = (sym) => {
+    if (sym && !needed.includes(sym)) needed.push(sym);
+  };
+  for (const m of h.matchAll(/<mat-([a-z0-9-]+)/gi)) {
+    add(moduleFromMatFeature(m[1]));
+  }
+  if (
+    /\bmat-(?:flat-|raised-|stroked-|icon-)?button\b|\bmatButton\b|\bmat-fab\b|\bmat-mini-fab\b/.test(
+      h
+    )
+  ) {
+    add('MatButtonModule');
+  }
+  for (const m of h.matchAll(/\bmat([A-Z][A-Za-z]+)\b/g)) {
+    add(`Mat${m[1]}Module`);
+  }
+  if (/\bform\b/.test(h) && /ngSubmit|formGroup|ngModel/.test(h)) add('FormsModule');
+  return needed;
+}
 
 function collectImportedValueNames(source) {
   const names = new Set();
-  const text = String(source || '');
+  const text = String(source || '')
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
   for (const m of text.matchAll(/import\s+(?!type\b)(?:[\w*\s,{}]+)\s+from\s*['"][^'"]+['"]/g)) {
     const stmt = m[0];
     const named = stmt.match(/\{([^}]*)\}/);
@@ -903,47 +1009,6 @@ function parseDecoratorImportItems(source) {
     .filter((s) => s && !s.startsWith('//') && s !== 'forwardRef');
 }
 
-function materialModulesNeededByHtml(html) {
-  const h = String(html || '');
-  const needed = [];
-  const add = (sym) => {
-    if (!needed.includes(sym)) needed.push(sym);
-  };
-  if (/<mat-sidenav\b|<mat-sidenav-container\b/.test(h)) add('MatSidenavModule');
-  if (/<mat-toolbar\b/.test(h)) add('MatToolbarModule');
-  if (
-    /\bmat-button\b|\bmat-flat-button\b|\bmat-icon-button\b|\bmat-raised-button\b|\bmat-stroked-button\b|\bmatButton\b/.test(
-      h
-    )
-  ) {
-    add('MatButtonModule');
-  }
-  if (/<mat-icon\b/.test(h)) add('MatIconModule');
-  if (/<mat-form-field\b|\bmatInput\b|<mat-label\b/.test(h)) {
-    add('MatFormFieldModule');
-    add('MatInputModule');
-  }
-  if (/<mat-select\b|<mat-option\b/.test(h)) add('MatSelectModule');
-  if (/<mat-dialog\b|\bmat-dialog-title\b|\bmat-dialog-content\b|\bmat-dialog-actions\b/.test(h)) {
-    add('MatDialogModule');
-  }
-  if (/<mat-table\b|\bmat-header-cell\b|\bmat-row\b/.test(h)) add('MatTableModule');
-  if (/<mat-card\b/.test(h)) add('MatCardModule');
-  if (/<mat-checkbox\b/.test(h)) add('MatCheckboxModule');
-  if (/<mat-menu\b/.test(h)) add('MatMenuModule');
-  if (/<mat-list\b/.test(h)) add('MatListModule');
-  if (/<mat-divider\b/.test(h)) add('MatDividerModule');
-  if (/<mat-progress-spinner\b|<mat-spinner\b/.test(h)) add('MatProgressSpinnerModule');
-  if (/\bmatTooltip\b/.test(h)) add('MatTooltipModule');
-  if (/<mat-paginator\b/.test(h)) add('MatPaginatorModule');
-  if (/<mat-tab\b|<mat-tab-group\b/.test(h)) add('MatTabsModule');
-  if (/<mat-slide-toggle\b/.test(h)) add('MatSlideToggleModule');
-  if (/<mat-radio-group\b|<mat-radio-button\b/.test(h)) add('MatRadioModule');
-  if (/<mat-chip\b|<mat-chip-set\b/.test(h)) add('MatChipsModule');
-  if (/<mat-accordion\b|<mat-expansion-panel\b/.test(h)) add('MatExpansionModule');
-  return needed;
-}
-
 function rewriteMaterialBarrelImports(source) {
   return String(source || '').replace(
     /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/material['"]\s*;?/g,
@@ -953,8 +1018,10 @@ function rewriteMaterialBarrelImports(source) {
       return parts
         .map((part) => {
           const bare = part.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
-          const pkg = ANGULAR_NG_IMPORT_MAP[bare];
-          if (!pkg) return `import { ${part} } from '@angular/material';`;
+          const pkg = inferDeclarablePackage(bare, '');
+          if (!pkg || pkg === '@angular/material') {
+            return `import { ${part} } from '@angular/material';`;
+          }
           return `import { ${bare} } from '${pkg}';`;
         })
         .join('\n');
@@ -971,7 +1038,7 @@ function preferImportedMaterialSymbol(source, moduleName) {
 }
 
 /**
- * Ensure every Material / Angular declarable used in the template or listed in
+ * Ensure every declarable used in the template or listed in
  * `@Component({ imports })` has a value import and is present in that array.
  */
 function syncNgComponentImports(source, html) {
@@ -982,14 +1049,14 @@ function syncNgComponentImports(source, html) {
     [...String(updated).matchAll(/\b(?:export\s+)?class\s+(\w+)/g)].map((m) => m[1])
   );
 
-  const needed = [
-    ...materialModulesNeededByHtml(html),
-    ...parseDecoratorImportItems(updated).filter((name) => ANGULAR_NG_IMPORT_MAP[name])
-  ];
+  const fromDecorator = parseDecoratorImportItems(updated).filter(
+    (name) => /^[A-Z]/.test(name) && !local.has(name)
+  );
+  const needed = [...declarablesNeededByHtml(html), ...fromDecorator];
 
   for (const raw of needed) {
     const symbol = preferImportedMaterialSymbol(updated, raw);
-    const pkg = ANGULAR_NG_IMPORT_MAP[symbol] || ANGULAR_NG_IMPORT_MAP[raw];
+    const pkg = inferDeclarablePackage(symbol, updated) || inferDeclarablePackage(raw, updated);
     if (!pkg) continue;
     if (!imported().has(symbol) && !local.has(symbol)) {
       updated = ensureImport(updated, symbol, pkg);
@@ -1007,7 +1074,6 @@ function syncNgComponentImports(source, html) {
     }
   }
 
-  // Drop remaining unknown Mat*Module names that still have no value import
   const stillImported = collectImportedValueNames(updated);
   updated = updated.replace(
     /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
@@ -1019,6 +1085,7 @@ function syncNgComponentImports(source, html) {
         .filter((item) => {
           const bare = item.split(/\s+as\s+/)[0].trim();
           if (!/^Mat[A-Z]\w+Module$/.test(bare) && !/^Mat[A-Z]\w+$/.test(bare)) return true;
+          if (inferDeclarablePackage(bare, updated)) return true;
           return stillImported.has(bare) || local.has(bare);
         });
       return `${start}${[...new Set(items)].join(', ')}${end}`;
@@ -1918,6 +1985,7 @@ function isReactEcosystemPackage(name) {
   if (n === 'nitro' || n.startsWith('nitro') || n === 'nitropack') return true;
   if (n.startsWith('@hookform/')) return true;
   if (n.startsWith('@radix-ui/')) return true;
+  if (n.startsWith('@mui/') || n.startsWith('@emotion/')) return true;
   if (n === 'cmdk' || n === 'vaul' || n === 'sonner' || n === 'input-otp' || n === 'next') return true;
   return false;
 }
@@ -2333,6 +2401,103 @@ function ensureOutputsFromParentEventBindings(destPath) {
   }
 }
 
+function workspaceUsesAngularMaterial(destPath, sourcePackageJson = null, sourceFilesMap = null) {
+  const stack = detectSourceStack(sourceFilesMap || {}, sourcePackageJson);
+  if (stack.material) return true;
+  const srcRoot = path.join(destPath, 'src');
+  if (!fs.existsSync(srcRoot)) return false;
+  for (const file of walkFiles(
+    srcRoot,
+    (n) => n.endsWith('.ts') || n.endsWith('.html') || n.endsWith('.scss')
+  )) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    if (
+      /@angular\/material/.test(content) ||
+      /<(mat-[\w-]+)\b/.test(content) ||
+      /\bmat-[a-z][\w-]*\b/.test(content)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureMaterialTheme(destPath) {
+  const theme = '@angular/material/prebuilt-themes/azure-blue.css';
+  const angularJsonPath = path.join(destPath, 'angular.json');
+  if (fs.existsSync(angularJsonPath)) {
+    try {
+      const aj = JSON.parse(fs.readFileSync(angularJsonPath, 'utf-8'));
+      const project = aj?.projects && Object.values(aj.projects)[0];
+      if (project?.architect?.build?.options) {
+        const styles = Array.isArray(project.architect.build.options.styles)
+          ? [...project.architect.build.options.styles]
+          : [];
+        if (!styles.some((s) => String(s).includes('@angular/material/prebuilt-themes'))) {
+          styles.unshift(theme);
+          project.architect.build.options.styles = styles;
+          fs.writeFileSync(angularJsonPath, `${JSON.stringify(aj, null, 2)}\n`, 'utf-8');
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * React MUI (and generated mat-* templates) need @angular/material in the
+ * converted workspace. The AI is forbidden from writing package.json, so the
+ * migrator must add the packages or NG1010 / Cannot find module never clears.
+ * Returns how many packages were added.
+ */
+export function ensureAngularMaterialPackages(destPath, sourcePackageJson = null, sourceFilesMap = null) {
+  if (!workspaceUsesAngularMaterial(destPath, sourcePackageJson, sourceFilesMap)) return 0;
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+  const core = pkg.dependencies['@angular/core'] || '22.0.8';
+  const kit = webAngularNpmDeps(core);
+  let added = 0;
+  for (const name of ['@angular/material', '@angular/cdk']) {
+    if (!pkg.dependencies[name]) {
+      pkg.dependencies[name] = kit.dependencies[name];
+      added += 1;
+    }
+  }
+  if (!pkg.dependencies['@angular/animations'] && kit.dependencies['@angular/cdk']) {
+    pkg.dependencies['@angular/animations'] = core;
+  }
+  if (added) writeJson(pkgPath, pkg);
+  ensureMaterialTheme(destPath);
+  ensureMaterialIconsLink(destPath);
+  return added;
+}
+
+function ensureNgSymbolsFromBuildErrors(source, buildErrors) {
+  let updated = String(source || '');
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const inDecorator = new Set(parseDecoratorImportItems(updated));
+  const seen = new Set();
+  for (const m of text.matchAll(/\b([A-Z][A-Za-z0-9]*)\b/g)) {
+    const symbol = m[1];
+    if (seen.has(symbol)) continue;
+    seen.add(symbol);
+    if (!inDecorator.has(symbol) && !/^Mat[A-Z]/.test(symbol)) continue;
+    const pkg = inferDeclarablePackage(symbol, updated);
+    if (!pkg) continue;
+    updated = ensureImport(updated, symbol, pkg);
+    updated = ensureDecoratorImport(updated, symbol);
+  }
+  return updated;
+}
+
 export function repairAngularWorkspace(destPath, options = {}) {
   const { sourceFilesMap = null, sourcePackageJson = null } = options;
 
@@ -2340,6 +2505,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   copySourceLibs(destPath, sourceFilesMap);
   ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
+  ensureAngularMaterialPackages(destPath, sourcePackageJson, sourceFilesMap);
 
   const componentFiles = walkFiles(path.join(destPath, 'src'), (name) =>
     name.endsWith('.component.ts')
@@ -2465,7 +2631,12 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       console.warn(`[postprocess] Angular compile repair failed for ${file}: ${err.message}`);
       continue;
     }
-    const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
+    let after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
+    const forced = ensureNgSymbolsFromBuildErrors(after, text);
+    if (forced !== after) {
+      fs.writeFileSync(file, forced.endsWith('\n') ? forced : `${forced}\n`, 'utf-8');
+      after = forced;
+    }
     if (after !== before) changed += 1;
   }
   return changed;
@@ -2786,7 +2957,10 @@ export function detectSourceStack(filesMap = {}, sourcePackageJson = null) {
   const fileBlob = Object.values(filesMap || {}).join('\n');
   const blob = `${pkgBlob}\n${fileBlob}`;
   return {
-    material: /@angular\/material/.test(blob) || /\bMat(Button|Icon|Sidenav|Dialog|Toolbar|FormField)/.test(blob),
+    material:
+      /@angular\/material/.test(blob) ||
+      /@mui\/(material|icons-material)/.test(blob) ||
+      /\bMat(Button|Icon|Sidenav|Dialog|Toolbar|FormField)/.test(blob),
     ngxs: /@ngxs\/store/.test(blob) || /\b(StateContext|provideStore|@State)\b/.test(blob),
     lucide: /lucide-angular|@lucide\/angular|lucide-react/.test(blob)
   };
@@ -4776,8 +4950,12 @@ function ensureReactPackagesFromImports(destPath, sourceStack = {}) {
 }
 
 function ensureMaterialIconsLink(destPath) {
-  const indexPath = path.join(destPath, 'index.html');
-  if (!fs.existsSync(indexPath)) return;
+  const candidates = [
+    path.join(destPath, 'src', 'index.html'),
+    path.join(destPath, 'index.html')
+  ];
+  const indexPath = candidates.find((p) => fs.existsSync(p));
+  if (!indexPath) return;
   let html = fs.readFileSync(indexPath, 'utf-8');
   if (/fonts\.googleapis\.com\/icon\?family=Material\+Icons/.test(html)) return;
   if (!html.includes('</head>')) return;
@@ -4801,7 +4979,18 @@ export function addPackagesFromBuildErrors(destPath, buildErrors) {
   const text = String(buildErrors || '');
   for (const m of text.matchAll(/Cannot find module ['"]([^'"]+)['"]/g)) {
     const pkgName = packageNameFromSpecifier(m[1]);
-    if (!pkgName || pkgName.startsWith('@angular/') || pkgName.startsWith('@ngxs/')) continue;
+    if (!pkgName || pkgName.startsWith('@ngxs/')) continue;
+    if (pkgName === '@angular/material' || pkgName === '@angular/cdk') {
+      if (pkg.dependencies['@angular/core'] || pkg.devDependencies?.['@angular/core']) {
+        added += ensureAngularMaterialPackages(destPath);
+        const latest = readJsonSafe(pkgPath);
+        if (latest?.dependencies) {
+          pkg.dependencies = { ...pkg.dependencies, ...latest.dependencies };
+        }
+      }
+      continue;
+    }
+    if (pkgName.startsWith('@angular/')) continue;
     const version = REACT_KNOWN_PACKAGES[pkgName];
     if (!version) continue;
     if (pkgName === 'react' || pkgName === 'react-dom' || pkgName === 'vite') continue;

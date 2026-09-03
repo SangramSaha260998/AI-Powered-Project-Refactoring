@@ -65,13 +65,16 @@ export function angularDestForReactSource(rel) {
     const kebab = toKebabName(fileBase.replace(/\.component$/i, ''));
     const dir = path.posix.dirname(n);
     let folder;
+    // Preserve feature-module trees:
+    // pages/<area>/<feature>/pages|components/... → src/app/pages/...
+    // shared components/... → src/app/components/...
     if (/^src\/pages(\/|$)/i.test(dir)) folder = dir.replace(/^src\/pages/i, 'src/app/pages');
     else if (/^src\/components(\/|$)/i.test(dir)) {
       folder = dir.replace(/^src\/components/i, 'src/app/components');
     } else if (/^src\/features(\/|$)/i.test(dir)) {
       folder = dir.replace(/^src\/features/i, 'src/app/pages');
     } else {
-      folder = `src/app/pages/${kebab}`;
+      folder = `src/app/pages/app/${kebab}/pages/${kebab}`;
     }
     const unit = `${folder}/${kebab}.component`;
     return {
@@ -479,6 +482,195 @@ function materialImportsForHtml(html) {
   return mods;
 }
 
+function formFieldStates(states) {
+  return (states || []).filter(
+    (st) =>
+      st?.name &&
+      !/Touched$|Error$|^open$|Open$|^show|^hide|^loading|^disabled/i.test(st.name) &&
+      !/^boolean$/i.test(String(st.type || ''))
+  );
+}
+
+function defaultsFromFormFields(fields) {
+  const entries = fields.map((f) => {
+    let init = f.init;
+    if (init === 'null' || init === 'undefined') init = "''";
+    return `    ${f.name}: [${init}]`;
+  });
+  return entries.join(',\n');
+}
+
+/** Rewrite a form template to [formGroup] + formControlName (never ngModel). */
+export function htmlToReactiveForm(html, fields) {
+  let h = String(html || '');
+  const names = (fields || []).map((f) => f.name).filter(Boolean);
+  if (!names.length || !/<form\b/i.test(h)) return h;
+
+  h = h.replace(/<form\b([^>]*)>/i, (full, attrs) => {
+    let a = String(attrs || '');
+    a = a.replace(/\s*\[formGroup\]="[^"]*"/g, '');
+    a += ' [formGroup]="form"';
+    return `<form${a}>`;
+  });
+
+  for (const name of names) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    h = h.replace(
+      new RegExp(
+        `<(input|textarea)\\b([^>]*?(?:\\[value\\]="\\s*${esc}\\s*"|\\[\\(ngModel\\)\\]="\\s*${esc}\\s*"|formControlName="${esc}")[^>]*?)(\\s*\\/?)>`,
+        'gi'
+      ),
+      (full, tag, attrs, slash) => {
+        let a = attrs
+          .replace(new RegExp(`\\s*\\[value\\]="\\s*${esc}\\s*"`, 'g'), '')
+          .replace(new RegExp(`\\s*\\[\\(ngModel\\)\\]="\\s*${esc}\\s*"`, 'g'), '')
+          .replace(new RegExp(`\\s*\\[ngModel\\]="\\s*${esc}\\s*"`, 'g'), '')
+          .replace(/\s*\(input\)="[^"]*"/g, '')
+          .replace(/\s*\(ngModelChange\)="[^"]*"/g, '')
+          .replace(/\s*\(change\)="[^"]*"/g, '')
+          .replace(new RegExp(`\\s*name="\\s*${esc}\\s*"`, 'g'), '')
+          .replace(/\s*formControlName="[^"]*"/g, '');
+        a += ` formControlName="${name}"`;
+        return `<${tag}${a}${slash || ''}>`;
+      }
+    );
+    h = h.replace(/<mat-select\b([^>]*)>/gi, (full, attrs) => {
+      if (
+        !new RegExp(
+          `\\[value\\]="\\s*${esc}\\s*"|\\[\\(ngModel\\)\\]="\\s*${esc}\\s*"|formControlName="${esc}"`
+        ).test(attrs)
+      ) {
+        return full;
+      }
+      let a = attrs
+        .replace(new RegExp(`\\s*\\[value\\]="\\s*${esc}\\s*"`, 'g'), '')
+        .replace(new RegExp(`\\s*\\[\\(ngModel\\)\\]="\\s*${esc}\\s*"`, 'g'), '')
+        .replace(/\s*\(selectionChange\)="[^"]*"/g, '')
+        .replace(/\s*\(ngModelChange\)="[^"]*"/g, '')
+        .replace(new RegExp(`\\s*name="\\s*${esc}\\s*"`, 'g'), '')
+        .replace(/\s*formControlName="[^"]*"/g, '');
+      a += ` formControlName="${name}"`;
+      return `<mat-select${a}>`;
+    });
+    h = h.replace(
+      new RegExp(`\\(blur\\)="${esc}Touched\\s*=\\s*true"`, 'g'),
+      `(blur)="form.controls['${name}'].markAsTouched()"`
+    );
+  }
+
+  h = h.replace(/\s*\[\(ngModel\)\]="[^"]*"/g, '');
+  h = h.replace(/\s*\[ngModel\]="[^"]*"/g, '');
+  return h;
+}
+
+function rewriteFormMethodBody(body, fields) {
+  let inner = String(body || '');
+  for (const f of fields) {
+    const esc = f.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    inner = inner.replace(
+      new RegExp(`this\\.${esc}\\.trim\\(\\)`, 'g'),
+      `String(this.form.value.${f.name} ?? '').trim()`
+    );
+    inner = inner.replace(
+      new RegExp(`(?<!['"\\w.])this\\.${esc}\\b`, 'g'),
+      `this.form.value.${f.name}`
+    );
+    inner = inner.replace(
+      new RegExp(`this\\.${esc}Touched\\s*=\\s*true`, 'g'),
+      `this.form.controls['${f.name}'].markAsTouched()`
+    );
+  }
+  inner = inner.replace(
+    /if\s*\(\s*String\(this\.form\.value\.(\w+)\s*\?\?\s*''\)\.trim\(\)\s*===\s*''\s*\)\s*\{/g,
+    (full, name) =>
+      `if (this.form.controls['${name}']?.invalid || String(this.form.value.${name} ?? '').trim() === '') {\n      this.form.markAllAsTouched();`
+  );
+  return inner;
+}
+
+/** Inside `if (this.foo) { ... this.foo.bar ... }`, capture a local to satisfy TS2531. */
+function narrowNullableThisAccess(body) {
+  const src = String(body || '');
+  const re = /if\s*\(\s*this\.(\w+)\s*\)\s*\{/g;
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(src))) {
+    const name = m[1];
+    const openBrace = m.index + m[0].length - 1;
+    let depth = 0;
+    let i = openBrace;
+    for (; i < src.length; i++) {
+      if (src[i] === '{') depth += 1;
+      else if (src[i] === '}') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (i >= src.length) break;
+    const block = src.slice(openBrace + 1, i);
+    out += src.slice(last, m.index);
+    if (
+      new RegExp(`this\\.${name}\\.`).test(block) &&
+      !new RegExp(`const\\s+\\w+\\s*=\\s*this\\.${name}\\b`).test(block)
+    ) {
+      const local = `current${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+      const rewritten = block.replace(new RegExp(`this\\.${name}\\b`, 'g'), local);
+      out += `if (this.${name}) {\n    const ${local} = this.${name};${rewritten}}`;
+    } else {
+      out += src.slice(m.index, i + 1);
+    }
+    last = i + 1;
+    re.lastIndex = last;
+  }
+  out += src.slice(last);
+  return out;
+}
+
+function buildReactiveFormClassPieces({ fields, entityProp, needsOnChanges }) {
+  const groupBody = defaultsFromFormFields(fields);
+  const resetDefaults = fields
+    .map((f) => {
+      let init = f.init;
+      if (init === 'null' || init === 'undefined') init = "''";
+      return `      ${f.name}: ${init}`;
+    })
+    .join(',\n');
+  const patchFromEntity = fields
+    .map((f) => `        ${f.name}: this.${entityProp}.${f.name}`)
+    .join(',\n');
+
+  const decls = [
+    '  private readonly fb = inject(FormBuilder);',
+    `  readonly form = this.fb.nonNullable.group({\n${groupBody}\n  });`
+  ];
+
+  const methods = [];
+  methods.push(`  resetForm(): void {
+    this.form.reset({
+${resetDefaults}
+    });
+  }`);
+
+  let onChanges = '';
+  if (needsOnChanges && entityProp) {
+    onChanges = `
+  ngOnChanges(changes: SimpleChanges): void {
+    if (!changes['${entityProp}']) return;
+    if (this.${entityProp}) {
+      this.form.patchValue({
+${patchFromEntity}
+      });
+    } else {
+      this.resetForm();
+    }
+  }
+`;
+  }
+
+  return { decls, methods, onChanges };
+}
+
 function childComponentImports(html, fromFile) {
   const found = [...html.matchAll(/<(app-[\w-]+)/g)].map((m) => m[1]);
   const unique = [...new Set(found)];
@@ -518,13 +710,19 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   const states = parseUseState(tsx);
   const props = parseProps(tsx);
   const body = extractComponentBody(tsx);
-  const methods = extractMethods(body, states);
+  let methods = extractMethods(body, states);
   const moduleConsts = [...tsx.matchAll(/^const\s+([A-Z_][A-Z0-9_]*)[^=]*=\s*([\s\S]*?);$/gm)];
+  const formFields = formFieldStates(states);
+  const useReactiveForm = /<form\b/i.test(html) && formFields.length > 0;
+  if (useReactiveForm) {
+    html = htmlToReactiveForm(html, formFields);
+  }
 
   const tsPath = info.files[0];
   const ngModules = materialImportsForHtml(html);
   const children = childComponentImports(html, tsPath);
   const needsOnChanges = /useEffect\(/.test(tsx) && props.names.length > 0;
+  const entity = primaryEntityProp(props);
   const modelImportLines = [];
   for (const m of String(tsx || '').matchAll(
     /import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]([^'"]*models\/[^'"]+)['"]/g
@@ -538,18 +736,13 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
     );
   }
 
-  const importLines = [
-    `import { Component${needsOnChanges ? ', Input, Output, EventEmitter, OnChanges, SimpleChanges' : props.fields.length ? ', Input, Output, EventEmitter' : ''} } from '@angular/core';`
-  ];
-  if (props.fields.length && !needsOnChanges) {
-    /* inputs already in Component import */
-  }
-  if (!props.fields.length && !needsOnChanges) {
-    importLines[0] = `import { Component } from '@angular/core';`;
-  } else if (props.fields.length && needsOnChanges) {
-    importLines[0] = `import { Component, Input, Output, EventEmitter, OnChanges, SimpleChanges } from '@angular/core';`;
-  } else if (props.fields.length) {
-    importLines[0] = `import { Component, Input, Output, EventEmitter } from '@angular/core';`;
+  const coreBits = ['Component'];
+  if (props.fields.length) coreBits.push('Input', 'Output', 'EventEmitter');
+  if (needsOnChanges) coreBits.push('OnChanges', 'SimpleChanges');
+  if (useReactiveForm) coreBits.push('inject');
+  const importLines = [`import { ${[...new Set(coreBits)].join(', ')} } from '@angular/core';`];
+  if (useReactiveForm) {
+    importLines.push(`import { FormBuilder, ReactiveFormsModule } from '@angular/forms';`);
   }
   for (const mod of ngModules) {
     importLines.push(`import { ${mod.mod} } from '${mod.pkg}';`);
@@ -563,6 +756,9 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
     ...ngModules.map((m) => m.mod),
     ...children.map((c) => c.className)
   ];
+  if (useReactiveForm && !ngImports.includes('ReactiveFormsModule')) {
+    ngImports.push('ReactiveFormsModule');
+  }
 
   const inputDecls = [];
   const outputDecls = [];
@@ -601,7 +797,30 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
     }
   }
 
-  const stateDecls = states.map((st) => `  ${st.name}: ${st.type} = ${st.init};`);
+  const formFieldNames = new Set(formFields.map((f) => f.name));
+  const touchedNames = new Set(
+    states.filter((s) => /Touched$/.test(s.name)).map((s) => s.name)
+  );
+  const stateDecls = useReactiveForm
+    ? states
+        .filter((st) => !formFieldNames.has(st.name) && !touchedNames.has(st.name))
+        .map((st) => `  ${st.name}: ${st.type} = ${st.init};`)
+    : states.map((st) => `  ${st.name}: ${st.type} = ${st.init};`);
+
+  let reactiveDecls = [];
+  let reactiveMethods = [];
+  let onChanges = '';
+  if (useReactiveForm) {
+    const pieces = buildReactiveFormClassPieces({
+      fields: formFields,
+      entityProp: entity?.name || null,
+      needsOnChanges
+    });
+    reactiveDecls = pieces.decls;
+    reactiveMethods = pieces.methods;
+    onChanges = pieces.onChanges;
+  }
+
   const extraFields = [];
   for (const m of String(tsx || '').matchAll(/\b([A-Z][A-Z0-9]*_STATUS_(?:LABELS|OPTIONS))\b/g)) {
     const alias = /LABELS$/.test(m[1]) ? 'statusLabels' : 'statusOptions';
@@ -618,13 +837,55 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
       );
     }
   }
+  if (useReactiveForm) {
+    for (const f of formFields) {
+      const errName = `${f.name}Error`;
+      if (new RegExp(`\\b${errName}\\b`).test(html) || new RegExp(`\\b${errName}\\b`).test(tsx)) {
+        getters.push(
+          `  get ${errName}(): boolean {\n    const c = this.form.controls['${f.name}'];\n    return !!(c && c.touched && String(c.value ?? '').trim() === '');\n  }`
+        );
+      }
+    }
+  }
 
-  const constDecls = moduleConsts.map((m) => `const ${m[1]} = ${m[2]};`);
+  const constDecls = moduleConsts.map((m) => {
+    const name = m[1];
+    const value = m[2];
+    const entityFromImport = modelImportLines
+      .map((line) => line.match(/import\s+\{([^}]+)\}/)?.[1] || '')
+      .join(',')
+      .split(',')
+      .map((s) => s.replace(/\btype\s+/g, '').trim())
+      .find((s) => /^[A-Z]/.test(s) && !/Status$|Draft$|Labels$|Options$/i.test(s));
+    if (
+      entityFromImport &&
+      /status\s*:/.test(value) &&
+      /^\s*\[/.test(value.trim())
+    ) {
+      return `const ${name}: ${entityFromImport}[] = ${value};`;
+    }
+    return `const ${name} = ${value};`;
+  });
   const thisNames = [
-    ...states.map((s) => s.name),
+    ...(useReactiveForm
+      ? states.filter((s) => !formFieldNames.has(s.name) && !touchedNames.has(s.name)).map((s) => s.name)
+      : states.map((s) => s.name)),
     ...props.fields.map((f) => f.name),
     ...methods.map((m) => m.name)
   ];
+
+  if (useReactiveForm) {
+    methods = methods.map((fn) => ({
+      ...fn,
+      body: rewriteFormMethodBody(fn.body, formFields)
+    }));
+    // Cancel / close should reset the form
+    methods = methods.map((fn) => {
+      if (!/^(onCancel|closeSidebar|handleCancel)$/.test(fn.name)) return fn;
+      if (/\bresetForm\s*\(/.test(fn.body)) return fn;
+      return { ...fn, body: `this.resetForm();\n${fn.body}` };
+    });
+  }
 
   const methodText = [
     ...methods.map((fn) => {
@@ -643,6 +904,7 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
           `this.${n}`
         );
       }
+      inner = narrowNullableThisAccess(inner);
       inner = inner.replace(/\bthis\.this\./g, 'this.');
       inner = inner
         .split('\n')
@@ -650,13 +912,12 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
         .join('\n');
       return `  ${fn.name}(${fn.args}): void {\n${inner}\n  }`;
     }),
+    ...reactiveMethods,
     ...emitWrappers,
     ...getters
   ].join('\n\n');
 
-  let onChanges = '';
-  if (needsOnChanges) {
-    const entity = primaryEntityProp(props);
+  if (!useReactiveForm && needsOnChanges) {
     if (entity) {
       const formStates = states.filter(
         (st) => !/Touched$|Error$|^open$/.test(st.name) && !/boolean/.test(st.type)
@@ -694,7 +955,7 @@ ${constDecls.length ? `\n${constDecls.join('\n')}\n` : ''}
   styleUrl: './${info.kebab}.component.scss'
 })
 export class ${info.className}${implementsClause} {
-${[...inputDecls, ...outputDecls, ...stateDecls, ...extraFields].filter(Boolean).join('\n')}
+${[...inputDecls, ...outputDecls, ...reactiveDecls, ...stateDecls, ...extraFields].filter(Boolean).join('\n')}
 ${onChanges}
 ${methodText}
 }

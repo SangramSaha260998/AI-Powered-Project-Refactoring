@@ -398,7 +398,11 @@ export class TaskFormSidebarComponent {
   const html = fs.readFileSync(path.join(dir, 'task-form-sidebar.component.html'), 'utf-8');
   const ts = fs.readFileSync(path.join(dir, 'task-form-sidebar.component.ts'), 'utf-8');
   assert(/\(click\)="onCancel\(\)"/.test(html), 'restore retargets handleCancel to onCancel');
-  assert(/\[\(ngModel\)\]="title"/.test(html) || /title\s*=\s*\$any/.test(html), 'restore wires title input to state');
+  assert(
+    /formControlName="title"/.test(html) || /\[formGroup\]="form"/.test(html),
+    'restore wires title input via reactive form'
+  );
+  assert(!/\[\(ngModel\)\]/.test(html), 'restore does not use ngModel');
   assert(!/handleCancel\(\.\.\._args/.test(ts), 'restore drops unused handleCancel stub');
 
   fs.rmSync(tmp, { recursive: true, force: true });

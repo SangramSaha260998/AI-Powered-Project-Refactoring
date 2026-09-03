@@ -31,6 +31,7 @@ import {
   pinSourceDomainArtifacts,
   ensureReactAppShell,
   fixAngularCompileErrors,
+  repairAngularStrictNullAndStatusTypes,
   ensureAngularMaterialPackages,
   inferDeclarablePackage,
   declarablesNeededByHtml,
@@ -1909,15 +1910,157 @@ export class ItemEditorComponent implements OnChanges {
   const html = fs.readFileSync(path.join(dir, 'item-editor.component.html'), 'utf-8');
   assert(/\(click\)="onCancel\(\)"/.test(html), 'handleCancel is retargeted to onCancel');
   assert(!/handleCancel\(/.test(html), 'stub handleCancel is gone from template');
-  assert(/\[\(ngModel\)\]="title"/.test(html), 'title input uses ngModel');
-  assert(/\bname="title"/.test(html), 'ngModel title has a name');
-  assert(/\[\(ngModel\)\]="description"/.test(html), 'description uses ngModel');
-  assert(/\[\(ngModel\)\]="status"/.test(html), 'status select uses ngModel');
-  assert(/titleTouched = true/.test(html), 'blur marks titleTouched');
+  assert(/\[formGroup\]="form"/.test(html), 'form uses reactive [formGroup]');
+  assert(/formControlName="title"/.test(html), 'title input uses formControlName');
+  assert(/formControlName="description"/.test(html), 'description uses formControlName');
+  assert(/formControlName="status"/.test(html), 'status select uses formControlName');
+  assert(!/\[\(ngModel\)\]/.test(html), 'ngModel is not used');
+  assert(/titleTouched|markAsTouched/.test(html), 'blur marks title touched');
   assert(!/\(submit\)=/.test(html), 'native submit is dropped when ngSubmit exists');
-  assert(/get titleError\(\)/.test(ts), 'titleError becomes a getter from titleTouched');
+  assert(/get titleError\(\)/.test(ts), 'titleError becomes a getter from form control');
+  assert(/ReactiveFormsModule/.test(ts), 'ReactiveFormsModule is imported');
+  assert(/readonly form\s*=/.test(ts) || /form\s*=\s*this\.fb/.test(ts), 'FormGroup is declared');
   assert(!/handleCancel\(\.\.\._args/.test(ts), 'unused handleCancel stub is removed');
   assert(!/onTitleInput\(\.\.\._args/.test(ts), 'unused onTitleInput stub is removed');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-strict-null-status-'));
+  const pageDir = path.join(tmp, 'src', 'app', 'pages', 'item-list');
+  const modelDir = path.join(tmp, 'src', 'app', 'models');
+  fs.mkdirSync(pageDir, { recursive: true });
+  fs.mkdirSync(modelDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelDir, 'item.model.ts'),
+    `export type ItemStatus = 'todo' | 'in-progress' | 'done';
+export interface Item { id: string; title: string; description: string; status: ItemStatus; }
+export type ItemDraft = Omit<Item, 'id'>;
+`
+  );
+  fs.writeFileSync(
+    path.join(pageDir, 'item-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { Item, ItemDraft } from '../../models/item.model';
+
+const INITIAL_ITEMS = [
+  { id: '1', title: 'A', description: '', status: 'done' },
+  { id: '2', title: 'B', description: '', status: 'todo' }
+];
+
+@Component({
+  selector: 'app-item-list',
+  standalone: true,
+  templateUrl: './item-list.component.html'
+})
+export class ItemListComponent {
+  items: Item[] = [...INITIAL_ITEMS];
+  editingItem: Item | null = null;
+
+  onSave(draft: ItemDraft): void {
+    if (this.editingItem) {
+      this.items = this.items.map((item) =>
+        item.id === this.editingItem.id ? { ...item, ...draft } : item
+      );
+    } else {
+      this.items = [...this.items, { ...draft, id: crypto.randomUUID() }];
+    }
+  }
+}
+`
+  );
+  fs.writeFileSync(path.join(pageDir, 'item-list.component.html'), `<div></div>\n`);
+
+  const errText = `TS2322: Type '{ id: string; title: string; description: string; status: string; }[]' is not assignable to type 'Item[]'.
+Type '{ id: string; title: string; description: string; status: string; }' is not assignable to type 'Item'.
+Types of property 'status' are incompatible. Type 'string' is not assignable to type 'ItemStatus'.
+[plugin angular-compiler] src/app/pages/item-list/item-list.component.ts:18:2:
+  items: Item[] = [...INITIAL_ITEMS];
+TS2531: Object is possibly 'null'.
+[plugin angular-compiler] src/app/pages/item-list/item-list.component.ts:24:20:
+  item.id === this.editingItem.id ? { ...item, ...draft } : item
+`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  assert(n >= 1, 'fixAngularCompileErrors repairs TS2322/TS2531 status and null issues');
+  const ts = fs.readFileSync(path.join(pageDir, 'item-list.component.ts'), 'utf-8');
+  assert(/const INITIAL_ITEMS:\s*Item\[\]\s*=/.test(ts), 'INITIAL_ITEMS is annotated as Item[]');
+  assert(
+    /const currentEditingItem\s*=\s*this\.editingItem/.test(ts),
+    'nullable this.editingItem is captured locally'
+  );
+  assert(
+    /item\.id === currentEditingItem\.id/.test(ts),
+    'map callback uses narrowed local instead of this.editingItem'
+  );
+  assert(!/this\.editingItem\.id/.test(ts), 'this.editingItem.id is gone from nested callback');
+
+  const n2 = repairAngularStrictNullAndStatusTypes(tmp, errText);
+  assert(n2 === 0, 'strict-null/status repair is idempotent');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-reactive-bogus-'));
+  const dir = path.join(tmp, 'src', 'app', 'components', 'item-editor');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.ts'),
+    `import { Component, Input, Output, EventEmitter, OnChanges, SimpleChanges, inject } from '@angular/core';
+import { FormBuilder, Reactive, ReactiveFormsModule, FormsModule } from '@angular/forms';
+import { MatInputModule } from '@angular/material/input';
+import { Item, ItemDraft } from '../../models/item.model';
+
+@Component({
+  selector: 'app-item-editor',
+  standalone: true,
+  imports: [MatInputModule, Reactive, ReactiveFormsModule, FormsModule],
+  templateUrl: './item-editor.component.html'
+})
+export class ItemEditorComponent implements OnChanges {
+  @Input() item: Item | null = null;
+  @Output() save = new EventEmitter<ItemDraft>();
+  @Output() cancel = new EventEmitter<unknown>();
+  private readonly fb = inject(FormBuilder);
+  readonly form = this.fb.nonNullable.group({ title: [''], description: [''], status: ['todo'] });
+  ngOnChanges(changes: SimpleChanges): void {
+    if (!changes['item']) return;
+    if (this.item) this.form.patchValue(this.item);
+    else this.form.reset({ title: '', description: '', status: 'todo' });
+  }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.html'),
+    `<form [formGroup]="form" (ngSubmit)="save.emit(form.getRawValue())">
+  <input matInput formControlName="title" />
+  <button type="submit">Save</button>
+</form>
+`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2305: Module '"@angular/forms"' has no exported member 'Reactive'.
+[plugin angular-compiler] src/app/components/item-editor/item-editor.component.ts:2:22:
+  import { FormBuilder, Reactive, ReactiveFormsModule, FormsModule } from '@angular/forms';
+NG1010: 'imports' must be an array of components, directives, pipes, or NgModules. Value could not be determined statically.
+[plugin angular-compiler] src/app/components/item-editor/item-editor.component.ts:10:30:
+  imports: [MatInputModule, Reactive, ReactiveFormsModule, FormsModule],
+Unknown reference.
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs bogus Reactive import');
+  const ts = fs.readFileSync(path.join(dir, 'item-editor.component.ts'), 'utf-8');
+  assert(!/\bReactive\b/.test(ts.replace(/ReactiveFormsModule/g, '')), 'bare Reactive symbol is removed');
+  assert(/ReactiveFormsModule/.test(ts), 'ReactiveFormsModule remains');
+  assert(!/imports:\s*\[[^\]]*Reactive\s*,/.test(ts), 'bare Reactive is gone from decorator imports');
+
+  // Regression: upgrading to reactive forms must not mangle ReactiveFormsModule → Reactive
+  repairAngularComponentFile(path.join(dir, 'item-editor.component.ts'), {});
+  const ts2 = fs.readFileSync(path.join(dir, 'item-editor.component.ts'), 'utf-8');
+  assert(/ReactiveFormsModule/.test(ts2), 'repair keeps ReactiveFormsModule intact');
+  assert(!/\bReactive\b/.test(ts2.replace(/ReactiveFormsModule/g, '')), 'repair does not reintroduce bare Reactive');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

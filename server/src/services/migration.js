@@ -3840,8 +3840,8 @@ List each file on a new line, starting with "src/".
 Use PascalCase .tsx for UI (never Angular .component.ts / .html / .scss).
 Example:
 src/App.tsx
-src/pages/HostPage.tsx
-src/components/item-editor/ItemEditor.tsx
+src/pages/admin/tasks/pages/task-list/TaskList.tsx
+src/pages/admin/tasks/components/item-editor/ItemEditor.tsx
 src/components/confirm-dialog/ConfirmDialog.tsx
 
 LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
@@ -4129,7 +4129,7 @@ CRITICAL RULES:
 29. app.routes.ts must import page components from their real files, never from './app.component'. Always \`export const routes\`. Include a route for every converted page.
 30. Form error checks: use errors?.['required'] / errors?.['minlength'] bracket access.
 31. HTML must be balanced and complete — no truncated templates (Unexpected EOF).
-32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow a clean folder structure (Angular: src/app with pages/components/services; React: components|features|hooks|lib|services) and high code quality.
+32. TARGET VERSION: Obey the TARGET VERSION MANDATE block exactly. If the user prompt names Angular/React version → that version; else latest stable. Never write a different major into package.json. Follow the feature-module folder structure (Angular: src/app/pages/<area>/<feature>/pages|components + shared src/app/components; React: src/pages/<area>/<feature>/pages|components + shared src/components). Angular forms must use Reactive Forms and reset add/edit sidebars on close. High code quality.
 33. Do NOT generate app.module.ts for modern Angular — standalone only. Child <app-*> components must be in the parent imports array.
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.

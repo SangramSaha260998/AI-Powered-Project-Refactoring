@@ -327,6 +327,24 @@ function ensureDecoratorImport(source, symbol) {
   return source.replace(/(@Component\s*\(\s*\{)/, `$1\n  imports: [${symbol}],`);
 }
 
+function removeDecoratorImport(source, symbol) {
+  if (!/@Component\s*\(/.test(source)) return source;
+  return source.replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    (full, start, mid, end) => {
+      const items = mid
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((item) => {
+          const bare = item.split(/\s+as\s+/)[0].trim();
+          return bare !== symbol;
+        });
+      return `${start}${items.join(', ')}${end}`;
+    }
+  );
+}
+
 function ensureStandaloneTrue(source) {
   if (!/@Component\s*\(/.test(source)) return source;
   if (/\bstandalone\s*:/.test(source)) {
@@ -652,8 +670,8 @@ function fieldFromBlurHandler(name) {
 
 /**
  * AI templates often call handleCancel / onTitleInput stubs while the class
- * already has onCancel() and a `title` field. Retarget those bindings so the
- * migrated UI actually updates state.
+ * already has onCancel() and form fields. Retarget bindings and always wire
+ * controls with Reactive Forms ([formGroup] + formControlName), never ngModel.
  */
 export function repairInferredTemplateHandlers(source, html) {
   let src = String(source || '');
@@ -693,53 +711,144 @@ export function repairInferredTemplateHandlers(source, html) {
       if (!stub) return full;
       if (evt === 'blur') {
         const field = fieldFromBlurHandler(handler);
-        if (field && classHasMember(src, `${field}Touched`)) {
-          return `(blur)="${field}Touched = true"`;
+        if (field && (classHasMember(src, `${field}Touched`) || /\bform\b/.test(src))) {
+          return `(blur)="form.controls['${field}'].markAsTouched()"`;
         }
-        return full;
       }
-      const field = fieldFromValueHandler(handler);
-      if (!field || !classHasMember(src, field)) return full;
-      if (evt === 'selectionChange') return `(${evt})="${field} = $event.value"`;
-      return `(${evt})="${field} = $any($event.target).value"`;
+      return full;
     }
   );
 
-  const upgradeControl = (attrs, field, eventName) => {
-    let next = attrs;
-    if (new RegExp(`\\[\\(ngModel\\)\\]\\s*=\\s*"${field}"`).test(next)) {
-      next = next.replace(new RegExp(`\\s*\\(${eventName}\\)="[^"]*"`), '');
-      if (!/\bname\s*=/.test(next)) next += ` name="${field}"`;
-      return next;
-    }
-    next = next.replace(/\s*\[value\]="[^"]*"/, '');
-    next = next.replace(new RegExp(`\\s*\\(${eventName}\\)="[^"]*"`), '');
-    next += ` [(ngModel)]="${field}"`;
-    if (!/\bname\s*=/.test(next)) next += ` name="${field}"`;
+  const upgradeToFormControl = (attrs, field) => {
+    let next = String(attrs || '')
+      .replace(/\s*\[value\]="[^"]*"/g, '')
+      .replace(/\s*\[\(ngModel\)\]="[^"]*"/g, '')
+      .replace(/\s*\[ngModel\]="[^"]*"/g, '')
+      .replace(/\s*\(input\)="[^"]*"/g, '')
+      .replace(/\s*\(change\)="[^"]*"/g, '')
+      .replace(/\s*\(ngModelChange\)="[^"]*"/g, '')
+      .replace(/\s*\(selectionChange\)="[^"]*"/g, '')
+      .replace(new RegExp(`\\s*name="\\s*${field}\\s*"`, 'g'), '')
+      .replace(/\s*formControlName="[^"]*"/g, '');
+    next += ` formControlName="${field}"`;
     return next;
   };
 
-  out = out.replace(
-    /<(input|textarea|select)\b([^>]*?)\s*(\/?)>/gi,
-    (full, tag, attrs, slash) => {
-      const valueField =
-        attrs.match(/\[value\]="\s*(\w+)\s*"/)?.[1] ||
-        attrs.match(/\[\(ngModel\)\]="\s*(\w+)\s*"/)?.[1];
-      if (!valueField || !classHasMember(src, valueField)) return full;
-      const eventName = tag.toLowerCase() === 'select' ? 'change' : 'input';
-      const next = upgradeControl(attrs, valueField, eventName);
-      const close = slash ? ' /' : '';
-      return `<${tag}${next}${close}>`;
-    }
+  const boundFields = new Set();
+  for (const m of out.matchAll(/\[value\]="\s*(\w+)\s*"/g)) boundFields.add(m[1]);
+  for (const m of out.matchAll(/\[\(ngModel\)\]="\s*(\w+)\s*"/g)) boundFields.add(m[1]);
+  for (const m of out.matchAll(/formControlName="\s*(\w+)\s*"/g)) boundFields.add(m[1]);
+  const fields = [...boundFields].filter(
+    (name) =>
+      name &&
+      !/Touched$|Error$|^open$/i.test(name) &&
+      (classHasMember(src, name) || /formControlName=/.test(out) || /\[value\]=/.test(out))
   );
 
-  out = out.replace(/<mat-select\b([^>]*?)>/gi, (full, attrs) => {
-    const valueField =
-      attrs.match(/\[value\]="\s*(\w+)\s*"/)?.[1] ||
-      attrs.match(/\[\(ngModel\)\]="\s*(\w+)\s*"/)?.[1];
-    if (!valueField || !classHasMember(src, valueField)) return full;
-    return `<mat-select${upgradeControl(attrs, valueField, 'selectionChange')}>`;
-  });
+  if (/<form\b/i.test(out) && fields.length) {
+    const hasForm =
+      /\breadonly form\b/.test(src) ||
+      (/\bform\s*[!=:]/.test(src) && /FormGroup|FormBuilder|fb\./.test(src));
+    if (!hasForm) {
+      src = ensureImport(src, 'inject', '@angular/core');
+      src = ensureImport(src, 'FormBuilder', '@angular/forms');
+      const group = fields
+        .map((name) => {
+          const initMatch = src.match(
+            new RegExp(
+              `^[\\t ]*(?:public|protected|private|readonly\\s+)*${name}\\s*(?:!\\s*)?:[^=\\n]*=\\s*([^;]+);`,
+              'm'
+            )
+          );
+          let init = (initMatch?.[1] || "''").trim();
+          if (init === 'null' || init === 'undefined') init = "''";
+          return `    ${name}: [${init}]`;
+        })
+        .join(',\n');
+      const resetBody = fields
+        .map((name) => {
+          const initMatch = src.match(
+            new RegExp(
+              `^[\\t ]*(?:public|protected|private|readonly\\s+)*${name}\\s*(?:!\\s*)?:[^=\\n]*=\\s*([^;]+);`,
+              'm'
+            )
+          );
+          let init = (initMatch?.[1] || "''").trim();
+          if (init === 'null' || init === 'undefined') init = "''";
+          return `      ${name}: ${init}`;
+        })
+        .join(',\n');
+      src = insertIntoClassBody(
+        src,
+        `  private readonly fb = inject(FormBuilder);\n  readonly form = this.fb.nonNullable.group({\n${group}\n  });\n  resetForm(): void {\n    this.form.reset({\n${resetBody}\n    });\n  }`
+      );
+      for (const name of fields) {
+        src = src.replace(
+          new RegExp(
+            `^[ \\t]*(?:public|protected|private|readonly\\s+)*${name}\\s*(?:!\\s*)?:[^;\\n]+;\\s*\\n?`,
+            'gm'
+          ),
+          ''
+        );
+        src = src.replace(
+          new RegExp(
+            `^[ \\t]*(?:public|protected|private|readonly\\s+)*${name}Touched\\s*(?:!\\s*)?:[^;\\n]+;\\s*\\n?`,
+            'gm'
+          ),
+          ''
+        );
+      }
+    } else if (!/\bresetForm\s*\(/.test(src)) {
+      const resetBody = fields.map((name) => `      ${name}: ''`).join(',\n');
+      src = insertIntoClassBody(
+        src,
+        `  resetForm(): void {\n    this.form.reset({\n${resetBody}\n    });\n  }`
+      );
+    }
+
+    out = out.replace(/<form\b([^>]*)>/i, (full, attrs) => {
+      let a = String(attrs || '').replace(/\s*\[formGroup\]="[^"]*"/g, '');
+      a += ' [formGroup]="form"';
+      return `<form${a}>`;
+    });
+
+    out = out.replace(
+      /<(input|textarea|select)\b([^>]*?)\s*(\/?)>/gi,
+      (full, tag, attrs, slash) => {
+        const valueField =
+          attrs.match(/\[value\]="\s*(\w+)\s*"/)?.[1] ||
+          attrs.match(/\[\(ngModel\)\]="\s*(\w+)\s*"/)?.[1] ||
+          attrs.match(/formControlName="\s*(\w+)\s*"/)?.[1];
+        if (!valueField || !fields.includes(valueField)) return full;
+        const close = slash ? ' /' : '';
+        return `<${tag}${upgradeToFormControl(attrs, valueField)}${close}>`;
+      }
+    );
+    out = out.replace(/<mat-select\b([^>]*?)>/gi, (full, attrs) => {
+      const valueField =
+        attrs.match(/\[value\]="\s*(\w+)\s*"/)?.[1] ||
+        attrs.match(/\[\(ngModel\)\]="\s*(\w+)\s*"/)?.[1] ||
+        attrs.match(/formControlName="\s*(\w+)\s*"/)?.[1];
+      if (!valueField || !fields.includes(valueField)) return full;
+      return `<mat-select${upgradeToFormControl(attrs, valueField)}>`;
+    });
+    out = out.replace(
+      /\(blur\)="(\w+)Touched\s*=\s*true"/g,
+      (_, field) => `(blur)="form.controls['${field}'].markAsTouched()"`
+    );
+
+    src = ensureImport(src, 'ReactiveFormsModule', '@angular/forms');
+    src = ensureDecoratorImport(src, 'ReactiveFormsModule');
+    src = removeNamedImport(src, 'FormsModule', '@angular/forms');
+    src = removeDecoratorImport(src, 'FormsModule');
+    // Must not match the FormsModule suffix of ReactiveFormsModule
+    src = src.replace(/(?<![A-Za-z0-9_]),?\s*FormsModule\b/g, '');
+    src = src.replace(/imports\s*:\s*\[\s*,/g, 'imports: [');
+    src = src.replace(/,\s*\]/g, ']');
+  }
+
+  out = out.replace(/\[\(ngModel\)\]="[^"]*"/g, '');
+  out = out.replace(/\[ngModel\]="[^"]*"/g, '');
 
   out = out.replace(/<form\b([^>]*?)>/gi, (full, attrs) => {
     if (!/\(ngSubmit\)=/.test(attrs)) return full;
@@ -751,18 +860,24 @@ export function repairInferredTemplateHandlers(source, html) {
     /^[ \t]*(?:public|protected|private|readonly\s+)*(\w+)Error\s*(?:!\s*)?:\s*any\s*=\s*(?:null|false)\s*;\s*$/gm
   )) {
     const base = m[1];
-    if (!classHasMember(src, base) || !classHasMember(src, `${base}Touched`)) continue;
     if (new RegExp(`\\bget\\s+${base}Error\\s*\\(`).test(src)) continue;
     src = src.replace(m[0], '');
-    src = insertIntoClassBody(
-      src,
-      `  get ${base}Error(): boolean {\n    return this.${base}Touched && String(this.${base} ?? '').trim() === '';\n  }`
-    );
+    if (/\breadonly form\b|\bform\s*=/.test(src)) {
+      src = insertIntoClassBody(
+        src,
+        `  get ${base}Error(): boolean {\n    const c = this.form.controls['${base}'];\n    return !!(c && c.touched && String(c.value ?? '').trim() === '');\n  }`
+      );
+    } else if (classHasMember(src, base) && classHasMember(src, `${base}Touched`)) {
+      src = insertIntoClassBody(
+        src,
+        `  get ${base}Error(): boolean {\n    return this.${base}Touched && String(this.${base} ?? '').trim() === '';\n  }`
+      );
+    }
   }
 
-  if (/\[\(ngModel\)\]=/.test(out)) {
-    src = ensureImport(src, 'FormsModule', '@angular/forms');
-    src = ensureDecoratorImport(src, 'FormsModule');
+  if (/\[formGroup\]|formControlName=/.test(out)) {
+    src = ensureImport(src, 'ReactiveFormsModule', '@angular/forms');
+    src = ensureDecoratorImport(src, 'ReactiveFormsModule');
   }
 
   for (const m of [...src.matchAll(
@@ -1118,7 +1233,7 @@ function sanitizeStandaloneImports(source) {
   if (!/@Component\s*\(/.test(source)) return source;
 
   const bannedExact = new Set([
-    'cn', 'clsx', 'twMerge', 'cva', 'classNames', 'classnames', 'React', 'Fragment'
+    'cn', 'clsx', 'twMerge', 'cva', 'classNames', 'classnames', 'React', 'Fragment', 'Reactive'
   ]);
 
   return source.replace(
@@ -1280,7 +1395,8 @@ export function declarablesNeededByHtml(html) {
   for (const m of h.matchAll(/\bmat([A-Z][A-Za-z]+)\b/g)) {
     add(`Mat${m[1]}Module`);
   }
-  if (/\bform\b/.test(h) && /ngSubmit|formGroup|ngModel/.test(h)) add('FormsModule');
+  if (/\bngModel\b|\[\(ngModel\)\]/.test(h)) add('FormsModule');
+  if (/\[formGroup\]|formControlName|\[formControl\]/.test(h)) add('ReactiveFormsModule');
   return needed;
 }
 
@@ -1406,6 +1522,47 @@ function syncNgComponentImports(source, html) {
 }
 
 /**
+ * Fix bare `Reactive` left behind when FormsModule was stripped from
+ * ReactiveFormsModule (TS2305 / NG1010).
+ */
+function repairBogusAngularFormsImports(source) {
+  let updated = String(source || '');
+  const hasBareReactive =
+    /import\s*\{[^}]*\bReactive\b[^}]*\}\s*from\s*['"]@angular\/forms['"]/.test(updated) ||
+    /imports\s*:\s*\[[^\]]*\bReactive\b/.test(updated);
+  if (!hasBareReactive) return updated;
+
+  if (/\bReactiveFormsModule\b/.test(updated)) {
+    updated = removeNamedImport(updated, 'Reactive', '@angular/forms');
+    updated = removeDecoratorImport(updated, 'Reactive');
+  } else {
+    updated = updated.replace(
+      /import\s*\{([^}]*)\}\s*from\s*['"]@angular\/forms['"]\s*;?/g,
+      (full, names) => {
+        const parts = names
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((n) => (n === 'Reactive' ? 'ReactiveFormsModule' : n));
+        return `import { ${[...new Set(parts)].join(', ')} } from '@angular/forms';`;
+      }
+    );
+    updated = updated.replace(
+      /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+      (full, start, mid, end) => {
+        const items = mid
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((n) => (n === 'Reactive' ? 'ReactiveFormsModule' : n));
+        return `${start}${[...new Set(items)].join(', ')}${end}`;
+      }
+    );
+  }
+  return updated;
+}
+
+/**
  * Strip hallucinated React→Angular leftovers that break the compiler.
  */
 function repairHallucinatedAngularApis(source) {
@@ -1416,6 +1573,9 @@ function repairHallucinatedAngularApis(source) {
     updated = removeNamedImport(updated, sym, '@angular/core');
     updated = removeNamedImport(updated, sym, 'react');
   }
+
+  // Bare `Reactive` is a common corruption of ReactiveFormsModule (FormsModule suffix strip)
+  updated = repairBogusAngularFormsImports(updated);
 
   // Input used as a generic type (React children leftover): actions: Input<X> = () => null
   updated = updated.replace(
@@ -1997,6 +2157,7 @@ function repairAngularComponentFile(tsPath, options = {}) {
     html = inferredAfterStub.html;
     source = ensureCountWhereHelper(source, html);
     source = repairFormBuilderInit(source);
+    source = repairBogusAngularFormsImports(source);
     source = sanitizeStandaloneImports(source);
     source = syncNgComponentImports(source, html);
     source = dedupeImports(source);
@@ -3118,6 +3279,117 @@ export function repairAngularWorkspace(destPath, options = {}) {
 }
 
 /**
+ * Inside `if (this.foo) { ... this.foo.bar ... }`, capture a local so nested
+ * callbacks satisfy TS2531 (TypeScript does not narrow `this.prop` there).
+ */
+function narrowNullableThisAccessInSource(src) {
+  const re = /if\s*\(\s*this\.(\w+)\s*\)\s*\{/g;
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(src))) {
+    const name = m[1];
+    const openBrace = m.index + m[0].length - 1;
+    let depth = 0;
+    let i = openBrace;
+    for (; i < src.length; i++) {
+      if (src[i] === '{') depth += 1;
+      else if (src[i] === '}') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (i >= src.length) break;
+    const block = src.slice(openBrace + 1, i);
+    out += src.slice(last, m.index);
+    if (
+      new RegExp(`this\\.${name}\\.`).test(block) &&
+      !new RegExp(`const\\s+\\w+\\s*=\\s*this\\.${name}\\b`).test(block)
+    ) {
+      const local = `current${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+      const rewritten = block.replace(new RegExp(`this\\.${name}\\b`, 'g'), local);
+      out += `if (this.${name}) {\n    const ${local} = this.${name};${rewritten}}`;
+    } else {
+      out += src.slice(m.index, i + 1);
+    }
+    last = i + 1;
+    re.lastIndex = last;
+  }
+  out += src.slice(last);
+  return out;
+}
+
+/**
+ * Fix common Angular TS2322 / TS2531 from React→Angular conversion:
+ * - INITIAL_* arrays with status string literals widened to string (annotate as Entity[])
+ * - this.nullable.prop used inside callbacks after if (this.nullable) (capture local)
+ */
+export function repairAngularStrictNullAndStatusTypes(destPath, buildErrors = '') {
+  const text = String(buildErrors || '');
+  const srcRoot = path.join(destPath, 'src');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/((?:src\/)?[\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].map((rel) => path.join(destPath, rel)).filter((f) => fs.existsSync(f))
+      : walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'));
+
+  let changed = 0;
+  for (const file of files) {
+    let content = fs.readFileSync(file, 'utf-8');
+    const original = content;
+
+    // Prefer primary model type (Item), not ItemDraft / ItemStatus
+    const importMatch = content.match(
+      /import\s+\{([^}]+)\}\s+from\s+['"][^'"]*models\/[^'"]+['"]/
+    );
+    const candidates = String(importMatch?.[1] || '')
+      .split(',')
+      .map((s) => s.replace(/\btype\s+/g, '').trim())
+      .filter((s) => /^[A-Z][A-Za-z0-9]*$/.test(s));
+    const fromAssign = content.match(
+      /:\s*([A-Z][A-Za-z0-9]*)\s*\[\s*\]\s*=\s*\[\s*\.\.\.\s*(?:INITIAL_|DEFAULT_|SEED_|MOCK_)\w+/
+    )?.[1];
+    const entityName =
+      (fromAssign && candidates.includes(fromAssign) ? fromAssign : null) ||
+      candidates.find((s) => !/Status$|Draft$|Labels$|Options$/i.test(s)) ||
+      candidates[0];
+
+    if (entityName) {
+      content = content.replace(
+        new RegExp(
+          `const\\s+(INITIAL_\\w+|DEFAULT_\\w+|SEED_\\w+|MOCK_\\w+)\\s*=\\s*(\\[[\\s\\S]*?\\]);`,
+          'g'
+        ),
+        (full, name, arr) => {
+          if (new RegExp(`^const\\s+${name}\\s*:`).test(full)) return full;
+          if (new RegExp(`const\\s+${name}\\s*:\\s*${entityName}\\[\\]`).test(content)) return full;
+          const usedAsEntity =
+            new RegExp(`${entityName}\\[\\]\\s*=\\s*\\[\\s*\\.\\.\\.\\s*${name}\\s*\\]`).test(
+              content
+            ) || new RegExp(`=\\s*\\[\\s*\\.\\.\\.\\s*${name}\\s*\\]`).test(content);
+          if (!/status\s*:/.test(arr) && !usedAsEntity) return full;
+          return `const ${name}: ${entityName}[] = ${arr};`;
+        }
+      );
+    }
+
+    content = narrowNullableThisAccessInSource(content);
+
+    if (content !== original) {
+      fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired strict-null/status typing in ${changed} Angular file(s)`);
+  }
+  return changed;
+}
+
+/**
  * Mechanical Angular compile repairs for NG1010 (unknown @Component imports)
  * and missing Material modules referenced by the template.
  */
@@ -3127,10 +3399,17 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /TS2345/.test(text) ||
     /Argument of type 'Event'/.test(text) ||
     /Property 'emit' does not exist/.test(text);
+  const typeIssues =
+    /TS2322/.test(text) ||
+    /TS2531/.test(text) ||
+    /Object is possibly 'null'/.test(text) ||
+    /is not assignable to type '\w+'/.test(text) ||
+    /Type 'string' is not assignable to type/.test(text);
   const needs =
     /NG1010/.test(text) ||
     /NG5002/.test(text) ||
     /TS2300/.test(text) ||
+    /TS2305/.test(text) ||
     /Duplicate identifier/.test(text) ||
     /Void elements do not have end tags/.test(text) ||
     /Unexpected closing tag/.test(text) ||
@@ -3138,8 +3417,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /is not a known element/.test(text) ||
     /is not a known attribute/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
-    /has no exported member 'Mat/.test(text);
-  if (!needs && !eventIssues) return 0;
+    /has no exported member/.test(text);
+  if (!needs && !eventIssues && !typeIssues) return 0;
 
   const srcRoot = path.join(destPath, 'src');
   const snapshot = () => {
@@ -3200,6 +3479,14 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
 
   if (eventIssues) {
     wrapDomEventPayloads(destPath, text);
+  }
+
+  if (typeIssues) {
+    try {
+      repairAngularStrictNullAndStatusTypes(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Strict-null/status repair failed: ${err.message}`);
+    }
   }
 
   const afterMap = snapshot();

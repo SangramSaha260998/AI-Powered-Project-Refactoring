@@ -7,6 +7,24 @@ An AI-powered framework migration and refactoring pipeline that seamlessly conve
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=flat&logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [API Endpoints](#api-endpoints)
+- [Project Structure](#project-structure)
+- [How It Works](#how-it-works)
+- [Development](#development)
+- [Testing](#testing)
+- [Known Limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## 🎯 Overview
 
@@ -23,6 +41,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 ## ✨ Features
 
 ### Frontend (Angular 20)
+
 - Modern standalone component architecture
 - Signals-based state management
 - Responsive design with mobile-first approach
@@ -30,6 +49,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 - Real-time migration status updates
 
 ### Backend (Node.js/Express)
+
 - RESTful API with Express.js (ES Modules)
 - OpenAI-compatible API integration
 - ZIP file extraction and validation
@@ -37,6 +57,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 - Rate limiting for AI API calls
 
 ### AI Migration Engine
+
 - Multi-stage migration pipeline
 - Blueprint generation for migration planning
 - File-by-file code generation
@@ -74,7 +95,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 │                          │                                       │
 │  ┌──────────────────────┴──────────────────────┐                │
 │  │         OpenAI-Compatible API                 │                │
-│  │        (zenmux.ai / OpenAI / etc.)            │                │
+│  │     (OpenRouter / Gemini / Ollama / etc.)     │                │
 │  └─────────────────────────────────────────────┘                │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -84,7 +105,7 @@ AI Framework Migration Studio is a full-stack application that uses artificial i
 - **Node.js**: v18.0.0 or higher
 - **npm**: v9.0.0 or higher
 - **Angular CLI**: v20.x (for frontend development)
-- **OpenAI API Key**: Or any OpenAI-compatible API endpoint
+- **API Key**: OpenRouter, Google Gemini, or a local Ollama install
 
 ## 🚀 Installation
 
@@ -130,14 +151,14 @@ Edit `server/.env`:
 # Server Configuration
 PORT=5000
 
-# OpenAI API Configuration
-OPENAI_API_KEY=your_api_key_here
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4
+# OpenRouter (default)
+OPENROUTER_API_KEY=your_openrouter_key_here
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
-# Optional: Custom API endpoint (e.g., for free alternatives)
-# OPENAI_BASE_URL=https://zenmux.ai/api/v1
-# OPENAI_MODEL=stepfun/step-3.7-flash-free
+# Optional: Google Gemini fallback
+# GENAI_API_KEY=your_gemini_key_here
+# GENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+# GENAI_MODEL=gemini-2.0-flash
 ```
 
 ### 4. Start the Application
@@ -161,21 +182,49 @@ npm run start:frontend
 
 ### Environment Variables
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `PORT` | Backend server port | `5000` | No |
-| `OPENAI_API_KEY` | API key for OpenAI-compatible service | - | Yes |
-| `OPENAI_BASE_URL` | API endpoint URL | `https://zenmux.ai/api/v1` | No |
-| `OPENAI_MODEL` | Model to use for migration | `stepfun/step-3.7-flash-free` | No |
+| Variable              | Description                                                | Default                          | Required |
+| --------------------- | ---------------------------------------------------------- | -------------------------------- | -------- |
+| `PORT`                | Backend server port                                        | `5000`                           | No       |
+| `OPENROUTER_API_KEY`  | OpenRouter API key(s) — comma-separate for key rotation    | -                                | Yes\*    |
+| `OPENROUTER_BASE_URL` | OpenRouter API endpoint                                    | `https://openrouter.ai/api/v1`   | No       |
+| `OPENROUTER_MODEL`    | Default OpenRouter model                                   | `google/gemma-4-26b-a4b-it:free` | No       |
+| `OPENROUTER_MODELS`   | OpenRouter model fallback list (comma-separated)           | built-in free list               | No       |
+| `GENAI_API_KEY`       | Google Gemini API key(s) — comma-separate for key rotation | -                                | No       |
+| `GENAI_BASE_URL`      | Gemini OpenAI-compatible endpoint                          | Gemini default                   | No       |
+| `GENAI_MODEL`         | Default Gemini model                                       | `gemini-2.0-flash`               | No       |
+| `GENAI_MODELS`        | Gemini model fallback list (comma-separated)               | built-in free list               | No       |
+| `GROQ_API_KEY`        | Groq API key(s) — comma-separate for key rotation          | -                                | No       |
+| `GROQ_MODELS`         | Groq model fallback list (comma-separated)                 | built-in free list               | No       |
+| `OLLAMA_API_KEY`      | Ollama Cloud API key(s) — comma-separate for key rotation  | -                                | No       |
+| `OLLAMA_MODELS`       | Ollama model fallback list (comma-separated)               | built-in list                    | No       |
+| `AI_FALLBACK_CHAIN`   | Provider fallback order                                    | `genai,openrouter,ollama,groq`   | No       |
+
+\* At least one configured provider is required (OpenRouter, Gemini, Groq, or Ollama).
+
+### 🤖 Automatic Fallback (Model → Key → Provider)
+
+Every AI call automatically rotates through **models, API keys, and providers** when a limit is crossed — no manual intervention needed:
+
+1. **Model fallback (same key)** — when a `(API key, model)` pair hits its rate limit / quota, the engine tries the next free model **on the same API key** (e.g. `gemini-2.0-flash` → `gemini-2.0-flash-lite`).
+2. **Key rotation (same provider)** — after all models on a key are exhausted, it moves to the next API key (models restart from #1).
+3. **Provider fallback (next AI)** — after all keys × models of a provider are exhausted, it moves to the next configured provider in the chain using that provider's own keys and models.
+
+```
+Model A + Key 1  ──limit crossed──▶  Model B + Key 1  ──▶  …  ──▶  Model A + Key 2  ──▶  …  ──▶  Next provider  ──▶  …
+```
+
+- Provide multiple API keys as comma-separated values: `OPENROUTER_API_KEY=key1,key2,key3`.
+- Override the model fallback list per provider with `<PREFIX>_MODELS` (e.g. `GENAI_MODELS=gemini-2.0-flash,gemini-1.5-flash`).
+- The UI-selected model is always tried first on the selected provider; the rest of the list is used only when it fails.
+- Auth/quota errors (HTTP 401/402) are key-level and skip model rotation, going straight to the next key.
 
 ### Supported API Providers
 
-The application uses the OpenAI SDK, so any OpenAI-compatible API works:
+The application uses the OpenAI SDK with these providers:
 
-- **OpenAI**: `https://api.openai.com/v1`
-- **Anthropic**: Via OpenAI-compatible proxy (e.g., LiteLLM)
-- **Local Models**: Ollama, LM Studio, vLLM, etc.
-- **Free Alternatives**: zenmux.ai, groq.com, together.ai, etc.
+- **OpenRouter**: `https://openrouter.ai/api/v1` (default; free models supported)
+- **Google Gemini**: OpenAI-compatible Generative Language API
+- **Local Models**: Ollama (`http://localhost:11434/v1`)
 
 ### File Limits
 
@@ -222,6 +271,7 @@ curl -X POST http://localhost:5000/api/migrate \
 ### Example Migration Prompts
 
 **Angular to React:**
+
 ```
 Convert this Angular project to React:
 - Transform all components to functional components with hooks
@@ -232,6 +282,7 @@ Convert this Angular project to React:
 ```
 
 **React to Angular:**
+
 ```
 Convert this React project to Angular:
 - Transform functional components to Angular standalone components
@@ -242,10 +293,175 @@ Convert this React project to Angular:
 ```
 
 **Tips for Better Results:**
+
 - Be specific about what you want converted
 - Mention any frameworks/libraries to preserve (e.g., styling libraries)
 - Specify if you want to keep the same directory structure
 - Note any specific patterns you want the AI to follow
+
+## 🔌 API Endpoints
+
+### Health Check
+
+```http
+GET /api/health
+```
+
+**Response:**
+
+```json
+{
+  "status": "Backend engine online and ready to extract packages!"
+}
+```
+
+### Upload Project
+
+```http
+POST /api/upload
+Content-Type: multipart/form-data
+```
+
+**Parameters:**
+
+- `projectZip` (file, required): ZIP archive of the source project
+- `fromTech` (string, optional): Source framework (Angular/React)
+- `toTech` (string, optional): Target framework (Angular/React)
+- `prompt` (string, optional): Additional migration instructions
+
+**Response:**
+
+```json
+{
+  "message": "Workspace successfully unpacked! Ready to migrate from Angular to React.",
+  "sessionId": "1703123456789",
+  "extractedLocation": "/path/to/extracted",
+  "fromTech": "Angular",
+  "toTech": "React"
+}
+```
+
+### Run Migration
+
+```http
+POST /api/migrate
+Content-Type: multipart/form-data
+```
+
+**Parameters:**
+
+- `zipFile` (file, required): ZIP archive of the source project
+- `prompt` (string, required): Migration instructions
+- `fromTech` (string, optional): Source framework
+- `toTech` (string, optional): Target framework
+
+**Response:** Binary ZIP file download
+
+**Error Response:**
+
+```json
+{
+  "error": "Description of what went wrong"
+}
+```
+
+## 📁 Project Structure
+
+```
+ai-architecture-migrator/
+├── frontend/                    # Angular frontend application
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── app.ts          # Main component
+│   │   │   ├── app.html        # Component template
+│   │   │   ├── app.css         # Component styles
+│   │   │   ├── app.config.ts   # App configuration
+│   │   │   └── app.spec.ts     # Unit tests
+│   │   ├── main.ts             # Bootstrap entry
+│   │   ├── index.html          # HTML entry point
+│   │   └── styles.css          # Global styles
+│   ├── angular.json            # Angular configuration
+│   ├── tsconfig.json           # TypeScript config
+│   └── package.json            # Frontend dependencies
+│
+├── server/                      # Node.js/Express backend (ES Modules)
+│   ├── src/
+│   │   ├── server.js           # Entry point
+│   │   ├── app.js              # Express app setup
+│   │   ├── config/
+│   │   │   └── index.js        # Configuration constants
+│   │   ├── routes/
+│   │   │   ├── health.js       # Health check endpoint
+│   │   │   └── upload.js       # Upload & migration endpoints
+│   │   ├── middleware/
+│   │   │   └── upload.js       # Multer upload middleware
+│   │   ├── services/
+│   │   │   ├── migration.js    # AI migration pipeline
+│   │   │   └── validator.js    # Project validation
+│   │   └── utils/
+│   │       └── file.js         # File utilities
+│   ├── tests/
+│   │   ├── validation.mjs      # Validation tests
+│   │   └── debug.mjs           # Debug utilities
+│   └── package.json            # Backend dependencies
+│
+├── .gitignore
+├── .env.example                # Environment variable template
+├── package.json                # Root package.json
+└── README.md                   # This file
+```
+
+## 🔄 How It Works
+
+### Migration Pipeline
+
+1. **Upload & Extraction**
+   - User uploads a ZIP file containing the source project
+   - Server extracts the ZIP to a temporary directory
+   - Validates the project structure and dependencies
+
+2. **Blueprint Generation**
+   - AI analyzes the source code structure
+   - Creates a migration plan with target file mappings
+   - Determines which files need to be created/modified
+
+3. **Code Generation**
+   - AI generates each target file individually
+   - Uses context from source files for accurate conversion
+   - Applies rate limiting to respect API quotas
+
+4. **Project Scaffolding**
+   - Injects framework-specific templates (package.json, tsconfig, etc.)
+   - Creates proper directory structure
+   - Includes .gitignore and configuration files
+
+5. **Packaging**
+   - Packages the generated project into a ZIP
+   - Returns downloadable ZIP to the user
+   - Cleans up temporary files
+
+### Validation Process
+
+The validator checks:
+
+- **Package.json**: Verifies framework dependencies exist
+- **Project Structure**: Looks for framework-specific config files
+- **File Extensions**: Confirms presence of .ts/.tsx (React) or angular.json (Angular)
+
+### Rate Limiting
+
+To respect API quotas and avoid rate limiting:
+
+- **5.5 second pause** between each AI file generation
+- **10 second retry** if an API call fails
+- **One retry** per failed file before throwing an error
+- **Automatic model → key → provider rotation** when free-tier limits are crossed (see [Automatic Fallback](#-automatic-fallback-model--key--provider))
+
+**Estimated Migration Times:**
+
+- Small project (5-10 files): ~1-2 minutes
+- Medium project (10-20 files): ~2-4 minutes
+- Large project (20+ files): ~4+ minutes
 
 ## 🛠️ Development
 
@@ -258,6 +474,12 @@ npm start
 # Or start backend with file watching
 cd server && npm run dev
 ```
+
+### Code Style
+
+- **Frontend**: Prettier with Angular parser (100 char line width, single quotes)
+- **Backend**: Standard ES Modules
+- **TypeScript**: Strict mode enabled
 
 ### Adding New Features
 
@@ -279,9 +501,35 @@ cd server && npm run dev
 ### ES Modules
 
 The server uses ES Modules (`"type": "module"` in package.json):
+
 - Use `import/export` syntax
 - Use `fileURLToPath` for `__filename` and `__dirname`
 - Use `.js` extension in relative imports
+
+## 🧪 Testing
+
+### Frontend Tests
+
+```bash
+cd frontend
+npm test                    # Run unit tests
+npm run build               # Build for production
+```
+
+### Backend Tests
+
+```bash
+cd server
+npm run test:validation     # Run validation tests
+npm run test:debug          # Run debug utilities
+```
+
+### Manual Testing
+
+1. Create a simple Angular/React project
+2. ZIP the project folder
+3. Upload through the web interface
+4. Verify the generated output works
 
 ## ⚠️ Known Limitations
 
@@ -298,34 +546,101 @@ The server uses ES Modules (`"type": "module"` in package.json):
 
 ### Common Issues
 
-#### "OPENAI_API_KEY is not set"
+#### "OPENROUTER_API_KEY is not set"
+
 ```bash
 # Create or update server/.env
-echo "OPENAI_API_KEY=your_key_here" > server/.env
+echo "OPENROUTER_API_KEY=your_key_here" > server/.env
 ```
 
 #### "Port already in use"
+
 ```bash
 # Change port in server/.env
 echo "PORT=3001" >> server/.env
 ```
 
 #### "No readable source files found"
+
 - Ensure your ZIP contains actual source code
 - Check that files aren't in a nested folder
 - Verify file extensions are recognized (.ts, .tsx, .js, .jsx, etc.)
 
 #### Migration fails midway
+
 - Check API rate limits
 - Reduce project size (exclude node_modules, dist, etc.)
 - Verify API key has sufficient credits
 - Try a simpler prompt
 
 #### Generated project won't compile
+
 - Some manual adjustments may be needed
 - Check the generated package.json for correct dependencies
 - Ensure all imports are correct
 
+### Debug Mode
+
+```bash
+# Enable verbose logging
+cd server
+DEBUG=* node src/server.js
+```
+
+### Logs
+
+- **Server**: Console output in terminal
+- **Frontend**: Browser developer console
+- **Migration**: Detailed logs in server terminal
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow these steps:
+
+1. **Fork the Repository**
+
+   ```bash
+   git fork https://github.com/yourusername/ai-architecture-migrator.git
+   ```
+
+2. **Create a Feature Branch**
+
+   ```bash
+   git checkout -b feature/amazing-feature
+   ```
+
+3. **Make Changes**
+   - Follow existing code style
+   - Add tests if applicable
+   - Update documentation
+
+4. **Commit Changes**
+
+   ```bash
+   git commit -m "Add amazing feature"
+   ```
+
+5. **Push to Branch**
+
+   ```bash
+   git push origin feature/amazing-feature
+   ```
+
+6. **Open a Pull Request**
+   - Describe your changes
+   - Reference any related issues
+   - Wait for review
+
+### Development Guidelines
+
+- **Commits**: Use conventional commits (feat:, fix:, docs:, etc.)
+- **PRs**: Keep them focused and small
+- **Testing**: Add tests for new features
+- **Documentation**: Update README if needed
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
@@ -336,7 +651,12 @@ echo "PORT=3001" >> server/.env
 - [AdmZip](https://github.com/cthackers/adm-zip) - ZIP file handling
 - [Multer](https://github.com/expressjs/multer) - File upload middleware
 
+## 📧 Support
+
+- **Issues**: [GitHub Issues](https://github.com/yourusername/ai-architecture-migrator/issues)
+- **Email**: your.email@example.com
+- **Documentation**: [Wiki](https://github.com/yourusername/ai-architecture-migrator/wiki)
 
 ---
 
-**Built with ❤️ by Team CodeMorph, for developers.**
+**Built with ❤️ by developers, for developers.**

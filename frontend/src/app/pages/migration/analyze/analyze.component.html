@@ -1,0 +1,149 @@
+<div class="analyze-page">
+  <header class="page-header">
+    <h1>Project Analysis</h1>
+    <p>
+      Review the source project structure, reference architecture, and migration plan before
+      starting.
+    </p>
+  </header>
+
+  @if (isLoading()) {
+    <div class="loading-state">
+      <div class="spinner"></div>
+      <p>Analyzing project structure...</p>
+    </div>
+  } @else if (errorMessage()) {
+    <div class="error-state">
+      <p class="error-text">{{ errorMessage() }}</p>
+      <button class="btn btn-primary" (click)="startMigration()">Back to Create</button>
+    </div>
+  } @else if (analysis()) {
+    <div class="analysis-content">
+      <!-- Source Analysis -->
+      <section class="card">
+        <h2>Source Project</h2>
+        <div class="meta-grid">
+          <div class="meta-item">
+            <span class="label">Framework</span>
+            <span class="value">{{ analysis()?.sourceAnalysis?.framework }}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Files</span>
+            <span class="value">{{ analysis()?.sourceAnalysis?.fileCount }}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Components</span>
+            <span class="value">{{ analysis()?.sourceAnalysis?.components?.length }}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Services</span>
+            <span class="value">{{ analysis()?.sourceAnalysis?.services?.length }}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Routes</span>
+            <span class="value">{{ analysis()?.sourceAnalysis?.routes?.length }}</span>
+          </div>
+        </div>
+
+        @if (analysis()?.sourceAnalysis?.components?.length) {
+          <h3>Components</h3>
+          <ul class="file-list">
+            @for (comp of analysis()?.sourceAnalysis?.components; track comp.file + comp.name) {
+              <li>
+                <span class="file-name">{{ comp.name }}</span>
+                <span class="file-path">{{ comp.file }}</span>
+              </li>
+            }
+          </ul>
+        }
+      </section>
+
+      <!-- Reference Analysis -->
+      @if (analysis()?.referenceAnalysis) {
+        <section class="card">
+          <h2>Reference Architecture</h2>
+          <div class="meta-grid">
+            <div class="meta-item">
+              <span class="label">Framework</span>
+              <span class="value">{{ analysis()?.referenceAnalysis?.framework }}</span>
+            </div>
+            <div class="meta-item">
+              <span class="label">Files</span>
+              <span class="value">{{ analysis()?.referenceAnalysis?.fileCount }}</span>
+            </div>
+            <div class="meta-item">
+              <span class="label">Shared Components</span>
+              <span class="value">{{
+                analysis()?.referenceAnalysis?.sharedComponents?.length
+              }}</span>
+            </div>
+            <div class="meta-item">
+              <span class="label">Services</span>
+              <span class="value">{{ analysis()?.referenceAnalysis?.services?.length }}</span>
+            </div>
+          </div>
+
+          @if (analysis()?.referenceAnalysis?.folders?.length) {
+            <h3>Folder Structure</h3>
+            <ul class="file-list">
+              @for (folder of analysis()?.referenceAnalysis?.folders; track folder) {
+                <li>
+                  <span class="file-path">{{ folder }}</span>
+                </li>
+              }
+            </ul>
+          }
+        </section>
+      }
+
+      <!-- Migration Plan -->
+      <section class="card">
+        <h2>Migration Plan Preview</h2>
+        @if (analysis()?.migrationPlan?.mappings?.length) {
+          <h3>Mappings</h3>
+          <table class="mapping-table">
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Target</th>
+                <th>Type</th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (
+                mapping of analysis()?.migrationPlan?.mappings;
+                track mapping.source + mapping.target
+              ) {
+                <tr>
+                  <td>{{ mapping.source }}</td>
+                  <td>{{ mapping.target }}</td>
+                  <td>
+                    <span class="badge">{{ mapping.type }}</span>
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        }
+
+        @if (analysis()?.migrationPlan?.plan?.length) {
+          <h3>Planned Files</h3>
+          <ul class="file-list">
+            @for (unit of analysis()?.migrationPlan?.plan; track unit.newPath) {
+              <li>
+                <span class="file-path">{{ unit.newPath }}</span>
+                <span class="badge" [class]="'badge-' + unit.complexity">{{
+                  unit.complexity
+                }}</span>
+              </li>
+            }
+          </ul>
+        }
+      </section>
+
+      <div class="actions">
+        <button class="btn btn-primary" (click)="startMigration()">Start Migration</button>
+      </div>
+    </div>
+  }
+</div>

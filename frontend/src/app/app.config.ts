@@ -1,10 +1,15 @@
 import { ApplicationConfig, provideZonelessChangeDetection } from '@angular/core';
-import { provideHttpClient } from '@angular/common/http';
+import { provideRouter } from '@angular/router';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { provideAnimationsAsync } from '@angular/platform-browser/animations/async';
+import { routes } from './app.routes';
+import { errorInterceptorFn } from '@core/interceptors';
 
 export const appConfig: ApplicationConfig = {
   providers: [
-    // Use the stable, clean API name here
-    provideZonelessChangeDetection(), 
-    provideHttpClient()
-  ]
+    provideZonelessChangeDetection(),
+    provideRouter(routes),
+    provideAnimationsAsync(),
+    provideHttpClient(withInterceptors([errorInterceptorFn])),
+  ],
 };

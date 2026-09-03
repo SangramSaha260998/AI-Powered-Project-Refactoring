@@ -178,6 +178,8 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Utils, hooks, services, stores, and types stay .ts.
 - Functional components + hooks only (React 19).
 - Prefer folders: components/, features/, hooks/, lib/, services/, pages/.
+- Keep source folder names when they already exist (e.g. Angular
+  \`src/app/components/task-form-sidebar/\` → \`src/components/task-form-sidebar/TaskFormSidebar.tsx\`).
 - Routing: react-router-dom (BrowserRouter or createBrowserRouter).
 - Do NOT generate angular.json, tsconfig.app.json, or Angular workspace files.
 - High code quality: typed props, no unused imports, small focused modules.
@@ -304,6 +306,10 @@ Do NOT use default project names — use the EXTRACTED name.
 - Parent \`(onSave)="save($event)"\` requires the child \`@Output() onSave =
   new EventEmitter<...>()\` (not \`@Input()\`). Typed \`$event\` must match
   the handler parameter (not DOM \`Event\` unless it is a native DOM listener).
+  Prefer matching names: child \`@Output() save\` → parent \`(save)="onSave($event)"\`.
+  Never bind \`(onSave)\` unless the child actually declares \`@Output() onSave\`.
+  In child templates, call the wrapper method (\`(click)="onRemove(task)"\`) —
+  do not write \`onRemove.emit(task)\` when \`onRemove\` is a method.
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.
@@ -339,7 +345,8 @@ export const INCREMENTAL_BLUEPRINT_PROMPT = `
 ## INCREMENTAL MIGRATION BLUEPRINT — DEPENDENCY ORDER (applied automatically)
 
 You are creating an INCREMENTAL migration plan. Convert the FULL uploaded project.
-The runtime writes one logical UNIT per AI call (Angular .ts+.html+.scss together).
+The runtime writes one logical UNIT per AI call (Angular .ts+.html+.scss together;
+React .tsx plus optional .scss — never an Angular triad).
 Compile checks run periodically and again at the end — do not assume every unit
 is built before the next one is planned.
 
@@ -354,7 +361,11 @@ is built before the next one is planned.
 ### Logical units (MANDATORY):
 - Angular component = ONE unit of three sibling paths listed BACK-TO-BACK in order:
   \`name.component.ts\`, then \`name.component.html\`, then \`name.component.scss\`
-- React component = ONE unit: \`Name.tsx\` then optional companion \`Name.scss\`
+- React component = ONE unit: PascalCase \`Name.tsx\` then optional companion \`Name.scss\`
+- If targeting React: NEVER plan Angular triads. Forbidden paths: \`*.component.ts\`,
+  \`*.component.html\`, \`*.component.scss\`, and unit ids ending in \`.component\`
+  (e.g. \`src/components/task-form-sidebar/task-form-sidebar.component\`).
+  Plan \`src/components/<kebab>/<Pascal>.tsx\` instead. JSX lives in the .tsx file — no .html.
 - Services, pipes, utils, routes, configs-in-src = ONE file = ONE unit
 - Never scatter a component triad across distant steps
 
@@ -400,6 +411,27 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
       "dependencies": ["src/lib/format.ts"],
       "complexity": "low",
       "unit": "src/app/pages/admin-users/admin-users.component"
+    }
+  ]
+}
+\`\`\`
+
+When targeting React, use this shape instead (never .component / .html):
+
+\`\`\`json
+{
+  "incrementalPlan": [
+    {
+      "step": 1,
+      "newPath": "src/components/task-form-sidebar/TaskFormSidebar.tsx",
+      "explanationOfSource": "Sidebar form as a React function component",
+      "approximateSourceFilesToRead": [
+        "src/app/components/task-form-sidebar/task-form-sidebar.component.ts",
+        "src/app/components/task-form-sidebar/task-form-sidebar.component.html"
+      ],
+      "dependencies": ["src/models/task.model.ts"],
+      "complexity": "medium",
+      "unit": "src/components/task-form-sidebar/TaskFormSidebar.tsx"
     }
   ]
 }

@@ -640,14 +640,38 @@ function isIgnorableAngularUnit(unit) {
   );
 }
 
+function toPascalCaseName(name) {
+  return String(name || '')
+    .replace(/\.component$/i, '')
+    .split(/[-_.\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('');
+}
+
 function normalizeReactPlanPath(plannedPath) {
-  let planned = String(plannedPath || '').replace(/\\/g, '/');
+  let planned = String(plannedPath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  if (!planned) return null;
   if (/\.html$/i.test(planned)) return null;
   if (isReactScaffoldPath(planned)) return null;
-  if (/\.component\.ts$/i.test(planned)) {
-    planned = planned.replace(/\.component\.ts$/i, '.tsx');
-  } else if (/\.component\.scss$/i.test(planned)) {
-    planned = planned.replace(/\.component\.scss$/i, '.scss');
+
+  planned = planned.replace(/^src\/app\//i, 'src/');
+
+  // Blueprint unit ids often keep the Angular stem without an extension.
+  if (/\.component$/i.test(planned) && !/\.(ts|tsx|js|jsx|scss|css|html)$/i.test(planned)) {
+    const dir = path.posix.dirname(planned);
+    const base = path.posix.basename(planned).replace(/\.component$/i, '');
+    planned = `${dir}/${toPascalCaseName(base)}.tsx`;
+  }
+
+  if (/\.component\.(scss|css)$/i.test(planned)) {
+    const dir = path.posix.dirname(planned);
+    const base = path.posix.basename(planned).replace(/\.component\.(scss|css)$/i, '');
+    planned = `${dir}/${toPascalCaseName(base)}.scss`;
+  } else if (/\.component\.(ts|tsx)$/i.test(planned)) {
+    const dir = path.posix.dirname(planned);
+    const base = path.posix.basename(planned).replace(/\.component\.(ts|tsx)$/i, '');
+    planned = `${dir}/${toPascalCaseName(base)}.tsx`;
   } else if (
     /\.ts$/i.test(planned) &&
     !/\.d\.ts$/i.test(planned) &&
@@ -656,9 +680,29 @@ function normalizeReactPlanPath(plannedPath) {
   ) {
     planned = planned.replace(/\.ts$/i, '.tsx');
   }
-  planned = planned.replace(/^src\/app\//i, 'src/');
+
   if (isReactScaffoldPath(planned)) return null;
   return planned;
+}
+
+function coerceReactMigrationUnit(unit) {
+  const seen = new Set();
+  const files = [];
+  for (const f of unit?.files || []) {
+    const np = normalizeReactPlanPath(f.newPath);
+    if (!np || seen.has(np)) continue;
+    seen.add(np);
+    files.push({ ...f, newPath: np });
+  }
+  if (!files.length) return { ...unit, files: [] };
+  const primary =
+    files.find((f) => /\.(tsx|jsx)$/i.test(f.newPath))?.newPath || files[0].newPath;
+  return {
+    ...unit,
+    files,
+    label: primary.replace(/\.(tsx|jsx)$/i, ''),
+    id: String(primary).replace(/\.(tsx|jsx|ts|js|scss|css)$/i, '')
+  };
 }
 
 function readDirectoryRecursively(dirPath, baseDir = dirPath, fileList = {}) {
@@ -1593,11 +1637,8 @@ function ensurePlanCoversAllSourceFiles(plan, filesMap, toTech) {
       // React target: Angular component triads become one .tsx (+ optional .scss).
       if (/\.html$/i.test(n)) continue;
       if (isReactScaffoldPath(n) || isReactScaffoldPath(n.replace(/^src\/app\//i, 'src/'))) continue;
-      let dest = n.replace(/\.(jsx)$/i, '.tsx').replace(/\.(css)$/i, '.scss');
-      if (/\.component\.ts$/i.test(dest)) dest = dest.replace(/\.component\.ts$/i, '.tsx');
-      else if (/\.component\.scss$/i.test(dest)) dest = dest.replace(/\.component\.scss$/i, '.scss');
-      dest = dest.replace(/^src\/app\//i, 'src/');
-      const newPath = dest.startsWith('src/') ? dest : `src/${dest}`;
+      const newPath = normalizeReactPlanPath(n);
+      if (!newPath) continue;
       if (isReactScaffoldPath(newPath)) continue;
       if (plannedPaths.has(newPath)) continue;
       plannedPaths.add(newPath);
@@ -2189,21 +2230,93 @@ function matchUnitBundleFile(parsedFiles, expectedPath) {
   const direct = byPath.get(expected) || byPath.get(tsxExpected);
   if (direct) return direct;
 
-  const expectedBase = path.posix.basename(expected).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, '');
+  const stripComp = (name) => String(name || '').replace(/\.component$/i, '');
+  const expectedBase = stripComp(
+    path.posix.basename(expected).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, '')
+  );
   const expectedExt = path.posix.extname(expected);
   const expectedStem = kebabStemFromPath(expected);
 
-  return (parsedFiles || []).find((f) => {
+  const stemHit = (parsedFiles || []).find((f) => {
     const p = String(f.path || '').replace(/\\/g, '/').replace(/^\.?\//, '');
-    const base = path.posix.basename(p).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, '');
+    const base = stripComp(path.posix.basename(p).replace(/\.(tsx|ts|jsx|js|scss|css|html)$/i, ''));
     const ext = path.posix.extname(p);
-    if (!extCompatible(expectedExt, ext)) return false;
+    if (!extCompatible(expectedExt, ext) && !(expectedExt === '.ts' && ext === '.jsx') && !(expectedExt === '.tsx' && ext === '.jsx')) {
+      return false;
+    }
     return (
       base === expectedBase ||
       base.toLowerCase() === expectedBase.toLowerCase() ||
       kebabStemFromPath(p) === expectedStem
     );
-  }) || null;
+  });
+  if (stemHit) return stemHit;
+
+  if (/\.(tsx|ts|jsx|js)$/i.test(expected)) {
+    const codeFiles = (parsedFiles || []).filter((f) =>
+      /\.(tsx|ts|jsx|js)$/i.test(f.path) && String(f.content || '').trim()
+    );
+    if (codeFiles.length === 1) return codeFiles[0];
+  }
+  return null;
+}
+
+/**
+ * When the AI omits a React component, build a .tsx from the matching Angular triad.
+ */
+function synthesizeReactUnitFromAngular(unit, filesMap) {
+  if (!unit?.files?.length || !filesMap) return [];
+  const destCode = (unit.files || []).find(
+    (f) => /\.(tsx|ts|jsx|js)$/i.test(f.newPath) && !/\.d\.ts$/i.test(f.newPath)
+  );
+  if (!destCode) return [];
+  const stem =
+    kebabStemFromPath(destCode.newPath) || kebabStemFromPath(unit.label);
+  if (!stem) return [];
+
+  let ngHtml = '';
+  let ngTs = '';
+  let ngScss = '';
+  for (const [rel, content] of Object.entries(filesMap)) {
+    const n = String(rel).replace(/\\/g, '/');
+    if (kebabStemFromPath(n) !== stem) continue;
+    if (/\.component\.html$/i.test(n)) ngHtml = String(content || '');
+    else if (/\.component\.ts$/i.test(n) && !/\.spec\./i.test(n)) ngTs = String(content || '');
+    else if (/\.component\.(scss|css)$/i.test(n)) ngScss = String(content || '');
+  }
+  if (!ngHtml && !ngTs) return [];
+
+  const pascal = toPascalCaseName(stem);
+  const inputs = [...ngTs.matchAll(/@Input\(\)\s+(\w+)/g)].map((m) => m[1]);
+  const outputs = [...ngTs.matchAll(/@Output\(\)\s+(\w+)/g)].map((m) => m[1]);
+  const handlers = outputs.map(
+    (name) => `on${name.charAt(0).toUpperCase()}${name.slice(1)}`
+  );
+  const props = [...new Set([...inputs, ...handlers])];
+  const propsSig = props.length ? `{ ${props.join(', ')} }` : '';
+  const jsxBody = (ngHtml || '<div />').trim();
+  const stub = `import { useState } from 'react';
+
+export default function ${pascal}(${propsSig}) {
+  return (
+    <>
+${jsxBody}
+    </>
+  );
+}
+`;
+  const converted = rewriteReactAngularLeftovers(stub);
+  const out = [
+    { path: destCode.newPath.replace(/\.ts$/i, '.tsx'), content: converted }
+  ];
+  const destScss = (unit.files || []).find((f) => /\.(scss|css)$/i.test(f.newPath));
+  if (destScss) {
+    out.push({
+      path: destScss.newPath.replace(/\.css$/i, '.scss'),
+      content: ngScss.trim() ? `${ngScss.trim()}\n` : '/* component */\n'
+    });
+  }
+  return out;
 }
 
 /**
@@ -2759,7 +2872,10 @@ export {
   filterEssentialSourceFiles,
   verifyNpmCiBuild,
   matchUnitBundleFile,
-  normalizeReactPlanPath
+  normalizeReactPlanPath,
+  groupPlanIntoMigrationUnits,
+  coerceReactMigrationUnit,
+  synthesizeReactUnitFromAngular
 };
 
 /**
@@ -3266,8 +3382,23 @@ function triadSiblingOrder(newPath) {
  * Group sorted plan files into migration units (component triads stay together).
  * Build verification runs once per unit after all files in the unit are written.
  */
-function groupPlanIntoMigrationUnits(planItems) {
-  const sorted = sortPlanByDependencies(planItems);
+function groupPlanIntoMigrationUnits(planItems, toTech = '') {
+  const isReact = String(toTech || '').toLowerCase().includes('react');
+  const prepared = isReact
+    ? (planItems || [])
+        .map((item) => {
+          const newPath = normalizeReactPlanPath(item.newPath);
+          if (!newPath) return null;
+          let unit = item.unit;
+          if (unit) {
+            const u = normalizeReactPlanPath(String(unit));
+            unit = u || newPath;
+          }
+          return { ...item, newPath, unit };
+        })
+        .filter(Boolean)
+    : planItems;
+  const sorted = sortPlanByDependencies(prepared);
   const units = [];
   const consumed = new Set();
 
@@ -3285,8 +3416,9 @@ function groupPlanIntoMigrationUnits(planItems) {
     const pathKey = item.newPath.replace(/\\/g, '/');
     if (consumed.has(pathKey)) continue;
 
-    // Angular component triad → one unit
-    if (/\.component\.(ts|html|scss|css)$/i.test(pathKey)) {
+    // Angular component triad → one unit (never for React — leftover .component.ts
+    // paths are remapped to .tsx above).
+    if (!isReact && /\.component\.(ts|html|scss|css)$/i.test(pathKey)) {
       const base = pathKey.replace(/\.component\.(ts|html|scss|css)$/i, '.component');
       const files = [];
       for (const ext of ['.ts', '.html', '.scss']) {
@@ -3604,7 +3736,7 @@ COMPLETE CONVERSION (MANDATORY):
 - There is NO starter-kit template. Do not assume src/app/core, shared, store, or auth pages already exist.
 
 - If targeting Angular: convert components into Angular Standalone Components under src/app/. NEVER plan paths like src/admin or src/pages outside src/app/.
-- If targeting React: convert Angular components into React functional components with hooks. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
+- If targeting React: convert Angular components into React functional components with hooks. Plan PascalCase .tsx files (e.g. src/components/task-form-sidebar/TaskFormSidebar.tsx). NEVER plan .component.ts / .component.html / .component.scss or a unit id ending in .component. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 
 IMPORTANT RULES FOR FILE GENERATION:
 - For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
@@ -3696,7 +3828,23 @@ ${isSameFramework ? 'NOTE: Same framework — convert every source file. Do NOT 
     const useSimplePrompt = attempt === 2;
 
     const attemptInstruction = useSimplePrompt
-      ? `You are converting a frontend project file tree.
+      ? (targetLower.includes('react')
+        ? `You are converting an Angular project into React (Vite + TypeScript).
+
+From the FILE TREE below, list EVERY application source file that must exist in the converted React project.
+Include all pages, components, routes, services, hooks, and utils — not just auth/dashboard.
+
+List each file on a new line, starting with "src/".
+Use PascalCase .tsx for UI (never Angular .component.ts / .html / .scss).
+Example:
+src/App.tsx
+src/pages/TaskList.tsx
+src/components/task-form-sidebar/TaskFormSidebar.tsx
+src/components/task-delete-dialog/TaskDeleteDialog.tsx
+
+LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
+Include ALL feature files from the source tree.`
+        : `You are converting a frontend project file tree.
 
 From the FILE TREE below, list EVERY application source file that must exist in the converted project.
 Include all pages, components, routes, services, hooks, and utils — not just auth/dashboard.
@@ -3708,7 +3856,7 @@ src/app/app.routes.ts
 src/app/pages/admin-users/admin-users.component.ts
 
 LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
-Include ALL feature files from the source tree.`
+Include ALL feature files from the source tree.`)
       : blueprintSystemInstruction;
 
     const attemptUserPrompt = useSimplePrompt
@@ -3892,7 +4040,7 @@ ${enhancedPrompt}`
   report('blueprint', `Blueprint ready — ${filteredPlan.length} file(s) planned.`);
 
   // Group into logical units (Angular triad / React+scss) and dependency order
-  migrationUnits = groupPlanIntoMigrationUnits(filteredPlan);
+  migrationUnits = groupPlanIntoMigrationUnits(filteredPlan, toTech);
   console.log(
     `[${sessionId}] Incremental units: ${migrationUnits.length} ` +
     `(from ${filteredPlan.length} planned files). One AI call per unit.`
@@ -4026,7 +4174,15 @@ Do not wrap the whole response in markdown fences. Each file must be complete.`;
     }
 
   for (const unitIndex of indexesToWrite) {
-    const unit = migrationUnits[unitIndex];
+    let unit = migrationUnits[unitIndex];
+    if (targetLower.includes('react')) {
+      unit = coerceReactMigrationUnit(unit);
+      migrationUnits[unitIndex] = unit;
+      if (!unit.files.length) {
+        console.log(`[${sessionId}] Skipping empty React unit ${unit.label} after Angular triad remap`);
+        continue;
+      }
+    }
     if (targetLower.includes('react') && (unit.files || []).every((f) => isReactScaffoldPath(f.newPath))) {
       console.log(`[${sessionId}] Skipping React scaffold unit ${unit.label} (workspace template provides it)`);
       continue;
@@ -4128,6 +4284,13 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
           parsedFiles = synthesized;
           bundleRaw = 'synthesized-from-react-source';
           console.log(`[${sessionId}] Synthesized Angular unit from React source: ${unit.label}`);
+        }
+      } else if (targetLower.includes('react')) {
+        const synthesized = synthesizeReactUnitFromAngular(unit, essentialFilesMap);
+        if (synthesized.length > 0) {
+          parsedFiles = synthesized;
+          bundleRaw = 'synthesized-from-angular-source';
+          console.log(`[${sessionId}] Synthesized React unit from Angular source: ${unit.label}`);
         }
       }
     }
@@ -4251,6 +4414,49 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
           generatedFiles[expected] ||
             matchUnitBundleFile(parsedFiles, expected) ||
             fs.existsSync(path.join(migrationWorkspacePath, expected))
+        );
+      });
+    }
+    if (!wroteAllExpected && targetLower.includes('react')) {
+      const synthesized = synthesizeReactUnitFromAngular(unit, essentialFilesMap);
+      for (const fileTarget of unit.files) {
+        const expected = fileTarget.newPath.replace(/\\/g, '/');
+        if (/\.html$/i.test(expected)) continue;
+        if (matchUnitBundleFile(parsedFiles, expected)) continue;
+        const syn = matchUnitBundleFile(synthesized, expected);
+        if (!syn) continue;
+        const writeHint =
+          targetLower.includes('react') && fileContainsJsx(syn.content)
+            ? expected.replace(/\.ts$/, '.tsx')
+            : expected;
+        const safePath = resolveSafeWritePath(migrationWorkspacePath, writeHint) ||
+          resolveSafeWritePath(migrationWorkspacePath, expected);
+        if (!safePath) continue;
+        let destRel = safePath.relative;
+        let destFull = safePath.full;
+        const dest = reactDestinationForContent(migrationWorkspacePath, safePath.relative, syn.content);
+        destRel = dest.relative;
+        destFull = dest.full;
+        ensureDirectoryExists(path.dirname(destFull));
+        if (dest.staleTsFull && dest.staleTsFull !== destFull) unlinkIfExists(dest.staleTsFull);
+        if (destRel.endsWith('.tsx')) unlinkIfExists(destFull.replace(/\.tsx$/, '.ts'));
+        const trimmedContent = sanitizeGeneratedContent(destRel, syn.content);
+        fs.writeFileSync(destFull, trimmedContent, 'utf-8');
+        generatedFiles[destRel] = trimmedContent;
+        generatedFiles[expected] = trimmedContent;
+        console.log(`[${sessionId}]   Wrote ${destRel} (synthesized from Angular source)`);
+        parsedFiles.push(syn);
+      }
+      wroteAllExpected = unit.files.every((f) => {
+        const expected = f.newPath.replace(/\\/g, '/');
+        if (/\.(scss|css|html)$/i.test(expected)) return true;
+        const tsxTwin = expected.replace(/\.ts$/, '.tsx');
+        return Boolean(
+          generatedFiles[expected] ||
+            generatedFiles[tsxTwin] ||
+            matchUnitBundleFile(parsedFiles, expected) ||
+            fs.existsSync(path.join(migrationWorkspacePath, expected)) ||
+            fs.existsSync(path.join(migrationWorkspacePath, tsxTwin))
         );
       });
     }

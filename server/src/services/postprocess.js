@@ -2311,20 +2311,116 @@ function ensureInputsFromParentPropertyBindings(destPath) {
   }
 }
 
+function classHasOutput(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  return (
+    new RegExp(`@Output\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b`).test(source) ||
+    new RegExp(`\\b${esc}\\s*=\\s*output\\s*(?:<[^>]*>)?\\s*\\(`).test(source)
+  );
+}
+
+function classHasMethod(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  return new RegExp(
+    `(?:^|\\n)[ \\t]*(?:public|protected|private|override|async\\s+)*${esc}\\s*\\([^;{]*\\)\\s*(?::[^{]+)?\\{`,
+    'm'
+  ).test(source);
+}
+
+function outputNameWithoutOnPrefix(name) {
+  const n = String(name || '');
+  if (!/^on[A-Z]/.test(n)) return '';
+  const rest = n.slice(2);
+  return rest ? rest.charAt(0).toLowerCase() + rest.slice(1) : '';
+}
+
+function nearestOpenTagName(html, index) {
+  const before = String(html || '').slice(0, index);
+  const lt = before.lastIndexOf('<');
+  if (lt < 0) return '';
+  const chunk = String(html).slice(lt, index);
+  if (chunk.includes('>')) return '';
+  const m = chunk.match(/^<([A-Za-z][\w-]*)/);
+  return m ? m[1] : '';
+}
+
+function resolveChildComponentFile(tag, bySelector, byClass) {
+  const raw = String(tag || '');
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (bySelector.has(lower)) return bySelector.get(lower);
+  if (byClass.has(raw)) return byClass.get(raw);
+  if (byClass.has(`${raw}Component`)) return byClass.get(`${raw}Component`);
+  const kebab = raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/_/g, '-')
+    .toLowerCase();
+  if (bySelector.has(kebab)) return bySelector.get(kebab);
+  const withApp = kebab.startsWith('app-') ? kebab : `app-${kebab}`;
+  if (bySelector.has(withApp)) return bySelector.get(withApp);
+  return null;
+}
+
+function indexAngularComponents(srcRoot) {
+  const bySelector = new Map();
+  const byClass = new Map();
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+    if (sel) bySelector.set(sel[1].toLowerCase(), file);
+    const cls = content.match(/export\s+class\s+(\w+)/);
+    if (cls) {
+      byClass.set(cls[1], file);
+      byClass.set(cls[1].replace(/Component$/, ''), file);
+    }
+  }
+  return { bySelector, byClass };
+}
+
 /**
- * Parents binding `(onSave)="..."` on a child need `@Output() onSave`, not `@Input()`.
- * Without this, Angular treats the binding as a DOM listener and `$event` is `Event`.
+ * Parents binding `(onSave)` while the child exposes `@Output() save` must use `(save)`.
+ * Otherwise Angular treats `(onSave)` as a DOM listener and `$event` is `Event` (TS2345).
+ * Do not invent a second `@Output() onSave` that collides with a wrapper method, and
+ * do not rewrite `(click)="onRemove(task)"` into `onRemove.emit(task)` when `onRemove` is a method.
  */
 function ensureOutputsFromParentEventBindings(destPath) {
   const srcRoot = path.join(destPath, 'src');
-  const bySelector = new Map();
-  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+  const { bySelector, byClass } = indexAngularComponents(srcRoot);
+
+  for (const htmlFile of walkFiles(srcRoot, (n) => n.endsWith('.html'))) {
+    let html;
     try {
-      const content = fs.readFileSync(file, 'utf-8');
-      const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
-      if (sel) bySelector.set(sel[1].toLowerCase(), file);
+      html = fs.readFileSync(htmlFile, 'utf-8');
     } catch {
-      /* ignore */
+      continue;
+    }
+    const next = html.replace(/\((on[A-Z][A-Za-z0-9]*)\)(\s*=)/g, (full, onName, eq, offset) => {
+      if (!PROMOTE_TO_OUTPUT.has(onName)) return full;
+      const tag = nearestOpenTagName(html, offset);
+      const childFile = resolveChildComponentFile(tag, bySelector, byClass);
+      if (!childFile) return full;
+      let childSrc = '';
+      try {
+        childSrc = fs.readFileSync(childFile, 'utf-8');
+      } catch {
+        return full;
+      }
+      if (classHasOutput(childSrc, onName)) return full;
+      const alias = outputNameWithoutOnPrefix(onName);
+      if (alias && classHasOutput(childSrc, alias)) {
+        return `(${alias})${eq}`;
+      }
+      return full;
+    });
+    if (next !== html) {
+      fs.writeFileSync(htmlFile, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
     }
   }
 
@@ -2337,14 +2433,22 @@ function ensureOutputsFromParentEventBindings(destPath) {
     } catch {
       continue;
     }
-    for (const m of html.matchAll(
-      /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b[^>]*\((on[A-Za-z][A-Za-z0-9]*)\)\s*=/gi
-    )) {
-      const tag = m[1].toLowerCase();
-      const outName = m[2];
+    for (const m of html.matchAll(/\((on[A-Z][A-Za-z0-9]*)\)\s*=/g)) {
+      const outName = m[1];
       if (!PROMOTE_TO_OUTPUT.has(outName)) continue;
-      const file = bySelector.get(tag);
+      const tag = nearestOpenTagName(html, m.index || 0);
+      const file = resolveChildComponentFile(tag, bySelector, byClass);
       if (!file) continue;
+      let childSrc = '';
+      try {
+        childSrc = fs.readFileSync(file, 'utf-8');
+      } catch {
+        continue;
+      }
+      const alias = outputNameWithoutOnPrefix(outName);
+      if (classHasOutput(childSrc, outName) || (alias && classHasOutput(childSrc, alias))) {
+        continue;
+      }
       if (!needed.has(file)) needed.set(file, new Set());
       needed.get(file).add(outName);
     }
@@ -2355,12 +2459,7 @@ function ensureOutputsFromParentEventBindings(destPath) {
     const original = source;
     for (const name of names) {
       const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (
-        new RegExp(`@Output\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b`).test(source) ||
-        new RegExp(`\\b${esc}\\s*=\\s*output\\s*(?:<[^>]*>)?\\s*\\(`).test(source)
-      ) {
-        continue;
-      }
+      if (classHasOutput(source, name)) continue;
 
       source = source.replace(
         new RegExp(`^[ \\t]*@Input\\s*\\([^)]*\\)\\s*${esc}\\s*!?:[^;\\n]*;\\s*\\n?`, 'gm'),
@@ -2378,13 +2477,13 @@ function ensureOutputsFromParentEventBindings(destPath) {
         ''
       );
 
+      const hadMethod = classHasMethod(source, name);
       source = ensureImport(source, 'Output', '@angular/core');
       source = ensureImport(source, 'EventEmitter', '@angular/core');
       source = insertIntoClassBody(source, `  @Output() ${name} = new EventEmitter<any>();`);
 
-      // Child template may still call onSave(...) as a React callback — use .emit()
       const htmlPath = file.replace(/\.ts$/, '.html');
-      if (fs.existsSync(htmlPath)) {
+      if (!hadMethod && fs.existsSync(htmlPath)) {
         let html = fs.readFileSync(htmlPath, 'utf-8');
         const nextHtml = html.replace(
           new RegExp(`\\b${esc}(?!\\.emit)\\s*\\(`, 'g'),
@@ -2399,6 +2498,70 @@ function ensureOutputsFromParentEventBindings(destPath) {
       fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
     }
   }
+}
+
+/**
+ * `(click)="onRemove.emit(task)"` fails when `onRemove` is a wrapper method, not an EventEmitter.
+ */
+function repairCallbackEmitInTemplates(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  for (const tsFile of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+    const htmlPath = tsFile.replace(/\.ts$/, '.html');
+    if (!fs.existsSync(htmlPath)) continue;
+    let source = '';
+    let html = '';
+    try {
+      source = fs.readFileSync(tsFile, 'utf-8');
+      html = fs.readFileSync(htmlPath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const next = html.replace(/\b([A-Za-z_]\w*)\.emit\s*\(/g, (full, name) => {
+      if (classHasOutput(source, name) && !classHasMethod(source, name)) return full;
+      if (classHasMethod(source, name)) return `${name}(`;
+      const alias = outputNameWithoutOnPrefix(name);
+      if (alias && classHasOutput(source, alias)) return `${alias}.emit(`;
+      return full;
+    });
+    if (next !== html) {
+      fs.writeFileSync(htmlPath, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+    }
+  }
+}
+
+function wrapDomEventPayloads(destPath, buildErrors) {
+  const text = String(buildErrors || '');
+  if (!/Argument of type 'Event'|TS2345/.test(text)) return 0;
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.html)/g)) {
+    mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+  }
+  let changed = 0;
+  const srcRoot = path.join(destPath, 'src');
+  const targets = mentioned.size
+    ? [...mentioned].map((rel) => path.join(destPath, rel)).filter((f) => fs.existsSync(f))
+    : walkFiles(srcRoot, (n) => n.endsWith('.html'));
+  for (const htmlFile of targets) {
+    let html;
+    try {
+      html = fs.readFileSync(htmlFile, 'utf-8');
+    } catch {
+      continue;
+    }
+    const next = html.replace(
+      /\((\w+)\)="(\w+)\(\$event\)"/g,
+      (full, ev, handler) => {
+        if (/\$any\(\s*\$event\s*\)/.test(full)) return full;
+        if (!/^on[A-Z]\w+$/.test(ev)) return full;
+        return `(${ev})="${handler}($any($event))"`;
+      }
+    );
+    if (next !== html) {
+      fs.writeFileSync(htmlFile, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  return changed;
 }
 
 function workspaceUsesAngularMaterial(destPath, sourcePackageJson = null, sourceFilesMap = null) {
@@ -2523,6 +2686,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   try {
     ensureInputsFromParentPropertyBindings(destPath);
     ensureOutputsFromParentEventBindings(destPath);
+    repairCallbackEmitInTemplates(destPath);
   } catch (err) {
     console.warn(`[postprocess] Input/Output binding repair failed: ${err.message}`);
   }
@@ -2595,6 +2759,10 @@ export function repairAngularWorkspace(destPath, options = {}) {
  */
 export function fixAngularCompileErrors(destPath, buildErrors) {
   const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const eventIssues =
+    /TS2345/.test(text) ||
+    /Argument of type 'Event'/.test(text) ||
+    /Property 'emit' does not exist/.test(text);
   const needs =
     /NG1010/.test(text) ||
     /Unknown reference/.test(text) ||
@@ -2602,42 +2770,74 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /is not a known attribute/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
     /has no exported member 'Mat/.test(text);
-  if (!needs) return 0;
-
-  const mentioned = new Set();
-  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
-    mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
-  }
+  if (!needs && !eventIssues) return 0;
 
   const srcRoot = path.join(destPath, 'src');
-  const targets = [];
-  for (const rel of mentioned) {
-    const full = path.join(destPath, rel);
-    if (fs.existsSync(full)) targets.push(full);
-  }
-  if (targets.length === 0) {
-    targets.push(
-      ...walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'))
-    );
+  const snapshot = () => {
+    const map = new Map();
+    for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts') || n.endsWith('.html'))) {
+      try {
+        map.set(file, fs.readFileSync(file, 'utf-8'));
+      } catch {
+        /* ignore */
+      }
+    }
+    return map;
+  };
+  const beforeMap = snapshot();
+
+  if (eventIssues) {
+    try {
+      ensureOutputsFromParentEventBindings(destPath);
+      repairCallbackEmitInTemplates(destPath);
+    } catch (err) {
+      console.warn(`[postprocess] Output/emit repair failed: ${err.message}`);
+    }
   }
 
+  if (needs) {
+    const mentioned = new Set();
+    for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+      mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+    }
+
+    const targets = [];
+    for (const rel of mentioned) {
+      const full = path.join(destPath, rel);
+      if (fs.existsSync(full)) targets.push(full);
+    }
+    if (targets.length === 0) {
+      targets.push(
+        ...walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'))
+      );
+    }
+
+    for (const file of [...new Set(targets)]) {
+      if (!fs.existsSync(file)) continue;
+      const before = fs.readFileSync(file, 'utf-8');
+      try {
+        repairAngularComponentFile(file, {});
+      } catch (err) {
+        console.warn(`[postprocess] Angular compile repair failed for ${file}: ${err.message}`);
+        continue;
+      }
+      let after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
+      const forced = ensureNgSymbolsFromBuildErrors(after, text);
+      if (forced !== after) {
+        fs.writeFileSync(file, forced.endsWith('\n') ? forced : `${forced}\n`, 'utf-8');
+      }
+    }
+  }
+
+  if (eventIssues) {
+    wrapDomEventPayloads(destPath, text);
+  }
+
+  const afterMap = snapshot();
   let changed = 0;
-  for (const file of [...new Set(targets)]) {
-    if (!fs.existsSync(file)) continue;
-    const before = fs.readFileSync(file, 'utf-8');
-    try {
-      repairAngularComponentFile(file, {});
-    } catch (err) {
-      console.warn(`[postprocess] Angular compile repair failed for ${file}: ${err.message}`);
-      continue;
-    }
-    let after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
-    const forced = ensureNgSymbolsFromBuildErrors(after, text);
-    if (forced !== after) {
-      fs.writeFileSync(file, forced.endsWith('\n') ? forced : `${forced}\n`, 'utf-8');
-      after = forced;
-    }
-    if (after !== before) changed += 1;
+  const keys = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  for (const k of keys) {
+    if (beforeMap.get(k) !== afterMap.get(k)) changed += 1;
   }
   return changed;
 }

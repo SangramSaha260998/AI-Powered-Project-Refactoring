@@ -40,7 +40,10 @@ import {
   sanitizeAngularComponentTs,
   sanitizeCssContent,
   matchUnitBundleFile,
-  normalizeReactPlanPath
+  normalizeReactPlanPath,
+  groupPlanIntoMigrationUnits,
+  coerceReactMigrationUnit,
+  synthesizeReactUnitFromAngular
 } from '../src/services/migration.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1090,8 +1093,18 @@ export function Template() {
   );
   assert(
     normalizeReactPlanPath('src/app/components/task-delete-dialog/task-delete-dialog.component.ts') ===
-      'src/components/task-delete-dialog/task-delete-dialog.tsx',
-    'Angular component.ts remaps to React tsx under src/'
+      'src/components/task-delete-dialog/TaskDeleteDialog.tsx',
+    'Angular component.ts remaps to React PascalCase tsx under src/'
+  );
+  assert(
+    normalizeReactPlanPath('src/components/task-form-sidebar/task-form-sidebar.component') ===
+      'src/components/task-form-sidebar/TaskFormSidebar.tsx',
+    'bare .component unit id remaps to TaskFormSidebar.tsx'
+  );
+  assert(
+    normalizeReactPlanPath('src/app/components/task-form-sidebar/task-form-sidebar.component.scss') ===
+      'src/components/task-form-sidebar/TaskFormSidebar.scss',
+    'Angular component.scss remaps to PascalCase scss'
   );
 
   const bundle = [
@@ -1102,6 +1115,84 @@ export function Template() {
   assert(
     matchUnitBundleFile(bundle, 'src/components/task-delete-dialog/TaskDeleteDialog.scss') === null,
     'scss is not matched from a tsx-only bundle'
+  );
+}
+
+// --- Angular→React: leftover .component triad must not skip as incomplete ---
+{
+  const unitId = 'src/components/task-form-sidebar/task-form-sidebar.component';
+  const planItems = [
+    {
+      newPath: `${unitId}.ts`,
+      explanationOfSource: 'sidebar class',
+      unit: unitId,
+      complexity: 'medium',
+      dependencies: []
+    },
+    {
+      newPath: `${unitId}.html`,
+      explanationOfSource: 'sidebar template',
+      unit: unitId,
+      complexity: 'medium',
+      dependencies: []
+    },
+    {
+      newPath: `${unitId}.scss`,
+      explanationOfSource: 'sidebar styles',
+      unit: unitId,
+      complexity: 'low',
+      dependencies: []
+    }
+  ];
+  const units = groupPlanIntoMigrationUnits(planItems, 'React');
+  assert(units.length === 1, 'React grouping collapses Angular triad into one unit');
+  const paths = units[0].files.map((f) => f.newPath);
+  assert(
+    paths.includes('src/components/task-form-sidebar/TaskFormSidebar.tsx'),
+    'React grouping remaps .component.ts to TaskFormSidebar.tsx'
+  );
+  assert(!paths.some((p) => /\.html$/i.test(p)), 'React grouping drops .html siblings');
+  assert(!paths.some((p) => /\.component\./i.test(p)), 'React grouping has no leftover .component.* paths');
+
+  const leftoverTriad = {
+    id: unitId,
+    label: unitId,
+    files: planItems.map((item) => ({ newPath: item.newPath }))
+  };
+  const coerced = coerceReactMigrationUnit(leftoverTriad);
+  assert(
+    coerced.files.some((f) => f.newPath.endsWith('TaskFormSidebar.tsx')),
+    'coerce remaps a leftover Angular triad to TaskFormSidebar.tsx'
+  );
+  assert(
+    !coerced.files.some((f) => /\.html$/i.test(f.newPath)),
+    'coerce drops invented .html from a leftover triad'
+  );
+  assert(
+    !String(coerced.label).endsWith('.component'),
+    'coerce does not keep the .component skip label'
+  );
+
+  const synthesized = synthesizeReactUnitFromAngular(coerced, {
+    'src/app/components/task-form-sidebar/task-form-sidebar.component.ts': `
+import { Component, EventEmitter, Input, Output } from '@angular/core';
+@Component({ selector: 'app-task-form-sidebar', templateUrl: './task-form-sidebar.component.html' })
+export class TaskFormSidebarComponent {
+  @Input() open = false;
+  @Output() closed = new EventEmitter<void>();
+}
+`,
+    'src/app/components/task-form-sidebar/task-form-sidebar.component.html':
+      '<form><input name="title" /></form>'
+  });
+  assert(synthesized.length > 0, 'synthesizer builds TaskFormSidebar from Angular source');
+  assert(
+    matchUnitBundleFile(synthesized, 'src/components/task-form-sidebar/TaskFormSidebar.tsx'),
+    'synthesized tsx matches the remapped React plan path'
+  );
+  assert(
+    /export default function TaskFormSidebar/.test(synthesized[0].content),
+    'synthesized component is a React function named TaskFormSidebar'
   );
 }
 
@@ -1410,6 +1501,177 @@ export class BoardComponent {}
   assert(/Material\+Icons/.test(indexHtml), 'Material Icons font is linked in Angular index.html');
 
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- React→Angular: (onSave)/onRemove.emit vs @Output() save/remove ---
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng-outputs-'));
+  const tableDir = path.join(tmp, 'src', 'app', 'components', 'task-table');
+  const formDir = path.join(tmp, 'src', 'app', 'components', 'task-form-sidebar');
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'task-list');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.mkdirSync(formDir, { recursive: true });
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'package.json'), '{"name":"t","dependencies":{"@angular/core":"20.0.0"}}\n');
+
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { Task } from '../../models/task.model';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {
+  @Input() tasks: Task[] = [];
+  @Output() remove = new EventEmitter<Task>();
+  @Output() edit = new EventEmitter<Task>();
+  onRemove(value: Task): void {
+    this.remove.emit(value);
+  }
+  onEdit(value: Task): void {
+    this.edit.emit(value);
+  }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `<button type="button" class="hover:bg-gray-100 transition-colors" (click)="onRemove.emit(task)">Delete</button>
+`
+  );
+  fs.writeFileSync(
+    path.join(formDir, 'task-form-sidebar.component.ts'),
+    `import { Component, EventEmitter, Input, Output } from '@angular/core';
+import { Task, TaskDraft } from '../../models/task.model';
+@Component({
+  selector: 'app-task-form-sidebar',
+  standalone: true,
+  templateUrl: './task-form-sidebar.component.html'
+})
+export class TaskFormSidebarComponent {
+  @Input() task: Task | null = null;
+  @Output() save = new EventEmitter<TaskDraft>();
+  @Output() cancel = new EventEmitter<void>();
+  onSave(value: TaskDraft): void {
+    this.save.emit(value);
+  }
+}
+`
+  );
+  fs.writeFileSync(path.join(formDir, 'task-form-sidebar.component.html'), `<form></form>\n`);
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { Task, TaskDraft } from '../../models/task.model';
+import { TaskFormSidebarComponent } from '../../components/task-form-sidebar/task-form-sidebar.component';
+import { TaskTableComponent } from '../../components/task-table/task-table.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskFormSidebarComponent, TaskTableComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  editingTask: Task | null = null;
+  onSave(draft: TaskDraft): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-form-sidebar [task]="editingTask" (onSave)="onSave($event)"></app-task-form-sidebar>
+<app-task-table [tasks]="[]" (onRemove)="deletingTask = $event"></app-task-table>
+`
+  );
+
+  repairAngularWorkspace(tmp, { sourceFilesMap: {}, sourcePackageJson: { dependencies: { react: '^19' } } });
+
+  const tableHtml = fs.readFileSync(path.join(tableDir, 'task-table.component.html'), 'utf-8');
+  const tableTs = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(
+    /\(click\)="onRemove\(task\)"/.test(tableHtml),
+    'onRemove.emit(task) rewrites to method call when onRemove is a wrapper'
+  );
+  assert(!/onRemove\.emit/.test(tableHtml), 'task-table template does not keep onRemove.emit');
+  assert(
+    !/@Output\(\)\s+onRemove/.test(tableTs),
+    'does not add a colliding @Output() onRemove next to @Output() remove'
+  );
+  assert(/\(save\)="onSave\(\$event\)"/.test(listHtml), 'parent (onSave) remaps to child @Output() save');
+  assert(!/\(onSave\)=/.test(listHtml), 'parent no longer binds unknown (onSave) DOM event');
+  assert(/\(remove\)=/.test(listHtml), 'parent (onRemove) remaps to child @Output() remove');
+
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng-emit-fix-'));
+  const t2 = path.join(tmp2, 'src', 'app', 'components', 'task-table');
+  const l2 = path.join(tmp2, 'src', 'app', 'pages', 'task-list');
+  fs.mkdirSync(t2, { recursive: true });
+  fs.mkdirSync(l2, { recursive: true });
+  fs.writeFileSync(
+    path.join(t2, 'task-table.component.ts'),
+    `import { Component, EventEmitter, Output } from '@angular/core';
+import { Task } from '../../models/task.model';
+@Component({ selector: 'app-task-table', standalone: true, templateUrl: './task-table.component.html' })
+export class TaskTableComponent {
+  @Output() remove = new EventEmitter<Task>();
+  onRemove(value: Task): void { this.remove.emit(value); }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(t2, 'task-table.component.html'),
+    `<button (click)="onRemove.emit(task)">x</button>\n`
+  );
+  fs.writeFileSync(
+    path.join(l2, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { TaskDraft } from '../../models/task.model';
+@Component({ selector: 'app-task-list', standalone: true, templateUrl: './task-list.component.html' })
+export class TaskListComponent {
+  onSave(draft: TaskDraft): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(l2, 'task-list.component.html'),
+    `<app-task-form-sidebar (onSave)="onSave($event)"></app-task-form-sidebar>\n`
+  );
+  fs.mkdirSync(path.join(tmp2, 'src', 'app', 'components', 'task-form-sidebar'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp2, 'src', 'app', 'components', 'task-form-sidebar', 'task-form-sidebar.component.ts'),
+    `import { Component, EventEmitter, Output } from '@angular/core';
+import { TaskDraft } from '../../models/task.model';
+@Component({ selector: 'app-task-form-sidebar', standalone: true, templateUrl: './task-form-sidebar.component.html' })
+export class TaskFormSidebarComponent {
+  @Output() save = new EventEmitter<TaskDraft>();
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp2, 'src', 'app', 'components', 'task-form-sidebar', 'task-form-sidebar.component.html'),
+    `<form></form>\n`
+  );
+
+  const errText = `
+Error: src/app/components/task-table/task-table.component.html:37:173: Property 'emit' does not exist
+  37 │ ...over:bg-gray-100 transition-colors" (click)="onRemove.emit(task)">
+Error occurs in the template of component TaskTableComponent.
+src/app/components/task-table/task-table.component.ts:9:15: templateUrl: './task-table.component.html'
+TS2345: Argument of type 'Event' is not assignable to parameter of type 'TaskDraft'.
+src/app/pages/task-list/task-list.component.html:47:25: (onSave)="onSave($event)"
+Error occurs in the template of component TaskListComponent.
+`;
+  const n = fixAngularCompileErrors(tmp2, errText);
+  assert(n >= 1, 'fixAngularCompileErrors repairs emit/$event template errors');
+  const tableHtml2 = fs.readFileSync(path.join(t2, 'task-table.component.html'), 'utf-8');
+  const listHtml2 = fs.readFileSync(path.join(l2, 'task-list.component.html'), 'utf-8');
+  assert(/onRemove\(task\)/.test(tableHtml2), 'compile fixer strips method.emit');
+  assert(/\(save\)="onSave\(\$event\)"/.test(listHtml2), 'compile fixer remaps (onSave) to (save)');
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp2, { recursive: true, force: true });
 }
 
 if (process.exitCode) {

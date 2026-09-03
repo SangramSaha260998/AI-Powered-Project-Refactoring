@@ -32,7 +32,9 @@ import {
   angularDestForReactSource,
   isReactBootstrapPath,
   isMisplacedAngularAppComponentPath,
-  synthesizeAngularUnitFromReact
+  synthesizeAngularUnitFromReact,
+  restoreAngularBehaviorFromReact,
+  collectAngularBehaviorGaps
 } from './reactToAngular.js';
 
 // ---------------------------------------------------------------------------
@@ -3736,7 +3738,7 @@ COMPLETE CONVERSION (MANDATORY):
 - There is NO starter-kit template. Do not assume src/app/core, shared, store, or auth pages already exist.
 
 - If targeting Angular: convert components into Angular Standalone Components under src/app/. NEVER plan paths like src/admin or src/pages outside src/app/.
-- If targeting React: convert Angular components into React functional components with hooks. Plan PascalCase .tsx files (e.g. src/components/task-form-sidebar/TaskFormSidebar.tsx). NEVER plan .component.ts / .component.html / .component.scss or a unit id ending in .component. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
+- If targeting React: convert Angular components into React functional components with hooks. Plan PascalCase .tsx files (e.g. src/components/item-editor/ItemEditor.tsx). NEVER plan .component.ts / .component.html / .component.scss or a unit id ending in .component. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
 
 IMPORTANT RULES FOR FILE GENERATION:
 - For React projects: Only generate src/ files. Do NOT generate config files like package.json, tsconfig.json, vite.config.ts.
@@ -3838,9 +3840,9 @@ List each file on a new line, starting with "src/".
 Use PascalCase .tsx for UI (never Angular .component.ts / .html / .scss).
 Example:
 src/App.tsx
-src/pages/TaskList.tsx
-src/components/task-form-sidebar/TaskFormSidebar.tsx
-src/components/task-delete-dialog/TaskDeleteDialog.tsx
+src/pages/HostPage.tsx
+src/components/item-editor/ItemEditor.tsx
+src/components/confirm-dialog/ConfirmDialog.tsx
 
 LIST ONLY THE FILE PATHS. No explanations. No JSON. No markdown.
 Include ALL feature files from the source tree.`
@@ -4132,6 +4134,7 @@ CRITICAL RULES:
 34. STYLING MANDATE: All UI styling = Tailwind CSS utilities. All style files = .scss (never .css). Global: Angular src/styles.scss, React src/index.scss.
 35. INCREMENTAL MIGRATION: Prefer code that compiles with only units written so far. Avoid importing files that are not yet generated; use temporary stubs or omit unfinished route entries until those units land.
 36. COMPLETE CONVERSION: There is NO starter-kit template. Convert every source feature into real target files. Do not skip CRUD/admin/settings pages. You may overwrite stub app.component / app.routes / App.tsx.
+36b. For Angular from React: copy SOURCE handler bodies (save/update/delete/submit/validation/open-close). Empty methods that compile are incomplete — the first conversion must include that behavior, not a later error-fix pass.
 37. ENVIRONMENTS: src/environments/environment*.ts start as { production }. Extend with keys the converted code needs in the SAME unit.
 38. For React: @ngxs/store → zustand (\`import { create } from 'zustand'\`). No @State, @Action, Store.dispatch(new X()), or provideStore. Export a useXStore hook with the same CRUD methods.
 39. For React: @angular/material → @mui/material. MatSidenav → Drawer, MatDialog → Dialog/DialogTitle/DialogContent/DialogActions, MatToolbar → AppBar+Toolbar, mat-icon → Icon (Material Icons font) or lucide-react, mat-button → Button, mat-icon-button → IconButton. Do not leave mat-* tags or @angular/material imports in React files.
@@ -4560,6 +4563,47 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       sourceFilesMap: essentialFilesMap,
       sourcePackageJson
     });
+    if (String(fromTech || '').toLowerCase().includes('react')) {
+      const restored = restoreAngularBehaviorFromReact(
+        migrationWorkspacePath,
+        essentialFilesMap
+      );
+      if (restored.changed) {
+        console.log(
+          `[${sessionId}] Restored source behavior in ${restored.changed} Angular component(s) from React`
+        );
+        report(
+          'unit',
+          `Restored missing source behavior in ${restored.changed} component(s)`
+        );
+        repairAngularWorkspace(migrationWorkspacePath, {
+          sourceFilesMap: essentialFilesMap,
+          sourcePackageJson
+        });
+      }
+      const leftoverGaps = restored.gaps?.length
+        ? restored.gaps
+        : collectAngularBehaviorGaps(migrationWorkspacePath, essentialFilesMap);
+      if (leftoverGaps.length) {
+        console.log(
+          `[${sessionId}] ${leftoverGaps.length} component(s) still missing source handlers — asking AI to restore behavior`
+        );
+        report('unit', 'Filling remaining source handlers before build...');
+        const parityEdits = await askAIToRestoreSourceBehavior(
+          sessionId,
+          migrationWorkspacePath,
+          essentialFilesMap,
+          leftoverGaps,
+          aiProvider,
+          aiModel
+        );
+        applyWorkspaceEdits(sessionId, migrationWorkspacePath, parityEdits);
+        repairAngularWorkspace(migrationWorkspacePath, {
+          sourceFilesMap: essentialFilesMap,
+          sourcePackageJson
+        });
+      }
+    }
     // Final lock: AI / postprocess must not drift away from resolved version
     enforceAngularPackageVersions(migrationWorkspacePath, targetVersions.angular);
   }
@@ -4712,6 +4756,120 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
   clearCheckpoint(sessionId);
 
   return outputZipPath;
+}
+
+function applyWorkspaceEdits(sessionId, workspacePath, edits) {
+  let applied = 0;
+  for (const edit of edits || []) {
+    if (edit.delete) {
+      const safePath = resolveSafeWritePath(workspacePath, edit.relativePath);
+      if (!safePath) {
+        console.warn(`[${sessionId}] Skipping unsafe delete path: ${edit.relativePath}`);
+        continue;
+      }
+      if (fs.existsSync(safePath.full)) {
+        fs.unlinkSync(safePath.full);
+        applied += 1;
+      }
+      continue;
+    }
+    const fixPath = resolveFixWritePath(workspacePath, edit.relativePath, '', false);
+    if (!fixPath) {
+      console.warn(`[${sessionId}] Skipping unsafe/unresolved edit path: ${edit.relativePath}`);
+      continue;
+    }
+    ensureDirectoryExists(path.dirname(fixPath.full));
+    fs.writeFileSync(
+      fixPath.full,
+      sanitizeGeneratedContent(fixPath.relative, edit.content),
+      'utf-8'
+    );
+    applied += 1;
+  }
+  return applied;
+}
+
+/**
+ * First-pass conversion often ships empty handlers that compile. Restore them
+ * from the uploaded source the same way a later "submit errors" rework would.
+ */
+async function askAIToRestoreSourceBehavior(
+  sessionId,
+  workspacePath,
+  sourceFilesMap,
+  gaps,
+  aiProvider,
+  aiModel
+) {
+  const destFiles = {};
+  const sourceSlice = {};
+  for (const gap of gaps || []) {
+    if (gap.source && sourceFilesMap[gap.source]) {
+      sourceSlice[gap.source] = sourceFilesMap[gap.source];
+    }
+    if (gap.dest) {
+      const full = path.join(workspacePath, gap.dest);
+      const html = full.replace(/\.ts$/, '.html');
+      const scss = full.replace(/\.ts$/, '.scss');
+      for (const file of [full, html, scss]) {
+        if (fs.existsSync(file)) {
+          destFiles[path.relative(workspacePath, file).replace(/\\/g, '/')] =
+            fs.readFileSync(file, 'utf-8');
+        }
+      }
+    }
+  }
+  const prompt = `The migrated Angular project COMPILES but is MISSING source behavior.
+This is the same work a user would later request via "submit errors / changes".
+Do it NOW from the uploaded SOURCE. Do not invent features that are not in the source.
+
+GAPS:
+${JSON.stringify(gaps, null, 2)}
+
+SOURCE FILES (behavior to preserve):
+${buildFilesContext(sourceSlice)}
+
+CURRENT ANGULAR FILES (incomplete — fill empty handlers, form submit, CRUD, dialogs, validation):
+${buildFilesContext(destFiles)}
+
+RULES:
+- Output JSON {"files":[{"path":"src/app/...","content":"..."}]} with COMPLETE files.
+- Copy SOURCE save/update/delete/submit/validation/open-close logic into class methods.
+- Keep Angular standalone + templateUrl. Parent event names must match child @Output names (save not onSave).
+- Do not empty out working methods. Do not rewrite unrelated files.
+- Output ONLY JSON.`;
+
+  try {
+    const response = await callLLM(
+      'You restore missing source behavior in a migrated Angular app. Output ONLY JSON with a files array.',
+      prompt,
+      true,
+      aiProvider,
+      aiModel
+    );
+    let parsed;
+    try {
+      let cleaned = String(response || '').trim();
+      if (/^```/.test(cleaned)) {
+        cleaned = cleaned.replace(/^```[\w+-]*\s*\n?/, '').replace(/\n?```\s*$/, '');
+      }
+      parsed = JSON.parse(cleaned);
+    } catch {
+      console.warn(`[${sessionId}] Source-behavior restore response was not valid JSON`);
+      return [];
+    }
+    const files = parsed.files || parsed;
+    if (!Array.isArray(files)) return [];
+    return files
+      .filter((f) => f && typeof f.path === 'string' && typeof f.content === 'string')
+      .map((f) => ({
+        relativePath: String(f.path).replace(/^\.?\//, ''),
+        content: f.content
+      }));
+  } catch (err) {
+    console.warn(`[${sessionId}] Source-behavior restore AI call failed: ${err.message}`);
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------

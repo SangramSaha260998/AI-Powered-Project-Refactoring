@@ -2,8 +2,9 @@
  * Mechanical React → Angular conversion used when the AI unit writer fails.
  * Produces a standalone component triad from a function-component TSX file.
  */
+import fs from 'fs';
 import path from 'path';
-import { declarablesNeededByHtml, inferDeclarablePackage } from './postprocess.js';
+import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairInferredTemplateHandlers } from './postprocess.js';
 
 export function isReactBootstrapPath(rel) {
   const p = String(rel || '').replace(/\\/g, '/');
@@ -253,7 +254,11 @@ function convertMui(html) {
         .replace(/\bmultiline\b/g, '')
         .replace(/\brows=\{(\d+)\}/g, 'rows="$1"');
       const tag = /\brows=/.test(a) ? 'textarea' : 'input';
-      return `<mat-form-field appearance="outline"><mat-label>${label}</mat-label><${tag} matInput${a}></${tag}></mat-form-field>`;
+      const control =
+        tag === 'input'
+          ? `<input matInput${a} />`
+          : `<textarea matInput${a}></textarea>`;
+      return `<mat-form-field appearance="outline"><mat-label>${label}</mat-label>${control}</mat-form-field>`;
     }
   );
   h = h.replace(/<FormControl\b([^>]*)>/g, '<mat-form-field appearance="outline"$1>');
@@ -273,8 +278,10 @@ function convertMui(html) {
   h = h.replace(/\blabelId="[^"]*"/g, '');
   h = h.replace(/(?<!aria-|mat-)label="([^"]+)"/g, '');
   h = h.replace(/\bvalue=\{([^}]+)\}/g, '[value]="$1"');
-  h = h.replace(/\btask=\{([^}]+)\}/g, '[task]="$1"');
-  h = h.replace(/\btasks=\{([^}]+)\}/g, '[tasks]="$1"');
+  h = h.replace(/\b([a-z]\w*)=\{([^}]+)\}/g, (full, name, expr) => {
+    if (/^on[A-Z]/.test(name)) return full;
+    return `[${name}]="${expr}"`;
+  });
   return h.replace(/⟹/g, '=>');
 }
 
@@ -291,11 +298,12 @@ function cleanupHtml(html) {
   h = h.replace(/<ng-container([^>]*)>/g, (full, attrs) => {
     if (/\[open\]=/.test(attrs)) {
       const expr = attrs.match(/\[open\]="([^"]+)"/)?.[1] || 'open';
-      return `@if (${expr}) {\n<div class="task-delete-dialog">`;
+      return `@if (${expr}) {\n<div class="dialog-host">`;
     }
-    return '<div class="task-delete-dialog">';
+    return '<div class="dialog-host">';
   });
   h = h.replace(/<\/ng-container>/g, '</div>\n}');
+  h = repairSelfClosingNonVoidTags(h);
   return h;
 }
 
@@ -394,6 +402,25 @@ function parseProps(tsx) {
   return { fields, names };
 }
 
+function primaryEntityProp(props) {
+  return (props?.fields || []).find(
+    (f) =>
+      !/^on[A-Z]/.test(f.name) &&
+      !String(f.type || '').includes('=>') &&
+      !/boolean/.test(f.type) &&
+      f.name !== 'open'
+  );
+}
+
+function extractTernaryConst(tsx, name) {
+  const re = new RegExp(
+    `(?:const|let)\\s+${name}\\s*=\\s*(\\w+)\\s*\\?\\s*(['"][^'"]+['"])\\s*:\\s*(['"][^'"]+['"])`
+  );
+  const m = String(tsx || '').match(re);
+  if (!m) return null;
+  return { cond: m[1], whenTrue: m[2], whenFalse: m[3] };
+}
+
 function rewriteSetters(body, states) {
   let out = body;
   for (const st of states) {
@@ -420,7 +447,8 @@ function extractComponentBody(tsx) {
 function extractMethods(body, states) {
   const methods = [];
   const withoutReturn = body.replace(/return\s*\([\s\S]*\)\s*;\s*$/, '');
-  const re = /const\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>\s*\{([\s\S]*?)\n  \};/g;
+  const re =
+    /const\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)(?:\s*:\s*[^=\{]+)?\s*=>\s*\{([\s\S]*?)\n\s*\};/g;
   let m;
   while ((m = re.exec(withoutReturn))) {
     let inner = rewriteSetters(m[3], states);
@@ -457,9 +485,7 @@ function childComponentImports(html, fromFile) {
   return unique.map((sel) => {
     const kebab = sel.replace(/^app-/, '');
     const className = `${toPascalName(kebab)}Component`;
-    const folder = kebab.includes('task-list')
-      ? `src/app/pages/${kebab}`
-      : `src/app/components/${kebab}`;
+    const folder = `src/app/components/${kebab}`;
     const target = `${folder}/${kebab}.component`;
     return { sel, className, importPath: relativeImport(fromFile, `${target}.ts`) };
   });
@@ -473,20 +499,21 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   if (!info || info.kind !== 'component') return [];
   const jsx = extractJsxReturn(tsx);
   let html = convertJsxToAngularHtml(jsx);
-  html = html.replace(/\bTASK_STATUS_LABELS\b/g, 'statusLabels');
-  html = html.replace(/\bTASK_STATUS_OPTIONS\b/g, 'statusOptions');
+  html = html.replace(/\b[A-Z][A-Z0-9]*_STATUS_LABELS\b/g, 'statusLabels');
+  html = html.replace(/\b[A-Z][A-Z0-9]*_STATUS_OPTIONS\b/g, 'statusOptions');
   html = html.replace(/\(click\)="(\w+)\(\$event\)"/g, (full, name) => {
-    if (name.startsWith('set') || name.startsWith('on') || name === 'openAdd' || name === 'openEdit') {
+    if (name.startsWith('set') || name.startsWith('on') || /^open[A-Z]/.test(name)) {
       return full.replace('($event)', '()');
     }
     return full;
   });
-  html = html.replace(/\(click\)="openAdd\(\$event\)"/g, '(click)="openAdd()"');
-  html = html.replace(/\(remove\)="setDeletingTask\(\$event\)"/g, '(remove)="deletingTask = $event"');
+  html = html.replace(/\((\w+)\)="set([A-Z]\w+)\(\$event\)"/g, (_, evt, cap) => {
+    const field = cap.charAt(0).toLowerCase() + cap.slice(1);
+    return `(${evt})="${field} = $event"`;
+  });
   html = html.replace(/<mat-sidenav([\s\S]*?)\[open\]=/g, '<mat-sidenav$1[opened]=');
   html = html.replace(/track option\.id/g, 'track option');
-  html = html.replace(/\(click\)="onEdit\(task[^"]*/g, '(click)="onEdit(task)"');
-  html = html.replace(/\(click\)="onRemove\(task[^"]*/g, '(click)="onRemove(task)"');
+  html = html.replace(/\(click\)="(on(?:Edit|Remove))\((\w+)[^"]*/g, '(click)="$1($2)"');
 
   const states = parseUseState(tsx);
   const props = parseProps(tsx);
@@ -497,11 +524,19 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   const tsPath = info.files[0];
   const ngModules = materialImportsForHtml(html);
   const children = childComponentImports(html, tsPath);
-  const needsOnChanges = /useEffect\(/.test(tsx) && props.names.includes('task');
-  const usesTaskModel = /\bTask\b/.test(tsx);
-  const modelImport = usesTaskModel
-    ? `import { Task${/TaskDraft/.test(tsx) ? ', TaskDraft' : ''}${/\bTaskStatus\b/.test(tsx) ? ', TaskStatus' : ''}${/TASK_STATUS_LABELS/.test(tsx) ? ', TASK_STATUS_LABELS' : ''}${/TASK_STATUS_OPTIONS/.test(tsx) ? ', TASK_STATUS_OPTIONS' : ''} } from '${relativeImport(tsPath, 'src/app/models/task.model')}';\n`
-    : '';
+  const needsOnChanges = /useEffect\(/.test(tsx) && props.names.length > 0;
+  const modelImportLines = [];
+  for (const m of String(tsx || '').matchAll(
+    /import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]([^'"]*models\/[^'"]+)['"]/g
+  )) {
+    const names = m[1].replace(/\btype\s+/g, '').trim();
+    const spec = m[2].replace(/\.(tsx|ts)$/i, '');
+    const base = spec.replace(/^.*\bmodels\//, '');
+    if (!names || !base) continue;
+    modelImportLines.push(
+      `import { ${names} } from '${relativeImport(tsPath, `src/app/models/${base}`)}';`
+    );
+  }
 
   const importLines = [
     `import { Component${needsOnChanges ? ', Input, Output, EventEmitter, OnChanges, SimpleChanges' : props.fields.length ? ', Input, Output, EventEmitter' : ''} } from '@angular/core';`
@@ -522,7 +557,7 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   for (const ch of children) {
     importLines.push(`import { ${ch.className} } from '${ch.importPath}';`);
   }
-  if (modelImport) importLines.push(modelImport.trim());
+  if (modelImportLines.length) importLines.push(...modelImportLines);
 
   const ngImports = [
     ...ngModules.map((m) => m.mod),
@@ -568,35 +603,40 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
 
   const stateDecls = states.map((st) => `  ${st.name}: ${st.type} = ${st.init};`);
   const extraFields = [];
-  if (/TASK_STATUS_LABELS/.test(tsx)) extraFields.push('  readonly statusLabels = TASK_STATUS_LABELS;');
-  if (/TASK_STATUS_OPTIONS/.test(tsx)) extraFields.push('  readonly statusOptions = TASK_STATUS_OPTIONS;');
-  const getters = [];
-  if (/\bheading\b/.test(html)) {
-    getters.push(`  get heading(): string {\n    return this.task ? 'Edit task' : 'Add task';\n  }`);
+  for (const m of String(tsx || '').matchAll(/\b([A-Z][A-Z0-9]*_STATUS_(?:LABELS|OPTIONS))\b/g)) {
+    const alias = /LABELS$/.test(m[1]) ? 'statusLabels' : 'statusOptions';
+    const line = `  readonly ${alias} = ${m[1]};`;
+    if (!extraFields.includes(line)) extraFields.push(line);
   }
-  if (/\bsubmitLabel\b/.test(html)) {
-    getters.push(`  get submitLabel(): string {\n    return this.task ? 'Update' : 'Add';\n  }`);
+  const getters = [];
+  for (const getterName of ['heading', 'submitLabel']) {
+    if (!new RegExp(`\\b${getterName}\\b`).test(html)) continue;
+    const ternary = extractTernaryConst(tsx, getterName);
+    if (ternary) {
+      getters.push(
+        `  get ${getterName}(): string {\n    return this.${ternary.cond} ? ${ternary.whenTrue} : ${ternary.whenFalse};\n  }`
+      );
+    }
   }
 
   const constDecls = moduleConsts.map((m) => `const ${m[1]} = ${m[2]};`);
   const thisNames = [
     ...states.map((s) => s.name),
     ...props.fields.map((f) => f.name),
-    ...methods.map((m) => m.name),
-    'title',
-    'description',
-    'status',
-    'titleTouched'
+    ...methods.map((m) => m.name)
   ];
 
   const methodText = [
     ...methods.map((fn) => {
       let inner = fn.body
         .replace(/\bthis\.(\w+) = \(([\s\S]*?)\);/g, 'this.$1 = $2;')
-        .replace(/\bcloseSidebar\(\)/g, 'this.closeSidebar()')
-        .replace(/\bopenAdd\(\)/g, 'this.openAdd()')
-        .replace(/\bonSave\(/g, 'this.save.emit(')
         .replace(/\bFormEvent\b/g, 'Event');
+      for (const f of props.fields) {
+        if (!/^on[A-Z]/.test(f.name) && !String(f.type || '').includes('=>')) continue;
+        const evt = f.name.replace(/^on/, '');
+        const evtName = evt.charAt(0).toLowerCase() + evt.slice(1);
+        inner = inner.replace(new RegExp(`\\b${f.name}\\(`, 'g'), `this.${evtName}.emit(`);
+      }
       for (const n of thisNames) {
         inner = inner.replace(
           new RegExp(`(?<!this\\.)(?<![.\\w])(?<!\\{\\s*)(?<!,\\s*)\\b${n}\\b`, 'g'),
@@ -616,21 +656,31 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
 
   let onChanges = '';
   if (needsOnChanges) {
-    onChanges = `
+    const entity = primaryEntityProp(props);
+    if (entity) {
+      const formStates = states.filter(
+        (st) => !/Touched$|Error$|^open$/.test(st.name) && !/boolean/.test(st.type)
+      );
+      const assigns = formStates
+        .map((st) => `      this.${st.name} = this.${entity.name}.${st.name};`)
+        .join('\n');
+      const resets = formStates.map((st) => `      this.${st.name} = ${st.init};`).join('\n');
+      const touched = states
+        .filter((st) => /Touched$/.test(st.name))
+        .map((st) => `    this.${st.name} = false;`)
+        .join('\n');
+      onChanges = `
   ngOnChanges(changes: SimpleChanges): void {
-    if (!changes['task']) return;
-    if (this.task) {
-      this.title = this.task.title;
-      this.description = this.task.description;
-      this.status = this.task.status;
+    if (!changes['${entity.name}']) return;
+    if (this.${entity.name}) {
+${assigns}
     } else {
-      this.title = '';
-      this.description = '';
-      this.status = 'todo';
+${resets}
     }
-    this.titleTouched = false;
+${touched}
   }
 `;
+    }
   }
 
   const implementsClause = needsOnChanges ? ' implements OnChanges' : '';
@@ -727,4 +777,488 @@ export function synthesizeAngularUnitFromReact(unit, filesMap) {
     scss: scssRel ? filesMap[scssRel] : '',
     dest: info
   });
+}
+
+function findMatchingBrace(text, openIdx) {
+  let depth = 0;
+  let inStr = null;
+  let escape = false;
+  for (let i = openIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function isStubMethodBody(body) {
+  const t = String(body || '')
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .trim();
+  if (!t) return true;
+  if (/^return;?$/.test(t)) return true;
+  if (/return\s+_args\b/.test(t)) return true;
+  if (/^throw new Error/.test(t)) return true;
+  if (/not implemented|TODO|FIXME/i.test(t) && t.length < 80) return true;
+  return t.length < 6;
+}
+
+function isThinTemplate(html) {
+  const t = String(html || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .trim();
+  if (t.length < 40) return true;
+  return /placeholder|coming soon|not implemented|todo component/i.test(t);
+}
+
+function sourceHandlerNames(tsx) {
+  const names = new Set();
+  const src = String(tsx || '');
+  for (const m of src.matchAll(
+    /const\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)(?:\s*:\s*[^=\{]+)?\s*=>\s*\{/g
+  )) {
+    if (/^(use[A-Z]|set[A-Z])/.test(m[1])) continue;
+    names.add(m[1]);
+  }
+  return [...names];
+}
+
+function extractClassMethods(source) {
+  const classMatch = String(source || '').match(/export\s+class\s+\w+[^{]*\{/);
+  if (!classMatch || classMatch.index == null) return [];
+  const open = classMatch.index + classMatch[0].length - 1;
+  const close = findMatchingBrace(source, open);
+  if (close < 0) return [];
+  const body = source.slice(open + 1, close);
+  const methods = [];
+  const re =
+    /(?:^|(?<=[\n}]))([ \t]*(?:public|protected|private|override|async\s+)*(?!constructor\b)(\w+)\s*\([^;{]*\)\s*(?::[^{]+)?\{)/g;
+  let m;
+  while ((m = re.exec(body))) {
+    if (/^(if|for|while|switch|catch|get|set)$/.test(m[2])) continue;
+    const absOpen = open + 1 + m.index + m[1].length - 1;
+    const absClose = findMatchingBrace(source, absOpen);
+    if (absClose < 0) continue;
+    const methodBody = source.slice(absOpen + 1, absClose);
+    methods.push({
+      name: m[2],
+      start: open + 1 + m.index,
+      end: absClose + 1,
+      body: methodBody,
+      full: source.slice(open + 1 + m.index, absClose + 1)
+    });
+  }
+  return methods;
+}
+
+function extractSynClassMembers(synTs) {
+  const classMatch = String(synTs || '').match(/export\s+class\s+\w+[^{]*\{/);
+  if (!classMatch || classMatch.index == null) return { fields: '', methods: [] };
+  const open = classMatch.index + classMatch[0].length - 1;
+  const close = findMatchingBrace(synTs, open);
+  if (close < 0) return { fields: '', methods: [] };
+  const methods = extractClassMethods(synTs);
+  let cursor = open + 1;
+  const fieldParts = [];
+  const sorted = [...methods].sort((a, b) => a.start - b.start);
+  for (const method of sorted) {
+    fieldParts.push(synTs.slice(cursor, method.start));
+    cursor = method.end;
+  }
+  fieldParts.push(synTs.slice(cursor, close));
+  return { fields: fieldParts.join('').trim(), methods };
+}
+
+function classHasMemberName(source, name) {
+  const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(
+    `@(?:Input|Output)\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b|\\b${esc}\\s*[!=:(]|\\b${esc}\\s*\\(`
+  ).test(source);
+}
+
+function classHasInputOrOutput(source, name) {
+  const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(
+    `@(?:Input|Output)\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b|` +
+      `(?:readonly\\s+)?${esc}\\s*=\\s*(?:input|output|model)\\s*(?:<[^>]*>)?\\s*\\(`
+  ).test(source);
+}
+
+function insertBeforeClassClose(source, snippet) {
+  const classMatch = String(source || '').match(/export\s+class\s+\w+[^{]*\{/);
+  if (!classMatch || classMatch.index == null) return source;
+  const open = classMatch.index + classMatch[0].length - 1;
+  const close = findMatchingBrace(source, open);
+  if (close < 0) return source;
+  const block = snippet.trim();
+  if (!block) return source;
+  return `${source.slice(0, close)}\n${block}\n${source.slice(close)}`;
+}
+
+function replaceMethod(source, method, replacement) {
+  return `${source.slice(0, method.start)}\n${replacement.trim()}\n${source.slice(method.end)}`;
+}
+
+function mergeClassBehavior(destTs, synTs) {
+  let out = destTs;
+  const destMethods = extractClassMethods(out);
+  const byName = new Map(destMethods.map((m) => [m.name, m]));
+  const syn = extractSynClassMembers(synTs);
+
+  for (const synMethod of syn.methods) {
+    if (isStubMethodBody(synMethod.body)) continue;
+    const existing = byName.get(synMethod.name);
+    if (!existing) {
+      // @Output() onClose + method onClose is TS2300. Keep the decorator member.
+      if (classHasInputOrOutput(out, synMethod.name)) continue;
+      out = insertBeforeClassClose(out, synMethod.full);
+      continue;
+    }
+    if (isStubMethodBody(existing.body)) {
+      out = replaceMethod(out, existing, synMethod.full);
+      const refreshed = extractClassMethods(out);
+      byName.clear();
+      for (const method of refreshed) byName.set(method.name, method);
+    }
+  }
+
+  const synFields = syn.fields
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('ngOnChanges') && l.includes(';'));
+  for (const line of synFields) {
+    const name = line
+      .replace(/@\w+\([^)]*\)\s*/g, '')
+      .replace(/^(?:public|protected|private|readonly)\s+/, '')
+      .match(/^(\w+)/)?.[1];
+    if (!name || classHasMemberName(out, name)) continue;
+    out = insertBeforeClassClose(out, `  ${line}`);
+  }
+
+  const synConsts = [...String(synTs).matchAll(/^const\s+[A-Z_][A-Z0-9_]*\s*=/gm)];
+  for (const m of synConsts) {
+    const name = m[0].match(/^const\s+(\w+)/)[1];
+    if (new RegExp(`\\bconst\\s+${name}\\b`).test(out)) continue;
+    const block = String(synTs).match(new RegExp(`const\\s+${name}[\\s\\S]*?;\\n`));
+    if (block) {
+      out = out.replace(/(@Component\s*\()/, `${block[0]}\n$1`);
+    }
+  }
+  return out;
+}
+
+function extractElement(html, tag) {
+  const src = String(html || '');
+  const self = src.match(new RegExp(`<${tag}\\b[^>]*/>`, 'i'));
+  if (self) return self[0];
+  const open = src.match(new RegExp(`<${tag}\\b[^>]*>`, 'i'));
+  if (!open) return '';
+  const start = src.indexOf(open[0]);
+  const closeTag = `</${tag}>`;
+  const end = src.indexOf(closeTag, start);
+  if (end < 0) return open[0];
+  return src.slice(start, end + closeTag.length);
+}
+
+function mergeMissingBindings(destHtml, synHtml, destTs = '') {
+  let out = String(destHtml || '');
+  if (isThinTemplate(out) && String(synHtml || '').trim()) return String(synHtml);
+
+  const synTags = [...String(synHtml || '').matchAll(/<([a-z][\w-]*)(\s[^>]*)?>/gi)];
+  for (const m of synTags) {
+    const tag = m[1];
+    const synAttrs = m[2] || '';
+    const bindings = [...synAttrs.matchAll(/((?:\[[\w.]+\]|\([\w.]+\)|\[\w+\])\s*=\s*"[^"]*")/g)].map(
+      (b) => b[1].trim()
+    );
+    if (!bindings.length && !tag.startsWith('app-')) continue;
+    if (!tag.startsWith('app-') && tag !== 'form' && !tag.startsWith('mat-')) continue;
+
+    if (!new RegExp(`<${tag}\\b`, 'i').test(out)) {
+      if (!tag.startsWith('app-')) continue;
+      const snippet = extractElement(synHtml, tag) || `<${tag}${synAttrs || ''}></${tag}>`;
+      if (/sidebar|form|drawer/i.test(tag) && /<mat-sidenav\b/i.test(out)) {
+        out = out.replace(/(<mat-sidenav\b[^>]*>)/i, `$1\n    ${snippet}\n`);
+      } else if (/dialog|modal|delete|confirm/i.test(tag)) {
+        if (/<\/mat-sidenav-container>/i.test(out)) {
+          out = out.replace(/<\/mat-sidenav-container>/i, `  ${snippet}\n</mat-sidenav-container>`);
+        } else {
+          out = `${out.trim()}\n${snippet}\n`;
+        }
+      } else if (/<section\b/i.test(out)) {
+        out = out.replace(/(<section\b[^>]*>)/i, `$1\n      ${snippet}\n`);
+      } else if (/<main\b/i.test(out)) {
+        out = out.replace(/(<main\b[^>]*>)/i, `$1\n    ${snippet}\n`);
+      } else {
+        out = `${out.trim()}\n${snippet}\n`;
+      }
+      continue;
+    }
+
+    out = out.replace(new RegExp(`<${tag}(\\s[^>]*)?>`, 'i'), (full, destAttrs = '') => {
+      let attrs = destAttrs || '';
+      for (const binding of bindings) {
+        const key = binding.match(/^((?:\[[\w.]+\]|\([\w.]+\)|\[\w+\]))/)?.[1];
+        if (!key) continue;
+        const keyEsc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const existing = attrs.match(new RegExp(`(${keyEsc}\\s*=\\s*")([^"]*)(")`));
+        if (existing) {
+          const handler = existing[2].match(/^(\w+)\s*\(/)?.[1];
+          const method = handler ? destMethodByName(destTs, handler) : null;
+          if (handler && method && isStubMethodBody(method.body)) {
+            attrs = attrs.replace(existing[0], binding);
+          }
+          continue;
+        }
+        const evt = key.match(/^\((\w+)\)$/)?.[1];
+        if (evt) {
+          let relatedName = '';
+          if (/^on[A-Z]/.test(evt)) {
+            relatedName = evt.slice(2);
+            relatedName = relatedName
+              ? relatedName.charAt(0).toLowerCase() + relatedName.slice(1)
+              : '';
+          } else {
+            relatedName = `on${evt.charAt(0).toUpperCase()}${evt.slice(1)}`;
+          }
+          if (relatedName && new RegExp(`\\(${relatedName}\\)\\s*=`).test(attrs)) continue;
+        }
+        attrs += ` ${binding}`;
+      }
+      return `<${tag}${attrs}>`;
+    });
+  }
+
+  const synButtons = [...synHtml.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/gi)];
+  for (const synBtn of synButtons) {
+    const click = synBtn[1].match(/\(click\)="([^"]+)"/)?.[1];
+    if (!click || out.includes(`(click)="${click}"`)) continue;
+    const innerNorm = synBtn[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!innerNorm) continue;
+    out = out.replace(/<button\b([^>]*)>([\s\S]*?)<\/button>/gi, (full, attrs, inner) => {
+      if (/\(click\)=/.test(attrs)) return full;
+      const destInner = inner.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (destInner !== innerNorm && !destInner.includes(innerNorm) && !innerNorm.includes(destInner)) {
+        return full;
+      }
+      return `<button${attrs} (click)="${click}">${inner}</button>`;
+    });
+  }
+  return out;
+}
+
+function mergeMissingImports(destTs, synTs) {
+  let out = destTs;
+  const synNgImports = synTs.match(/imports\s*:\s*\[([\s\S]*?)\]/);
+  const destNgImports = out.match(/imports\s*:\s*\[([\s\S]*?)\]/);
+  if (synNgImports && destNgImports) {
+    const synNames = synNgImports[1].split(',').map((s) => s.trim()).filter(Boolean);
+    const destNames = destNgImports[1].split(',').map((s) => s.trim()).filter(Boolean);
+    const destSet = new Set(destNames);
+    const added = synNames.filter((n) => n && !destSet.has(n));
+    if (added.length) {
+      const merged = [...destNames, ...added].filter(Boolean).join(', ');
+      out = out.replace(/imports\s*:\s*\[([\s\S]*?)\]/, `imports: [${merged}]`);
+    }
+  }
+  for (const m of synTs.matchAll(/import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g)) {
+    const symbols = m[1].split(',').map((s) => s.trim()).filter(Boolean);
+    const from = m[2];
+    for (const sym of symbols) {
+      const esc = sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const fromEsc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`import\\s*\\{[^}]*\\b${esc}\\b`).test(out)) continue;
+      if (new RegExp(`from\\s+['"]${fromEsc}['"]`).test(out) && new RegExp(`\\b${esc}\\b`).test(out)) {
+        continue;
+      }
+      out = `import { ${sym} } from '${from}';\n${out}`;
+    }
+  }
+  return out;
+}
+
+function walkComponentTsFiles(dir, results = []) {
+  if (!fs.existsSync(dir)) return results;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      walkComponentTsFiles(full, results);
+    } else if (entry.name.endsWith('.component.ts')) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
+function findDestComponentFiles(destPath, sourceRel) {
+  const planned = angularDestForReactSource(sourceRel);
+  if (planned?.kind === 'component') {
+    const ts = path.join(destPath, planned.files[0]);
+    if (fs.existsSync(ts)) {
+      return {
+        ts,
+        html: ts.replace(/\.ts$/, '.html'),
+        scss: ts.replace(/\.ts$/, '.scss'),
+        info: planned
+      };
+    }
+  }
+  const stem = toKebabName(path.posix.basename(String(sourceRel)).replace(/\.(tsx|jsx)$/i, ''));
+  const hits = walkComponentTsFiles(path.join(destPath, 'src')).filter(
+    (f) => path.basename(f) === `${stem}.component.ts`
+  );
+  if (!hits.length) return null;
+  const ts = hits[0];
+  return {
+    ts,
+    html: ts.replace(/\.ts$/, '.html'),
+    scss: ts.replace(/\.ts$/, '.scss'),
+    info: planned
+  };
+}
+
+function destMethodByName(destTs, name) {
+  return extractClassMethods(destTs).find((m) => m.name === name);
+}
+
+/**
+ * True when the Angular component is missing source handlers (empty methods or
+ * no matching method at all). Used to decide whether a source-backed restore
+ * or a follow-up AI parity pass is still needed.
+ */
+export function collectAngularBehaviorGaps(destPath, sourceFilesMap) {
+  const gaps = [];
+  if (!sourceFilesMap) return gaps;
+  for (const [rel, content] of Object.entries(sourceFilesMap)) {
+    const n = String(rel).replace(/\\/g, '/');
+    if (!/\.(tsx|jsx)$/i.test(n) || isReactBootstrapPath(n)) continue;
+    const tsx = String(content || '');
+    const handlers = sourceHandlerNames(tsx);
+    if (!handlers.length) continue;
+    const dest = findDestComponentFiles(destPath, n);
+    if (!dest || !fs.existsSync(dest.ts)) {
+      gaps.push({ source: n, reason: 'missing-component' });
+      continue;
+    }
+    const destTs = fs.readFileSync(dest.ts, 'utf-8');
+    const destHtml = fs.existsSync(dest.html) ? fs.readFileSync(dest.html, 'utf-8') : '';
+    const missing = handlers.filter((name) => {
+      const method = destMethodByName(destTs, name);
+      return !method || isStubMethodBody(method.body);
+    });
+    for (const method of extractClassMethods(destTs)) {
+      if (!isStubMethodBody(method.body)) continue;
+      if (!new RegExp(`\\b${method.name}\\s*\\(`).test(destHtml)) continue;
+      if (!missing.includes(method.name)) missing.push(method.name);
+    }
+    const synHasForm = /onSubmit|handleSubmit|<form\b/.test(tsx);
+    const destHasSubmit = /\(ngSubmit\)=|<form\b/.test(destHtml);
+    if (missing.length || (synHasForm && !destHasSubmit && isThinTemplate(destHtml))) {
+      gaps.push({
+        source: n,
+        dest: path.relative(destPath, dest.ts).replace(/\\/g, '/'),
+        missingHandlers: missing
+      });
+    }
+  }
+  return gaps;
+}
+
+/**
+ * After AI conversion, overlay real source behavior onto stub Angular components.
+ * Works for any uploaded React project — not tied to a specific sample app.
+ */
+export function restoreAngularBehaviorFromReact(destPath, sourceFilesMap) {
+  if (!destPath || !sourceFilesMap) return { changed: 0, gaps: [] };
+  let changed = 0;
+  for (const [rel, content] of Object.entries(sourceFilesMap)) {
+    const n = String(rel).replace(/\\/g, '/');
+    if (!/\.(tsx|jsx)$/i.test(n) || isReactBootstrapPath(n)) continue;
+    const tsx = String(content || '');
+    if (!tsx.trim() || !/</.test(tsx)) continue;
+    const dest = findDestComponentFiles(destPath, n);
+    if (!dest) continue;
+    const planned = dest.info || angularDestForReactSource(n);
+    if (!planned || planned.kind !== 'component') continue;
+    const scssRel = Object.keys(sourceFilesMap).find((key) => {
+      const p = String(key).replace(/\\/g, '/');
+      return (
+        /\.(scss|css)$/i.test(p) &&
+        path.posix.dirname(p) === path.posix.dirname(n) &&
+        toKebabName(path.posix.basename(p).replace(/\.(scss|css)$/i, '')) ===
+          toKebabName(path.posix.basename(n).replace(/\.(tsx|jsx)$/i, ''))
+      );
+    });
+    const synthesized = reactTsxToAngularTriad({
+      sourceRel: n,
+      tsx,
+      scss: scssRel ? sourceFilesMap[scssRel] : '',
+      dest: {
+        ...planned,
+        files: [
+          path.relative(destPath, dest.ts).replace(/\\/g, '/'),
+          path.relative(destPath, dest.html).replace(/\\/g, '/'),
+          path.relative(destPath, dest.scss).replace(/\\/g, '/')
+        ]
+      }
+    });
+    if (!synthesized.length) continue;
+    const synTs = synthesized.find((f) => /\.ts$/i.test(f.path))?.content || '';
+    const synHtml = synthesized.find((f) => /\.html$/i.test(f.path))?.content || '';
+    const synScss = synthesized.find((f) => /\.scss$/i.test(f.path))?.content || '';
+
+    let destTs = fs.existsSync(dest.ts) ? fs.readFileSync(dest.ts, 'utf-8') : '';
+    let destHtml = fs.existsSync(dest.html) ? fs.readFileSync(dest.html, 'utf-8') : '';
+    let destScss = fs.existsSync(dest.scss) ? fs.readFileSync(dest.scss, 'utf-8') : '';
+    const before = destTs + destHtml + destScss;
+
+    if (!destTs.trim()) {
+      destTs = synTs;
+      destHtml = synHtml;
+      destScss = synScss || destScss;
+    } else {
+      destTs = mergeClassBehavior(destTs, synTs);
+      destTs = mergeMissingImports(destTs, synTs);
+      destHtml = mergeMissingBindings(destHtml, synHtml, destTs);
+      const inferred = repairInferredTemplateHandlers(destTs, destHtml);
+      destTs = inferred.source;
+      destHtml = inferred.html;
+      if ((!destScss || destScss.trim().length < 20) && synScss.trim().length > 20) {
+        destScss = synScss;
+      }
+    }
+
+    if (destTs + destHtml + destScss !== before) {
+      fs.mkdirSync(path.dirname(dest.ts), { recursive: true });
+      fs.writeFileSync(dest.ts, destTs.endsWith('\n') ? destTs : `${destTs}\n`, 'utf-8');
+      fs.writeFileSync(dest.html, destHtml.endsWith('\n') ? destHtml : `${destHtml}\n`, 'utf-8');
+      if (destScss != null) {
+        fs.writeFileSync(dest.scss, destScss.endsWith('\n') ? destScss : `${destScss}\n`, 'utf-8');
+      }
+      changed += 1;
+    }
+  }
+  return { changed, gaps: collectAngularBehaviorGaps(destPath, sourceFilesMap) };
 }

@@ -179,7 +179,7 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Functional components + hooks only (React 19).
 - Prefer folders: components/, features/, hooks/, lib/, services/, pages/.
 - Keep source folder names when they already exist (e.g. Angular
-  \`src/app/components/task-form-sidebar/\` → \`src/components/task-form-sidebar/TaskFormSidebar.tsx\`).
+  \`src/app/components/item-editor/\` → \`src/components/item-editor/ItemEditor.tsx\`).
 - Routing: react-router-dom (BrowserRouter or createBrowserRouter).
 - Do NOT generate angular.json, tsconfig.app.json, or Angular workspace files.
 - High code quality: typed props, no unused imports, small focused modules.
@@ -196,15 +196,16 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Only real npm deps in package.json; skip @angular/* packages in the React app.
 
 ### Domain types & store (MANDATORY — copy source, do not invent)
-- Copy \`models/*.ts\` field-for-field. If Task has \`status: 'todo' | 'in-progress' | 'done'\`,
-  use those literals exactly. Never add fields the source model does not have
-  (no \`priority\`, \`completed\`, \`dueDate\`). Never write \`in_progress\`.
-- NGXS \`TaskState.items\` stays \`items\` on the zustand store. Pages may alias
-  \`const { items: tasks } = useTaskStore()\`. Do not invent \`state.tasks\`.
-- Import \`Task\` / \`TaskDraft\` / \`TaskStatus\` from \`models/task.model\` (the copied source
-  file). Never invent \`types/task\`, \`interfaces/task\`, or \`services/task.service\`.
-- \`useTaskStore\` must be a real \`create()\` export (or a barrel that re-exports that file).
-  Do not emit \`export { useTaskStore } from './taskStore'\` unless \`taskStore.ts\` exists.
+- Copy \`models/*.ts\` field-for-field. Keep source union literals exactly
+  (never rewrite hyphenated values as underscores). Never add fields the source
+  model does not have (no invented \`priority\`, \`completed\`, \`dueDate\`).
+- NGXS \`@State\` defaults keep the same field names on the zustand store
+  (e.g. \`items\` stays \`items\`). Pages may alias
+  \`const { items: rows } = useXStore()\`. Do not invent a second collection field.
+- Import domain types from the copied \`models/*.ts\` (or \`*.model.ts\`) file.
+  Never invent \`types/<name>\`, \`interfaces/<name>\`, or \`services/<name>.service\`.
+- \`useXStore\` must be a real \`create()\` export (or a barrel that re-exports that file).
+  Do not emit \`export { useXStore } from './xStore'\` unless that file exists.
 
 ### Library mapping (MANDATORY)
 - @ngxs/store → zustand. \`create((set, get) => ({ ... }))\`. No @State/@Action/dispatch(new X()).
@@ -310,6 +311,9 @@ Do NOT use default project names — use the EXTRACTED name.
   Never bind \`(onSave)\` unless the child actually declares \`@Output() onSave\`.
   In child templates, call the wrapper method (\`(click)="onRemove(task)"\`) —
   do not write \`onRemove.emit(task)\` when \`onRemove\` is a method.
+- NEVER ship empty handlers that only compile. Copy SOURCE logic for save, update,
+  delete, submit, validation, and dialogs into the class methods. \`onSave(): void {}\`
+  while the React source actually adds/updates items is a failed conversion.
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.
@@ -364,7 +368,7 @@ is built before the next one is planned.
 - React component = ONE unit: PascalCase \`Name.tsx\` then optional companion \`Name.scss\`
 - If targeting React: NEVER plan Angular triads. Forbidden paths: \`*.component.ts\`,
   \`*.component.html\`, \`*.component.scss\`, and unit ids ending in \`.component\`
-  (e.g. \`src/components/task-form-sidebar/task-form-sidebar.component\`).
+  (e.g. \`src/components/item-editor/item-editor.component\`).
   Plan \`src/components/<kebab>/<Pascal>.tsx\` instead. JSX lives in the .tsx file — no .html.
 - Services, pipes, utils, routes, configs-in-src = ONE file = ONE unit
 - Never scatter a component triad across distant steps
@@ -423,15 +427,15 @@ When targeting React, use this shape instead (never .component / .html):
   "incrementalPlan": [
     {
       "step": 1,
-      "newPath": "src/components/task-form-sidebar/TaskFormSidebar.tsx",
+      "newPath": "src/components/item-editor/ItemEditor.tsx",
       "explanationOfSource": "Sidebar form as a React function component",
       "approximateSourceFilesToRead": [
-        "src/app/components/task-form-sidebar/task-form-sidebar.component.ts",
-        "src/app/components/task-form-sidebar/task-form-sidebar.component.html"
+        "src/app/components/item-editor/item-editor.component.ts",
+        "src/app/components/item-editor/item-editor.component.html"
       ],
-      "dependencies": ["src/models/task.model.ts"],
+      "dependencies": ["src/models/item.model.ts"],
       "complexity": "medium",
-      "unit": "src/components/task-form-sidebar/TaskFormSidebar.tsx"
+      "unit": "src/components/item-editor/ItemEditor.tsx"
     }
   ]
 }

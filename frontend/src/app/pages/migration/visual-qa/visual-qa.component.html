@@ -1,0 +1,88 @@
+<div class="visual-qa-page">
+  <header class="page-header">
+    <h1>Visual QA Report</h1>
+    <p>Compare source vs migrated screenshots to verify UI fidelity.</p>
+  </header>
+
+  @if (isLoading()) {
+    <div class="loading-state">
+      <div class="spinner"></div>
+      <p>Loading visual QA report...</p>
+    </div>
+  } @else if (errorMessage()) {
+    <div class="error-state">
+      <p class="error-text">{{ errorMessage() }}</p>
+      <button class="btn btn-primary" (click)="goBack()">Back to Create</button>
+    </div>
+  } @else if (report()) {
+    <div class="summary-bar">
+      <div class="summary-item">
+        <span class="label">Total Routes</span>
+        <span class="value">{{ report()?.summary?.total }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">Passed</span>
+        <span class="value success">{{ report()?.summary?.passed }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">Failed</span>
+        <span class="value danger">{{ report()?.summary?.failed }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="label">Avg Similarity</span>
+        <span class="value">{{ (report()?.summary?.averageSimilarity ?? 0) * 100 | number:'1.0-0' }}%</span>
+      </div>
+    </div>
+
+    <div class="route-tabs">
+      @for (comp of report()?.comparisons; track comp.route) {
+        <button
+          class="route-tab"
+          [class.active]="selectedRoute() === comp.route"
+          [class.passed]="comp.passed"
+          [class.failed]="!comp.passed"
+          (click)="selectRoute(comp.route)"
+        >
+          {{ comp.route }}
+          <span class="tab-status">{{ comp.passed ? '✓' : '✗' }}</span>
+        </button>
+      }
+    </div>
+
+    @if (selectedComparison) {
+      <div class="comparison">
+        <div class="comparison-header">
+          <h2>Route: {{ selectedComparison.route }}</h2>
+          <span
+            class="similarity"
+            [class.passed]="selectedComparison.passed"
+            [class.failed]="!selectedComparison.passed"
+          >
+            {{ selectedComparison.similarity * 100 | number:'1.0-0' }}% similar
+          </span>
+        </div>
+
+        <div class="image-grid">
+          <div class="image-card">
+            <h3>Source</h3>
+            <img [src]="fileUrl(selectedComparison.sourceImage)" alt="Source screenshot" />
+          </div>
+          <div class="image-card">
+            <h3>Migrated</h3>
+            <img [src]="fileUrl(selectedComparison.migratedImage)" alt="Migrated screenshot" />
+          </div>
+          @if (selectedComparison.diffImage) {
+            <div class="image-card">
+              <h3>Diff</h3>
+              <img [src]="fileUrl(selectedComparison.diffImage)" alt="Diff overlay" />
+            </div>
+          }
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" (click)="goBack()">Back to Create</button>
+        </div>
+      </div>
+    }
+  }
+</div>

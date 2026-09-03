@@ -1,0 +1,20 @@
+<div class="app-container">
+  <button
+    type="button"
+    class="theme-toggle"
+    (click)="themeService.toggle()"
+    [attr.aria-label]="themeService.theme() === 'light' ? 'Switch to dark theme' : 'Switch to light theme'"
+  >
+    <span class="theme-toggle-icon" aria-hidden="true">{{ themeService.theme() === 'light' ? '🌙' : '☀️' }}</span>
+    <span>{{ themeService.theme() === 'light' ? 'Dark' : 'Light' }}</span>
+  </button>
+
+  <header class="app-header">
+    <h1>⚡ AI Framework Migration Studio</h1>
+    <p>Seamless structural conversion engine for Angular & React ecosystems</p>
+  </header>
+
+  <main class="main-dashboard">
+    <router-outlet></router-outlet>
+  </main>
+</div>

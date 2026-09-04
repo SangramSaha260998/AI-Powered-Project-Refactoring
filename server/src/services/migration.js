@@ -544,6 +544,24 @@ function resolveSafeWritePath(workspaceRoot, relativePath) {
   // Drop accidental leading project-folder prefixes
   normalized = normalized.replace(/^(migrated-(?:angular|react)-project\/)+/i, '');
 
+  // Angular workspace: React-shaped src/models|components|… → src/app/…
+  if (fs.existsSync(path.join(workspaceRoot, 'src', 'app'))) {
+    const angularWriteRemaps = [
+      [/^src\/models\//i, 'src/app/models/'],
+      [/^src\/components\//i, 'src/app/components/'],
+      [/^src\/services\//i, 'src/app/services/'],
+      [/^src\/lib\//i, 'src/app/lib/'],
+      [/^src\/utils\//i, 'src/app/lib/'],
+      [/^src\/hooks\//i, 'src/app/lib/']
+    ];
+    for (const [re, to] of angularWriteRemaps) {
+      if (re.test(normalized)) {
+        normalized = normalized.replace(re, to);
+        break;
+      }
+    }
+  }
+
   const baseName = path.posix.basename(normalized);
   if (PROTECTED_OUTPUT_FILES.has(baseName)) {
     return null;
@@ -829,11 +847,12 @@ function enforceAngularPackageVersions(destPath, stack) {
     '@angular/core',
     '@angular/forms',
     '@angular/platform-browser',
-    '@angular/platform-browser-dynamic',
     '@angular/router'
   ];
+  // Standalone bootstrap uses @angular/platform-browser; this package is deprecated on 21+.
+  delete pkg.dependencies['@angular/platform-browser-dynamic'];
   for (const name of corePkgs) {
-    if (pkg.dependencies[name] || name === '@angular/core') {
+    if (pkg.dependencies[name] || name === '@angular/core' || name === '@angular/animations') {
       pkg.dependencies[name] = stack.core;
     }
   }
@@ -1205,6 +1224,18 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null, options 
   ensureDirectoryExists(path.join(destPath, 'src', 'environments'));
   ensureDirectoryExists(path.join(destPath, 'public'));
 
+  const dependencies = {
+    '@angular/animations': stack.core,
+    '@angular/common': stack.core,
+    '@angular/compiler': stack.core,
+    '@angular/core': stack.core,
+    '@angular/forms': stack.core,
+    '@angular/platform-browser': stack.core,
+    '@angular/router': stack.core,
+    rxjs: '~7.8.0',
+    tslib: '^2.3.0',
+    'zone.js': stack.zone || '~0.15.0'
+  };
   const packageJson = {
     name: safeName,
     version: '1.0.0',
@@ -1215,19 +1246,7 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null, options 
       build: 'ng build',
       watch: 'ng build --watch --configuration development'
     },
-    dependencies: {
-      '@angular/animations': stack.core,
-      '@angular/common': stack.core,
-      '@angular/compiler': stack.core,
-      '@angular/core': stack.core,
-      '@angular/forms': stack.core,
-      '@angular/platform-browser': stack.core,
-      '@angular/platform-browser-dynamic': stack.core,
-      '@angular/router': stack.core,
-      rxjs: '~7.8.0',
-      tslib: '^2.3.0',
-      'zone.js': stack.zone || '~0.15.0'
-    },
+    dependencies,
     devDependencies: {
       '@angular/build': `^${stack.tooling}`,
       '@angular/cli': `^${stack.tooling}`,
@@ -1677,27 +1696,27 @@ async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
       console.log(`[${sessionId}] npm ci check: no package-lock.json — generating via npm install...`);
       // NOTE: no --prefer-offline — stale cached packuments cause ETARGET for
       // recently published versions (e.g. Angular 22 patch lines).
-      const gen = await runCommand('npm', ['install'], workspacePath, 300000);
-      if (gen.exitCode !== 0) {
+      const gen = await runNpmInstall(workspacePath);
+      if (!npmInstallLooksSuccessful(workspacePath, gen)) {
         return {
           ok: false,
-          errors: `npm install (lock generation) failed:\n${(gen.stderr || gen.stdout || '').slice(-2000)}`
+          errors: `npm install (lock generation) failed:\n${summarizeNpmFailure(gen)}`
         };
       }
     }
 
     console.log(`[${sessionId}] npm ci check (attempt ${attempt}/2): npm ci ...`);
-    const ci = await runCommand('npm', ['ci'], workspacePath, 300000);
-    if (ci.exitCode !== 0) {
-      const errOut = (ci.stderr || ci.stdout || '').slice(-1500);
+    const ci = await runNpmCi(workspacePath);
+    if (ci.exitCode !== 0 && !npmInstallLooksSuccessful(workspacePath, ci)) {
+      const errOut = summarizeNpmFailure(ci);
       console.error(`[${sessionId}] npm ci failed (attempt ${attempt}):\n${errOut}`);
       if (attempt === 1) {
         // Out-of-sync lock (postprocess may have touched package.json) — regen + retry
-        const regen = await runCommand('npm', ['install'], workspacePath, 300000);
-        if (regen.exitCode !== 0) {
+        const regen = await runNpmInstall(workspacePath);
+        if (!npmInstallLooksSuccessful(workspacePath, regen)) {
           return {
             ok: false,
-            errors: `npm ci failed, lock regeneration also failed:\n${errOut}\n${(regen.stderr || regen.stdout || '').slice(-1500)}`
+            errors: `npm ci failed, lock regeneration also failed:\n${errOut}\n${summarizeNpmFailure(regen)}`
           };
         }
         continue;
@@ -2903,17 +2922,79 @@ export {
  * Run a shell command and return { stdout, stderr, exitCode }.
  * Resolves even on non-zero exit so callers can inspect the error output.
  */
+const NPM_QUIET_FLAGS = ['--no-fund', '--no-audit', '--no-update-notifier'];
+const NPM_INSTALL_TIMEOUT_MS = 600000;
+
 function runCommand(cmd, args, cwd, timeoutMs = 300000) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd, timeout: timeoutMs, shell: true, windowsHide: true }, (error, stdout, stderr) => {
-      resolve({
-        exitCode: error ? error.code || 1 : 0,
-        stdout: stdout || '',
-        stderr: stderr || '',
-        error
-      });
-    });
+    execFile(
+      cmd,
+      args,
+      {
+        cwd,
+        timeout: timeoutMs,
+        shell: true,
+        windowsHide: true,
+        maxBuffer: 32 * 1024 * 1024,
+        env: {
+          ...process.env,
+          npm_config_fund: 'false',
+          npm_config_audit: 'false',
+          npm_config_update_notifier: 'false'
+        }
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          exitCode: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
+          stdout: stdout || '',
+          stderr: stderr || '',
+          error
+        });
+      }
+    );
   });
+}
+
+function combinedCommandOutput(result) {
+  return `${result?.stdout || ''}\n${result?.stderr || ''}`;
+}
+
+/** True when npm finished installing even if Node truncated logs or printed deprecations. */
+function npmInstallLooksSuccessful(workspacePath, result) {
+  if (!result) return false;
+  if (result.exitCode === 0) return true;
+  const output = combinedCommandOutput(result);
+  const hasRealError =
+    /npm error\b|ERESOLVE|ETARGET|EPERM|ENOENT|ENEEDAUTH|ERR!/i.test(output) ||
+    result.error?.code === 'ETIMEDOUT' ||
+    result.error?.killed === true;
+  const toolingPresent =
+    fs.existsSync(path.join(workspacePath, 'node_modules', '@angular', 'core')) ||
+    fs.existsSync(path.join(workspacePath, 'node_modules', '@angular', 'cli')) ||
+    fs.existsSync(path.join(workspacePath, 'node_modules', 'react')) ||
+    fs.existsSync(path.join(workspacePath, 'node_modules', 'vite')) ||
+    fs.existsSync(path.join(workspacePath, 'node_modules', '.bin', 'ng'));
+  if (!toolingPresent || hasRealError) return false;
+  const overflow = result.error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+  const deprecationOnly = /npm warn deprecated/i.test(output) && !/npm error/i.test(output);
+  return overflow || deprecationOnly;
+}
+
+function summarizeNpmFailure(result) {
+  const output = combinedCommandOutput(result);
+  const lines = output.split('\n').filter((l) => /npm error\b|ERESOLVE|ETARGET|ERR!/i.test(l));
+  if (lines.length) return lines.slice(-40).join('\n');
+  const code = result?.error?.code || result?.error?.signal;
+  if (code) return `npm failed (${code}).\n${output.slice(-2000)}`;
+  return output.slice(-2000);
+}
+
+function runNpmInstall(cwd, extraArgs = []) {
+  return runCommand('npm', ['install', ...NPM_QUIET_FLAGS, ...extraArgs], cwd, NPM_INSTALL_TIMEOUT_MS);
+}
+
+function runNpmCi(cwd) {
+  return runCommand('npm', ['ci', ...NPM_QUIET_FLAGS], cwd, NPM_INSTALL_TIMEOUT_MS);
 }
 
 /**
@@ -2938,9 +3019,9 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
 
   if (shouldInstall) {
     console.log(`[${sessionId}] Build verification: running npm install...`);
-    const installResult = await runCommand('npm', ['install'], workspacePath, 300000);
-    if (installResult.exitCode !== 0) {
-      const errOutput = (installResult.stderr || installResult.stdout || '').slice(-3000);
+    const installResult = await runNpmInstall(workspacePath);
+    if (!npmInstallLooksSuccessful(workspacePath, installResult)) {
+      const errOutput = summarizeNpmFailure(installResult);
       console.error(`[${sessionId}] npm install failed:\n`, errOutput);
       // Remove partial node_modules so the next attempt does not skip install
       try {
@@ -3162,7 +3243,7 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         const missingModule = /Cannot find module/.test(result.errors || '');
         if (repairedPkgs > 0 || addedPkgs > 0 || (missingModule && typeFixed === 0)) {
           console.log(`[${sessionId}] Installing dependencies after postprocess/package fixes...`);
-          await runCommand('npm', ['install'], workspacePath, 300000);
+          await runNpmInstall(workspacePath);
           skipNpmInstall = true;
           continue;
         }
@@ -3178,10 +3259,11 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
           continue;
         }
         const materialPkgs = ensureAngularMaterialPackages(workspacePath, sourcePackageJson, sourceFilesMap);
+        const addedPkgs = addPackagesFromBuildErrors(workspacePath, result.errors);
         const ngFixed = fixAngularCompileErrors(workspacePath, result.errors);
-        if (materialPkgs > 0) {
-          console.log(`[${sessionId}] Added Angular Material packages. Installing dependencies...`);
-          await runCommand('npm', ['install'], workspacePath, 300000);
+        if (materialPkgs > 0 || addedPkgs > 0) {
+          console.log(`[${sessionId}] Added Angular packages. Installing dependencies...`);
+          await runNpmInstall(workspacePath);
           skipNpmInstall = true;
           repairAngularWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson });
           continue;
@@ -3961,6 +4043,12 @@ ${enhancedPrompt}`
     let planned = item.newPath.replace(/\\/g, '/').replace(/^\.?\//, '');
     if (targetLower.includes('angular')) {
       const planRemaps = [
+        [/^src\/models\//i, 'src/app/models/'],
+        [/^src\/components\//i, 'src/app/components/'],
+        [/^src\/services\//i, 'src/app/services/'],
+        [/^src\/lib\//i, 'src/app/lib/'],
+        [/^src\/utils\//i, 'src/app/lib/'],
+        [/^src\/hooks\//i, 'src/app/lib/'],
         [/^src\/admin\//i, 'src/app/admin/'],
         [/^src\/pages\//i, 'src/app/pages/'],
         [/^src\/core\//i, 'src/app/core/'],
@@ -3968,7 +4056,9 @@ ${enhancedPrompt}`
         [/^src\/store\//i, 'src/app/store/'],
         [/^src\/config\//i, 'src/app/config/'],
         [/^admin\//i, 'src/app/admin/'],
-        [/^pages\//i, 'src/app/pages/']
+        [/^pages\//i, 'src/app/pages/'],
+        [/^models\//i, 'src/app/models/'],
+        [/^components\//i, 'src/app/components/']
       ];
       for (const [re, to] of planRemaps) {
         if (re.test(planned)) {
@@ -4877,6 +4967,66 @@ RULES:
 // ---------------------------------------------------------------------------
 
 /**
+ * Split a Submit Changes / Errors prompt into discrete items.
+ * Numbered (1. / 1) / Task 1:) or bulleted lists become separate jobs so
+ * every item is applied in order. A single paragraph stays one job.
+ */
+export function splitReworkItems(prompt) {
+  const text = String(prompt || '').trim();
+  if (!text) return [];
+  const parts = text.split(
+    /(?=^\s*(?:(?:\d+)[.)]\s+|[-*•]\s+|(?:task|error|issue|fix|change)\s*\d+\s*[:.)-]\s*))/im
+  );
+  const items = parts.map((p) => p.trim()).filter(Boolean);
+  return items.length >= 2 ? items : [text];
+}
+
+function collapseEditsByPath(edits) {
+  const byPath = new Map();
+  for (const edit of edits) {
+    const key = String(edit.relativePath || '')
+      .replace(/\\/g, '/')
+      .replace(/^\.?\//, '');
+    if (!key) continue;
+    byPath.set(key, { ...edit, relativePath: key });
+  }
+  return [...byPath.values()];
+}
+
+function applyReworkEdits(sessionId, workspacePath, edits) {
+  let applied = 0;
+  for (const edit of collapseEditsByPath(edits)) {
+    if (edit.delete) {
+      const safePath = resolveSafeWritePath(workspacePath, edit.relativePath);
+      if (!safePath) {
+        console.warn(`[${sessionId}] Skipping unsafe delete path: ${edit.relativePath}`);
+        continue;
+      }
+      if (fs.existsSync(safePath.full)) {
+        fs.unlinkSync(safePath.full);
+        console.log(`[${sessionId}] Deleted: ${safePath.relative}`);
+        applied += 1;
+      }
+      continue;
+    }
+
+    const fixPath = resolveFixWritePath(workspacePath, edit.relativePath, '', false);
+    if (!fixPath) {
+      console.warn(`[${sessionId}] Skipping unsafe/unresolved edit path: ${edit.relativePath}`);
+      continue;
+    }
+    if (fixPath.relative.replace(/\\/g, '/') !== edit.relativePath.replace(/\\/g, '/').replace(/^\.?\//, '')) {
+      console.log(`[${sessionId}] Remapped edit path ${edit.relativePath} → ${fixPath.relative}`);
+    }
+    ensureDirectoryExists(path.dirname(fixPath.full));
+    fs.writeFileSync(fixPath.full, sanitizeGeneratedContent(fixPath.relative, edit.content), 'utf-8');
+    console.log(`[${sessionId}] Updated: ${fixPath.relative}`);
+    applied += 1;
+  }
+  return applied;
+}
+
+/**
  * Ask the AI to produce a change plan (JSON) for applying user-submitted
  * changes / error fixes to an existing converted project.
  * Returns an array of { relativePath, content, delete? } edits.
@@ -4887,8 +5037,11 @@ async function askAIForChangePlan(sessionId, workspacePath, reworkPrompt, aiProv
 
   const changePrompt = `You are updating an EXISTING migrated ${targetTech} project to implement the user's requested changes and/or fix the reported errors.
 
-The changes/errors reported by the user:
+The change(s) / error(s) reported by the user:
 ${reworkPrompt}
+
+If the text above lists more than one issue, you MUST address EVERY issue, not only the last one.
+If several issues affect the SAME file, return that file ONCE with ALL of those fixes combined.
 
 CURRENT PROJECT FILES:
 ${filesContext}
@@ -4899,6 +5052,7 @@ IMPORTANT RULES:
 - path MUST be an exact workspace-relative path that already exists in the project (e.g. src/app/pages/... NOT src/pages).
 - If a file must be deleted, output {"path": "src/...", "delete": true}.
 - Only include files that need to be changed to satisfy the user's request or fix the errors.
+- Each path may appear at most once in "files".
 - Each file must be COMPLETE valid TypeScript/HTML/SCSS/JSX/TSX (not a diff, not truncated, no dangling commas).
 - Do NOT include package.json, angular.json, tsconfig.json, or any root config files.
 - Preserve the existing framework structure, imports, and conventions.
@@ -4972,49 +5126,33 @@ export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, 
     throw new Error('No readable source files found in the existing project.');
   }
 
-  // 1. Ask the AI for the change plan
-  report('rework', 'Asking AI to apply your changes / fix errors...');
-  const edits = await askAIForChangePlan(sessionId, workspacePath, reworkPrompt, aiProvider, aiModel, toTech);
-
-  if (edits.length === 0) {
-    throw new Error('The AI did not return any file changes. Please rephrase your changes/errors and try again.');
-  }
-
-  // 2. Apply edits (create/overwrite/delete) safely inside the workspace
+  // 1. Ask the AI for each listed change (numbered/bullets run in order)
+  const items = splitReworkItems(reworkPrompt);
   let applied = 0;
-  for (const edit of edits) {
-    if (edit.delete) {
-      const safePath = resolveSafeWritePath(workspacePath, edit.relativePath);
-      if (!safePath) {
-        console.warn(`[${sessionId}] Skipping unsafe delete path: ${edit.relativePath}`);
-        continue;
-      }
-      if (fs.existsSync(safePath.full)) {
-        fs.unlinkSync(safePath.full);
-        console.log(`[${sessionId}] Deleted: ${safePath.relative}`);
-        applied++;
-      }
+  for (let i = 0; i < items.length; i++) {
+    const label =
+      items.length > 1
+        ? `Asking AI to apply change ${i + 1} of ${items.length}...`
+        : 'Asking AI to apply your changes / fix errors...';
+    report('rework', label);
+    console.log(`[${sessionId}] Rework item ${i + 1}/${items.length}`);
+    const edits = await askAIForChangePlan(
+      sessionId,
+      workspacePath,
+      items[i],
+      aiProvider,
+      aiModel,
+      toTech
+    );
+    if (edits.length === 0) {
+      console.warn(`[${sessionId}] Rework item ${i + 1} returned no file changes.`);
       continue;
     }
-
-    // Exact-path resolution only: never silently redirect an edit to a
-    // different existing file that merely shares the same basename.
-    const fixPath = resolveFixWritePath(workspacePath, edit.relativePath, '', false);
-    if (!fixPath) {
-      console.warn(`[${sessionId}] Skipping unsafe/unresolved edit path: ${edit.relativePath}`);
-      continue;
-    }
-    if (fixPath.relative.replace(/\\/g, '/') !== edit.relativePath.replace(/\\/g, '/').replace(/^\.?\//, '')) {
-      console.log(`[${sessionId}] Remapped edit path ${edit.relativePath} → ${fixPath.relative}`);
-    }
-    ensureDirectoryExists(path.dirname(fixPath.full));
-    fs.writeFileSync(fixPath.full, sanitizeGeneratedContent(fixPath.relative, edit.content), 'utf-8');
-    console.log(`[${sessionId}] Updated: ${fixPath.relative}`);
-    applied++;
+    applied += applyReworkEdits(sessionId, workspacePath, edits);
   }
 
   if (applied === 0) {
-    throw new Error('No file changes could be applied. Please rephrase your changes/errors and try again.');
+    throw new Error('The AI did not return any file changes. Please rephrase your changes/errors and try again.');
   }
 
   // 3. Post-process repairs after AI edits

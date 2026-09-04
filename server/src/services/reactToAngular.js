@@ -4,7 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairInferredTemplateHandlers } from './postprocess.js';
+import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairMismatchedHtmlClosingTags, repairInferredTemplateHandlers } from './postprocess.js';
 
 export function isReactBootstrapPath(rel) {
   const p = String(rel || '').replace(/\\/g, '/');
@@ -108,11 +108,13 @@ function relativeImport(fromFile, toFile) {
 
 function extractJsxReturn(tsx) {
   const src = String(tsx || '');
+  // Early-return empty/full branches → Angular control flow directly.
+  // Avoid wrapping as `{cond ? (a) : (b)}` — nested JSX `)}` breaks naive ternary rewrites.
   const early = src.match(
     /if\s*\(([^)]+)\)\s*\{\s*return\s*\(([\s\S]*?)\)\s*;\s*\}\s*return\s*\(([\s\S]*?)\)\s*;/
   );
   if (early) {
-    return `{${early[1]} ? (${early[2].trim()}) : (${early[3].trim()})}`;
+    return `@if (${early[1].trim()}) {\n${early[2].trim()}\n} @else {\n${early[3].trim()}\n}`;
   }
   const m = src.match(/return\s*\(\s*([\s\S]*?)\s*\)\s*;\s*\}\s*$/);
   if (m) return m[1].trim();
@@ -172,7 +174,7 @@ function convertEventsAndBindings(html) {
   h = h.replace(/\bonClick=\{\(\)\s*=>\s*([^}]+)\}/g, '(click)="$1"');
   h = h.replace(/\bonClick=\{\((\w+)\)\s*=>\s*([^}]+)\}/g, '(click)="$2"');
   h = h.replace(/\bonClick=\{(\w+)\}/g, '(click)="$1()"');
-  h = h.replace(/\bonSubmit=\{(\w+)\}/g, '(ngSubmit)="$1($event)"');
+  h = h.replace(/\bonSubmit=\{(\w+)\}/g, '(ngSubmit)="$1()"');
   h = h.replace(/\bonBlur=\{\(\)\s*=>\s*set([A-Z]\w+)\(([^)]*)\)\}/g, (_, cap, val) => {
     const field = cap.charAt(0).toLowerCase() + cap.slice(1);
     return `(blur)="${field} = ${val}"`;
@@ -342,6 +344,18 @@ function convertInterpolations(html) {
   return html.replace(/\{([A-Za-z_$][\w.?![\]]*)\}/g, '{{ $1 }}');
 }
 
+function unwrapRootLayoutAroundSidenav(html) {
+  const s = String(html || '').trim();
+  const open = s.match(/^<(div|section|main)\b([^>]*)>/i);
+  if (!open) return html;
+  const tag = open[1];
+  const closeRe = new RegExp(`</${tag}\\s*>\\s*$`, 'i');
+  if (!closeRe.test(s)) return html;
+  const inner = s.slice(open[0].length).replace(closeRe, '');
+  if (!/<mat-sidenav\b/i.test(inner)) return html;
+  return inner.trim();
+}
+
 function convertJsxToAngularHtml(jsx) {
   let h = String(jsx || '');
   h = h.replace(/<>/g, '').replace(/<\/>/g, '');
@@ -355,13 +369,19 @@ function convertJsxToAngularHtml(jsx) {
   h = convertInterpolations(h);
   h = cleanupHtml(h);
   if (/<mat-sidenav\b/.test(h) && !/<mat-sidenav-container\b/.test(h)) {
+    h = unwrapRootLayoutAroundSidenav(h);
     h = `<mat-sidenav-container class="layout">\n${h}\n</mat-sidenav-container>`;
     h = h.replace(
       /<\/mat-sidenav>([\s\S]*)<\/mat-sidenav-container>/,
-      '</mat-sidenav>\n<mat-sidenav-content>$1</mat-sidenav-content>\n</mat-sidenav-container>'
+      (_full, rest) => {
+        const trimmed = String(rest || '');
+        const inner = trimmed.replace(/<\/(div|section|main)\s*>\s*$/i, '');
+        return `</mat-sidenav>\n<mat-sidenav-content>${inner}</mat-sidenav-content>\n</mat-sidenav-container>`;
+      }
     );
   }
   h = h.replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  h = repairMismatchedHtmlClosingTags(h);
   return h.trim() + '\n';
 }
 
@@ -705,7 +725,12 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   });
   html = html.replace(/<mat-sidenav([\s\S]*?)\[open\]=/g, '<mat-sidenav$1[opened]=');
   html = html.replace(/track option\.id/g, 'track option');
-  html = html.replace(/\(click\)="(on(?:Edit|Remove))\((\w+)[^"]*/g, '(click)="$1($2)"');
+  // Normalize onEdit/onRemove(arg…) → single-arg call; MUST consume the closing quote
+  // (older `[^"]*` form left the original `"` → `(click)="onEdit(task)"">` → NG5002).
+  html = html.replace(
+    /\(click\)="(on(?:Edit|Remove))\((\w+)[^"]*"\s*/g,
+    '(click)="$1($2)"'
+  );
 
   const states = parseUseState(tsx);
   const props = parseProps(tsx);

@@ -354,6 +354,157 @@ function ensureStandaloneTrue(source) {
 }
 
 /**
+ * Detect an existing reactive FormGroup property (form, taskForm, itemForm, …).
+ */
+function findExistingFormGroupName(source) {
+  const s = String(source || '');
+  const patterns = [
+    /\b(?:readonly\s+)?(form)\s*=\s*this\.fb\b/,
+    /\b(?:readonly\s+)?(\w*[Ff]orm)\s*=\s*this\.fb\b/,
+    /\bthis\.(\w*[Ff]orm)\s*=\s*this\.fb\./,
+    /\b(?:readonly\s+)?(\w*[Ff]orm)\s*[!:]?\s*:\s*FormGroup\b/,
+    /\b(?:readonly\s+)?(\w*[Ff]orm)\s*=\s*new\s+FormGroup\b/
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m?.[1]) return m[1];
+  }
+  if (/\breadonly form\b/.test(s)) return 'form';
+  if (/\bform\s*[!=:]/.test(s) && /FormGroup|FormBuilder|\bfb\./.test(s) && !/\btaskForm\b|\bitemForm\b/.test(s)) {
+    return 'form';
+  }
+  return null;
+}
+
+function classHasInjectedFormBuilder(source) {
+  return (
+    /\bfb\s*=\s*inject\s*\(\s*FormBuilder\s*\)/.test(source) ||
+    /constructor\s*\([^)]*\bfb\s*:\s*FormBuilder/.test(source) ||
+    /\bprivate\s+(?:readonly\s+)?fb\b/.test(source)
+  );
+}
+
+/**
+ * Drop duplicate fields/methods in a class body (TS2300 / TS2393).
+ * Keeps the first declaration of each name.
+ */
+export function dedupeDuplicateClassMembers(source) {
+  let updated = String(source || '');
+  const classMatch = updated.match(/export\s+class\s+\w+[^{]*\{/);
+  if (!classMatch || classMatch.index == null) return updated;
+  const classStart = classMatch.index + classMatch[0].length - 1;
+  const classEnd = findMatchingBrace(updated, classStart);
+  if (classEnd < 0) return updated;
+
+  const body = updated.slice(classStart + 1, classEnd);
+  const seenFields = new Set();
+  const seenMethods = new Set();
+  const cuts = [];
+
+  // Field: optional modifiers + name = …; or name: Type = …;
+  const fieldRe =
+    /^[ \t]*(?:(?:public|protected|private|readonly|static|override|declare)\s+)*([A-Za-z_]\w*)\s*(?:!\s*)?(?::[^=;\n]+)?=\s*[^;]+;/gm;
+  let m;
+  while ((m = fieldRe.exec(body))) {
+    const name = m[1];
+    if (/^(if|for|while|switch|return|throw|new|typeof|await)$/.test(name)) continue;
+    // Skip method-looking false positives handled below
+    if (seenFields.has(name)) {
+      cuts.push({
+        start: classStart + 1 + m.index,
+        end: classStart + 1 + m.index + m[0].length
+      });
+    } else {
+      seenFields.add(name);
+    }
+  }
+
+  const methodRe =
+    /^[ \t]*(?:(?:public|protected|private|override|async)\s+)*([A-Za-z_]\w*)\s*\([^;{]*\)\s*(?::[^{]+)?\{/gm;
+  while ((m = methodRe.exec(body))) {
+    const name = m[1];
+    if (/^(if|for|while|switch|catch)$/.test(name)) continue;
+    const openInFull = classStart + 1 + m.index + m[0].length - 1;
+    const close = findMatchingBrace(updated, openInFull);
+    if (close < 0) continue;
+    if (seenMethods.has(name) || seenFields.has(name)) {
+      cuts.push({ start: classStart + 1 + m.index, end: close + 1 });
+    } else {
+      seenMethods.add(name);
+    }
+  }
+
+  if (!cuts.length) return updated;
+  cuts.sort((a, b) => b.start - a.start);
+  for (const cut of cuts) {
+    updated = `${updated.slice(0, cut.start)}${updated.slice(cut.end)}`;
+  }
+  return updated.replace(/\n{3,}/g, '\n\n');
+}
+
+/**
+ * If both `form` and `taskForm` (or similar) exist, keep the one used by the
+ * template / primary reactive group and rewrite references.
+ */
+function consolidateDuplicateFormGroups(source, html = '') {
+  let updated = String(source || '');
+  const names = new Set();
+  for (const m of updated.matchAll(
+    /\b(?:readonly\s+)?(\w*[Ff]orm)\s*(?:=\s*this\.fb|[!:]?\s*:\s*FormGroup)/g
+  )) {
+    names.add(m[1]);
+  }
+  for (const m of updated.matchAll(/\bthis\.(\w*[Ff]orm)\s*=\s*this\.fb\./g)) {
+    names.add(m[1]);
+  }
+
+  if (names.size >= 2) {
+    const list = [...names];
+    const htmlForm =
+      String(html || '').match(/\[formGroup\]="\s*(\w+)\s*"/)?.[1] ||
+      (/\bform\.controls\b|\bform\.reset\b|\bform\.patchValue\b/.test(html) ? 'form' : null);
+    const prefer =
+      (htmlForm && names.has(htmlForm) && htmlForm) ||
+      (names.has('form') && 'form') ||
+      list.find((n) => new RegExp(`\\b${n}\\s*=\\s*this\\.fb\\.nonNullable`).test(updated)) ||
+      list[0];
+
+    for (const name of list) {
+      if (name === prefer) continue;
+      updated = updated.replace(
+        new RegExp(
+          `^[ \\t]*(?:(?:public|protected|private|readonly)\\s+)*${name}\\s*(?:!\\s*)?(?::[^=;\\n]+)?(?:=\\s*[^;]+)?;\\s*\\n?`,
+          'gm'
+        ),
+        ''
+      );
+      updated = updated.replace(
+        new RegExp(`^[ \\t]*this\\.${name}\\s*=\\s*this\\.fb\\.[\\s\\S]*?;\\s*\\n?`, 'gm'),
+        ''
+      );
+      updated = updated.replace(new RegExp(`\\bthis\\.${name}\\b`, 'g'), `this.${prefer}`);
+      updated = updated.replace(
+        new RegExp(
+          `(?<!\\.\\w*)\\b${name}\\b(?=\\s*\\.\\s*(?:controls|reset|patchValue|get|invalid|valid|value|markAllAsTouched))`,
+          'g'
+        ),
+        prefer
+      );
+    }
+  }
+
+  // Drop orphan *Form: any = null stubs when a real FormGroup exists
+  const keep = findExistingFormGroupName(updated);
+  if (keep) {
+    updated = updated.replace(
+      /^[ \t]*(?:(?:public|protected|private|readonly)\s+)*(\w*[Ff]orm)\s*(?:!\s*)?:\s*any\s*=\s*null\s*;\s*\n?/gm,
+      (full, name) => (name === keep ? full : '')
+    );
+  }
+  return updated;
+}
+
+/**
  * Insert members just inside the first exported class body.
  */
 function insertIntoClassBody(source, snippet) {
@@ -395,7 +546,7 @@ function removeNamedClassMethods(source, name) {
   const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!esc) return source;
   const re = new RegExp(
-    `(^|\\n)([ \\t]*(?:public|protected|private|override|async\\s+)*${esc}\\s*\\([^;{]*\\)\\s*(?::[^{]+)?\\{)`,
+    `(^|\\n)([ \\t]*(?:(?:public|protected|private|override|async)\\s+)*${esc}\\s*\\([^;{]*\\)\\s*(?::[^{]+)?\\{)`,
     'g'
   );
   const cuts = [];
@@ -626,7 +777,7 @@ function extractNamedMethod(source, name) {
   const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!esc) return null;
   const re = new RegExp(
-    `(^|\\n)([ \\t]*(?:public|protected|private|override|async\\s+)*${esc}\\s*\\(([^;{]*)\\)\\s*(?::[^{]+)?\\{)`
+    `(^|\\n)([ \\t]*(?:(?:public|protected|private|override|async)\\s+)*${esc}\\s*\\(([^;{]*)\\)\\s*(?::[^{]+)?\\{)`
   );
   const m = re.exec(source);
   if (!m) return null;
@@ -746,9 +897,8 @@ export function repairInferredTemplateHandlers(source, html) {
   );
 
   if (/<form\b/i.test(out) && fields.length) {
-    const hasForm =
-      /\breadonly form\b/.test(src) ||
-      (/\bform\s*[!=:]/.test(src) && /FormGroup|FormBuilder|fb\./.test(src));
+    let formName = findExistingFormGroupName(src);
+    const hasForm = !!formName;
     if (!hasForm) {
       src = ensureImport(src, 'inject', '@angular/core');
       src = ensureImport(src, 'FormBuilder', '@angular/forms');
@@ -778,10 +928,17 @@ export function repairInferredTemplateHandlers(source, html) {
           return `      ${name}: ${init}`;
         })
         .join(',\n');
+      const fbDecl = classHasInjectedFormBuilder(src)
+        ? ''
+        : '  private readonly fb = inject(FormBuilder);\n';
+      const resetDecl = /\bresetForm\s*\(/.test(src)
+        ? ''
+        : `  resetForm(): void {\n    this.form.reset({\n${resetBody}\n    });\n  }\n`;
       src = insertIntoClassBody(
         src,
-        `  private readonly fb = inject(FormBuilder);\n  readonly form = this.fb.nonNullable.group({\n${group}\n  });\n  resetForm(): void {\n    this.form.reset({\n${resetBody}\n    });\n  }`
+        `${fbDecl}  readonly form = this.fb.nonNullable.group({\n${group}\n  });\n${resetDecl}`.trimEnd()
       );
+      formName = 'form';
       for (const name of fields) {
         src = src.replace(
           new RegExp(
@@ -802,13 +959,14 @@ export function repairInferredTemplateHandlers(source, html) {
       const resetBody = fields.map((name) => `      ${name}: ''`).join(',\n');
       src = insertIntoClassBody(
         src,
-        `  resetForm(): void {\n    this.form.reset({\n${resetBody}\n    });\n  }`
+        `  resetForm(): void {\n    this.${formName}.reset({\n${resetBody}\n    });\n  }`
       );
     }
 
+    const bindName = formName || 'form';
     out = out.replace(/<form\b([^>]*)>/i, (full, attrs) => {
       let a = String(attrs || '').replace(/\s*\[formGroup\]="[^"]*"/g, '');
-      a += ' [formGroup]="form"';
+      a += ` [formGroup]="${bindName}"`;
       return `<form${a}>`;
     });
 
@@ -834,7 +992,7 @@ export function repairInferredTemplateHandlers(source, html) {
     });
     out = out.replace(
       /\(blur\)="(\w+)Touched\s*=\s*true"/g,
-      (_, field) => `(blur)="form.controls['${field}'].markAsTouched()"`
+      (_, field) => `(blur)="${bindName}.controls['${field}'].markAsTouched()"`
     );
 
     src = ensureImport(src, 'ReactiveFormsModule', '@angular/forms');
@@ -881,7 +1039,7 @@ export function repairInferredTemplateHandlers(source, html) {
   }
 
   for (const m of [...src.matchAll(
-    /(?:^|\n)[ \t]*(?:public|protected|private|override|async\s+)*([A-Za-z_]\w*)\s*\(([^;{]*)\)\s*(?::[^{]+)?\{/g
+    /(?:^|\n)[ \t]*(?:(?:public|protected|private|override|async)\s+)*([A-Za-z_]\w*)\s*\(([^;{]*)\)\s*(?::[^{]+)?\{/g
   )]) {
     const name = m[1];
     const method = extractNamedMethod(src, name);
@@ -890,7 +1048,60 @@ export function repairInferredTemplateHandlers(source, html) {
     src = removeNamedClassMethods(src, name);
   }
 
-  return { source: src, html: out };
+  src = consolidateDuplicateFormGroups(src, out);
+  src = dedupeDuplicateClassMembers(src);
+  return { source: src, html: dropEventArgForZeroParamHandlers(src, out) };
+}
+
+/**
+ * `(event)="handler($event)"` is TS2554 when `handler()` takes no parameters.
+ * Angular `(ngSubmit)` already preventDefaults, so drop the extra argument.
+ */
+function dropEventArgForZeroParamHandlers(source, html) {
+  return String(html || '').replace(
+    /(\([\w.-]+\)="\s*)([A-Za-z_]\w*)\s*\(\s*\$event\s*\)(\s*")/g,
+    (full, prefix, name, suffix) => {
+      const method = extractNamedMethod(source, name);
+      if (!method) return full;
+      if (String(method.signature || '').trim()) return full;
+      return `${prefix}${name}()${suffix}`;
+    }
+  );
+}
+
+export function repairZeroArgTemplateCalls(destPath, buildErrors = '') {
+  const text = String(buildErrors || '');
+  const srcRoot = path.join(destPath, 'src');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/((?:src\/)?[\w./\\-]+\.component\.(?:ts|html))/g)) {
+    mentioned.add(
+      m[1]
+        .replace(/\\/g, '/')
+        .replace(/^\.?\//, '')
+        .replace(/\.html$/, '.ts')
+    );
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].map((rel) => path.join(destPath, rel)).filter((f) => fs.existsSync(f))
+      : walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    const htmlFile = tsFile.replace(/\.ts$/, '.html');
+    if (!fs.existsSync(htmlFile)) continue;
+    const src = fs.readFileSync(tsFile, 'utf-8');
+    const html = fs.readFileSync(htmlFile, 'utf-8');
+    const next = dropEventArgForZeroParamHandlers(src, html);
+    if (next !== html) {
+      fs.writeFileSync(htmlFile, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Dropped extra $event args in ${changed} template(s)`);
+  }
+  return changed;
 }
 
 /**
@@ -1127,11 +1338,129 @@ export function repairSelfClosingNonVoidTags(html) {
   return out;
 }
 
+function tokenizeHtmlMarkup(html) {
+  const s = String(html || '');
+  const tokens = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s.startsWith('<!--', i)) {
+      const end = s.indexOf('-->', i + 4);
+      const j = end < 0 ? s.length : end + 3;
+      tokens.push({ kind: 'text', text: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (s[i] !== '<') {
+      const next = s.indexOf('<', i);
+      const j = next < 0 ? s.length : next;
+      tokens.push({ kind: 'text', text: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    const close = s.indexOf('>', i + 1);
+    if (close < 0) {
+      tokens.push({ kind: 'text', text: s.slice(i) });
+      break;
+    }
+    const raw = s.slice(i, close + 1);
+    const closeMatch = raw.match(/^<\/([A-Za-z][\w-]*)\s*>$/);
+    if (closeMatch) {
+      tokens.push({ kind: 'close', name: closeMatch[1], text: raw });
+      i = close + 1;
+      continue;
+    }
+    const openMatch = raw.match(/^<([A-Za-z][\w-]*)([\s\S]*)$/);
+    if (openMatch) {
+      const name = openMatch[1];
+      const selfClosing = /\/\s*>$/.test(raw);
+      const voidish = HTML_VOID_TAGS.has(name.toLowerCase()) || selfClosing;
+      tokens.push({
+        kind: voidish ? 'void' : 'open',
+        name,
+        text: raw
+      });
+      i = close + 1;
+      continue;
+    }
+    tokens.push({ kind: 'text', text: raw });
+    i = close + 1;
+  }
+  return tokens;
+}
+
+/**
+ * Move premature ancestor closes (e.g. layout `</div>` inside
+ * `<mat-sidenav-content>`) and drop unmatched end tags (NG5002).
+ */
+export function repairMismatchedHtmlClosingTags(html) {
+  const tokens = tokenizeHtmlMarkup(html);
+  const stack = [];
+  const out = [];
+
+  const flushDeferred = () => {
+    while (stack.length && stack[stack.length - 1].deferred) {
+      const frame = stack.pop();
+      out.push(`</${frame.name}>`);
+    }
+  };
+
+  for (const token of tokens) {
+    if (token.kind === 'text' || token.kind === 'void') {
+      out.push(token.text);
+      continue;
+    }
+    if (token.kind === 'open') {
+      out.push(token.text);
+      stack.push({ name: token.name, deferred: false });
+      continue;
+    }
+    const want = token.name;
+    const top = stack[stack.length - 1];
+    if (top && top.name.toLowerCase() === want.toLowerCase()) {
+      stack.pop();
+      out.push(token.text);
+      flushDeferred();
+      continue;
+    }
+    let ancestorAt = -1;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (stack[i].name.toLowerCase() === want.toLowerCase()) {
+        ancestorAt = i;
+        break;
+      }
+    }
+    if (ancestorAt < 0) continue;
+    stack[ancestorAt].deferred = true;
+  }
+
+  while (stack.length) {
+    const frame = stack.pop();
+    if (frame.deferred) out.push(`</${frame.name}>`);
+  }
+
+  return unwrapSidenavContainerInnerWrapper(out.join(''));
+}
+
+function unwrapSidenavContainerInnerWrapper(html) {
+  return String(html || '').replace(
+    /(<mat-sidenav-container\b[^>]*>)\s*<div\b[^>]*>\s*(<mat-sidenav\b[\s\S]*?<\/mat-sidenav>\s*<mat-sidenav-content\b[\s\S]*?<\/mat-sidenav-content>)\s*<\/div>\s*(<\/mat-sidenav-container>)/gi,
+    '$1\n$2\n$3'
+  );
+}
+
 /**
  * Repair Angular HTML leftovers that commonly break ng serve after React conversions.
  */
 function repairAngularTemplateHtml(html, source) {
   let updated = repairSelfClosingNonVoidTags(html);
+  updated = repairMismatchedHtmlClosingTags(updated);
+
+  // Doubled attribute closers: (click)="fn()""> confuses the parser into NG5002 on </button>
+  updated = updated.replace(/(\)[^"<>]*)"{2,}(\s*\/?\s*>)/g, '$1"$2');
+
+  // Leftover JSX/ternary closers after @if/@else conversion: </div>)} → </div>}
+  updated = updated.replace(/(<\/[A-Za-z][\w-]*>)\s*\)\}/g, '$1\n}');
+  updated = updated.replace(/(@else\s*\{[\s\S]*?<\/[A-Za-z][\w-]*>)\s*\)\s*$/g, '$1\n}');
 
   // Empty event bindings are invalid
   updated = updated.replace(/\s*\((click|input|change|submit|blur|focus|keydown|keyup)\)\s*=\s*(["'])\s*\2/g, '');
@@ -2157,6 +2486,8 @@ function repairAngularComponentFile(tsPath, options = {}) {
     html = inferredAfterStub.html;
     source = ensureCountWhereHelper(source, html);
     source = repairFormBuilderInit(source);
+    source = consolidateDuplicateFormGroups(source, html);
+    source = dedupeDuplicateClassMembers(source);
     source = repairBogusAngularFormsImports(source);
     source = sanitizeStandaloneImports(source);
     source = syncNgComponentImports(source, html);
@@ -2166,6 +2497,8 @@ function repairAngularComponentFile(tsPath, options = {}) {
 
   // Prefer real @Input/@Output over heuristic stubs; fix strict-null field inits
   source = dedupeStubbedClassMembers(source);
+  source = consolidateDuplicateFormGroups(source, readAllTemplates(source, tsPath));
+  source = dedupeDuplicateClassMembers(source);
   source = repairNullAssignedPrimitives(source);
   for (const targetHtml of htmlFiles) {
     if (!fs.existsSync(targetHtml)) continue;
@@ -2554,10 +2887,14 @@ function mergePackageDependencies(destPath, sourcePackageJson, targetFramework) 
   }
 
   if (targetFramework === 'angular') {
-    // Ensure animations package present (templates often need it)
+    const coreVer = pkg.dependencies['@angular/core'] || '^22.0.8';
+    const major = parseInt(String(coreVer).replace(/^[^\d]*/, '').split('.')[0], 10) || 22;
+    // provideAnimationsAsync() still bundles @angular/animations/browser
     if (!pkg.dependencies['@angular/animations']) {
-      const coreVer = pkg.dependencies['@angular/core'] || '^22.0.8';
       pkg.dependencies['@angular/animations'] = coreVer;
+    }
+    if (major >= 21) {
+      delete pkg.dependencies['@angular/platform-browser-dynamic'];
     }
 
     // Do not inject Material/NGXS/toastr kit packages — converted source owns deps.
@@ -2809,7 +3146,7 @@ function classHasMethod(source, name) {
   const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!esc) return false;
   return new RegExp(
-    `(?:^|\\n)[ \\t]*(?:public|protected|private|override|async\\s+)*${esc}\\s*\\([^;{]*\\)\\s*(?::[^{]+)?\\{`,
+    `(?:^|\\n)[ \\t]*(?:(?:public|protected|private|override|async)\\s+)*${esc}\\s*\\([^;{]*\\)\\s*(?::[^{]+)?\\{`,
     'm'
   ).test(source);
 }
@@ -3151,6 +3488,7 @@ export function ensureAngularMaterialPackages(destPath, sourcePackageJson = null
   if (!pkg) return 0;
   pkg.dependencies = pkg.dependencies || {};
   const core = pkg.dependencies['@angular/core'] || '22.0.8';
+  const major = parseInt(String(core).replace(/^[^\d]*/, '').split('.')[0], 10) || 22;
   const kit = webAngularNpmDeps(core);
   let added = 0;
   for (const name of ['@angular/material', '@angular/cdk']) {
@@ -3161,6 +3499,11 @@ export function ensureAngularMaterialPackages(destPath, sourcePackageJson = null
   }
   if (!pkg.dependencies['@angular/animations'] && kit.dependencies['@angular/cdk']) {
     pkg.dependencies['@angular/animations'] = core;
+    added += 1;
+  }
+  if (major >= 21 && pkg.dependencies['@angular/platform-browser-dynamic']) {
+    delete pkg.dependencies['@angular/platform-browser-dynamic'];
+    added += 1;
   }
   if (added) writeJson(pkgPath, pkg);
   ensureMaterialTheme(destPath);
@@ -3186,10 +3529,67 @@ function ensureNgSymbolsFromBuildErrors(source, buildErrors) {
   return updated;
 }
 
+/**
+ * React sources keep models under src/models/; Angular components import
+ * ../../models from src/app/... which resolves to src/app/models/.
+ * Move misplaced models and pin missing ones from the source map.
+ */
+export function ensureAngularAppModels(destPath, sourceFilesMap = null) {
+  const appModels = path.join(destPath, 'src', 'app', 'models');
+  const reactModels = path.join(destPath, 'src', 'models');
+  let changed = 0;
+
+  if (fs.existsSync(reactModels)) {
+    fs.mkdirSync(appModels, { recursive: true });
+    for (const name of fs.readdirSync(reactModels)) {
+      if (!/\.(ts|tsx)$/i.test(name)) continue;
+      const from = path.join(reactModels, name);
+      const to = path.join(appModels, name.replace(/\.tsx$/i, '.ts'));
+      if (!fs.existsSync(from) || !fs.statSync(from).isFile()) continue;
+      const body = fs.readFileSync(from, 'utf-8');
+      if (!fs.existsSync(to) || fs.readFileSync(to, 'utf-8') !== body) {
+        fs.writeFileSync(to, body.endsWith('\n') ? body : `${body}\n`, 'utf-8');
+        changed += 1;
+      }
+      try {
+        fs.unlinkSync(from);
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      if (fs.readdirSync(reactModels).length === 0) fs.rmdirSync(reactModels);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (sourceFilesMap && typeof sourceFilesMap === 'object') {
+    for (const [rel, content] of Object.entries(sourceFilesMap)) {
+      const norm = String(rel).replace(/\\/g, '/');
+      if (!/(^|\/)models\/.+\.ts$/i.test(norm) && !/\.model\.ts$/i.test(norm)) continue;
+      if (typeof content !== 'string' || !content.trim()) continue;
+      fs.mkdirSync(appModels, { recursive: true });
+      const dest = path.join(appModels, path.basename(norm).replace(/\.tsx$/i, '.ts'));
+      const body = content.endsWith('\n') ? content : `${content}\n`;
+      if (!fs.existsSync(dest) || fs.readFileSync(dest, 'utf-8') !== body) {
+        fs.writeFileSync(dest, body, 'utf-8');
+        changed += 1;
+      }
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Ensured Angular models under src/app/models (${changed} file(s))`);
+  }
+  return changed;
+}
+
 export function repairAngularWorkspace(destPath, options = {}) {
   const { sourceFilesMap = null, sourcePackageJson = null } = options;
 
   addAngularPathAliases(destPath);
+  ensureAngularAppModels(destPath, sourceFilesMap);
   copySourceLibs(destPath, sourceFilesMap);
   ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
@@ -3405,12 +3805,22 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /Object is possibly 'null'/.test(text) ||
     /is not assignable to type '\w+'/.test(text) ||
     /Type 'string' is not assignable to type/.test(text);
+  const arityIssues =
+    /TS2554/.test(text) ||
+    /Expected 0 arguments, but got 1/.test(text);
+  const moduleIssues =
+    /TS2307/.test(text) ||
+    /Could not resolve ['"].*models\//.test(text) ||
+    /Cannot find module ['"].*models\//.test(text);
+  const duplicateIssues =
+    /TS2393/.test(text) ||
+    /TS2300/.test(text) ||
+    /Duplicate function implementation/.test(text) ||
+    /Duplicate identifier/.test(text);
   const needs =
     /NG1010/.test(text) ||
     /NG5002/.test(text) ||
-    /TS2300/.test(text) ||
     /TS2305/.test(text) ||
-    /Duplicate identifier/.test(text) ||
     /Void elements do not have end tags/.test(text) ||
     /Unexpected closing tag/.test(text) ||
     /Unknown reference/.test(text) ||
@@ -3418,7 +3828,9 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /is not a known attribute/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
     /has no exported member/.test(text);
-  if (!needs && !eventIssues && !typeIssues) return 0;
+  if (!needs && !eventIssues && !typeIssues && !arityIssues && !moduleIssues && !duplicateIssues) {
+    return 0;
+  }
 
   const srcRoot = path.join(destPath, 'src');
   const snapshot = () => {
@@ -3434,6 +3846,14 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   };
   const beforeMap = snapshot();
 
+  if (moduleIssues) {
+    try {
+      ensureAngularAppModels(destPath);
+    } catch (err) {
+      console.warn(`[postprocess] Angular model layout repair failed: ${err.message}`);
+    }
+  }
+
   if (eventIssues) {
     try {
       ensureOutputsFromParentEventBindings(destPath);
@@ -3443,7 +3863,7 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     }
   }
 
-  if (needs) {
+  if (needs || duplicateIssues) {
     const mentioned = new Set();
     for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
       mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
@@ -3470,8 +3890,14 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
         continue;
       }
       let after = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : before;
+      if (duplicateIssues) {
+        const htmlPath = file.replace(/\.ts$/, '.html');
+        const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
+        after = consolidateDuplicateFormGroups(after, html);
+        after = dedupeDuplicateClassMembers(after);
+      }
       const forced = ensureNgSymbolsFromBuildErrors(after, text);
-      if (forced !== after) {
+      if (forced !== after || after !== before) {
         fs.writeFileSync(file, forced.endsWith('\n') ? forced : `${forced}\n`, 'utf-8');
       }
     }
@@ -3486,6 +3912,14 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       repairAngularStrictNullAndStatusTypes(destPath, text);
     } catch (err) {
       console.warn(`[postprocess] Strict-null/status repair failed: ${err.message}`);
+    }
+  }
+
+  if (arityIssues) {
+    try {
+      repairZeroArgTemplateCalls(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Template arity repair failed: ${err.message}`);
     }
   }
 
@@ -4855,8 +5289,11 @@ function resolvePhantomDomainImport(fromFile, spec, binding, modelTypes) {
   if (byName && resolveModuleFile(fromFile, byName)) return byName;
 
   const srcRoot = srcRootFromFile(fromFile);
-  const modelsDir = path.join(srcRoot, 'models');
-  if (fs.existsSync(modelsDir)) {
+  for (const modelsDir of [
+    path.join(srcRoot, 'app', 'models'),
+    path.join(srcRoot, 'models')
+  ]) {
+    if (!fs.existsSync(modelsDir)) continue;
     for (const file of walkFiles(modelsDir, (n) => /\.(tsx|ts)$/i.test(n))) {
       return moduleRelFrom(fromFile, file);
     }
@@ -5904,6 +6341,14 @@ export function addPackagesFromBuildErrors(destPath, buildErrors) {
   pkg.dependencies = pkg.dependencies || {};
   let added = 0;
   const text = String(buildErrors || '');
+  if (
+    /@angular\/animations(?:\/browser)?/.test(text) &&
+    !pkg.dependencies['@angular/animations'] &&
+    pkg.dependencies['@angular/core']
+  ) {
+    pkg.dependencies['@angular/animations'] = pkg.dependencies['@angular/core'];
+    added += 1;
+  }
   for (const m of text.matchAll(/Cannot find module ['"]([^'"]+)['"]/g)) {
     const pkgName = packageNameFromSpecifier(m[1]);
     if (!pkgName || pkgName.startsWith('@ngxs/')) continue;

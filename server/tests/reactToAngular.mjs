@@ -87,6 +87,20 @@ assert(modelDest?.newPath === 'src/app/models/item.model.ts', 'models stay in sr
   assert(!/PaperProps|className=|startIcon=/.test(html), 'TaskList html has no React leftovers');
   assert(/\(click\)="openAdd\(\)"/.test(html), 'Add task click handler');
   assert(/\[opened\]="sidebarOpen"/.test(html), 'sidenav uses [opened]');
+  assert(/<mat-sidenav-container[\s\S]*<mat-sidenav\b/.test(html), 'sidenav is inside the container');
+  assert(
+    !/<\/div>\s*<\/mat-sidenav-content>/s.test(html),
+    'TaskList does not close a layout div inside mat-sidenav-content'
+  );
+  const sidenavContent = html.match(
+    /<mat-sidenav-content>([\s\S]*)<\/mat-sidenav-content>/
+  )?.[1] || '';
+  const contentDivOpens = (sidenavContent.match(/<div\b/g) || []).length;
+  const contentDivCloses = (sidenavContent.match(/<\/div>/g) || []).length;
+  assert(
+    contentDivOpens === contentDivCloses,
+    'div tags inside mat-sidenav-content are balanced'
+  );
   assert(!/<app-text-field/.test(html), 'TextField is not left as a custom component');
   assert(/\(click\)="onEdit\(task\)"/.test(html) || /app-task-table/.test(html), 'table is wired');
 }
@@ -110,6 +124,13 @@ assert(modelDest?.newPath === 'src/app/models/item.model.ts', 'models stay in sr
   const opens = (html.match(/<button\b/g) || []).length;
   const closes = (html.match(/<\/button>/g) || []).length;
   assert(opens === closes, 'TaskTable button open/close tags are balanced');
+  assert(!/\)""/.test(html), 'TaskTable click bindings do not double-close quotes');
+  assert(/\(click\)="onEdit\(task\)"/.test(html), 'TaskTable wires onEdit(task)');
+  assert(/\(click\)="onRemove\(task\)"/.test(html), 'TaskTable wires onRemove(task)');
+  assert(!/\)\}\s*$/.test(html.trim()), 'TaskTable has no leftover JSX )} closer');
+  assert(/@if\s*\(tasks\.length === 0\)/.test(html), 'TaskTable empty state uses @if');
+  assert(/@else\s*\{/.test(html), 'TaskTable non-empty branch uses @else');
+  assert(/@for\s*\(task of tasks/.test(html), 'TaskTable rows use @for');
 }
 
 {

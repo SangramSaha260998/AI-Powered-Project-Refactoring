@@ -35,7 +35,11 @@ import {
   ensureAngularMaterialPackages,
   inferDeclarablePackage,
   declarablesNeededByHtml,
-  repairSelfClosingNonVoidTags
+  repairSelfClosingNonVoidTags,
+  repairMismatchedHtmlClosingTags,
+  repairZeroArgTemplateCalls,
+  ensureAngularAppModels,
+  dedupeDuplicateClassMembers
 } from '../src/services/postprocess.js';
 import { rewriteHtmlLucideToInlineSvg } from '../src/services/lucideInlineSvg.js';
 import {
@@ -45,7 +49,10 @@ import {
   normalizeReactPlanPath,
   groupPlanIntoMigrationUnits,
   coerceReactMigrationUnit,
-  synthesizeReactUnitFromAngular
+  synthesizeReactUnitFromAngular,
+  injectAngularWorkspaceTemplates,
+  enforceAngularPackageVersions,
+  splitReworkItems
 } from '../src/services/migration.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1778,6 +1785,100 @@ src/app/components/item-table/item-table.component.ts:10:15: templateUrl: './ite
 }
 
 {
+  const broken = `
+<td class="actions">
+  <button mat-icon-button type="button" aria-label="Edit" (click)="onEdit(task)"">
+    <mat-icon>edit</mat-icon>
+  </button>
+  <button mat-icon-button type="button" aria-label="Delete" (click)="onRemove(task)"">
+    <mat-icon>delete</mat-icon>
+  </button>
+</td>
+</div>)}
+`;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng5002-quotes-'));
+  const dir = path.join(tmp, 'src', 'app', 'components', 'item-table');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'item-table.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({ selector: 'app-item-table', standalone: true, templateUrl: './item-table.component.html' })
+export class ItemTableComponent {}
+`
+  );
+  fs.writeFileSync(path.join(dir, 'item-table.component.html'), broken);
+  const n = fixAngularCompileErrors(
+    tmp,
+    `NG5002: Unexpected closing tag "button".
+src/app/components/item-table/item-table.component.html:5:2: </button>
+Error occurs in the template of component ItemTableComponent.
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs doubled click quotes (NG5002)');
+  const html = fs.readFileSync(path.join(dir, 'item-table.component.html'), 'utf-8');
+  assert(!/\)""/.test(html), 'doubled attribute quotes are removed');
+  assert(/\(click\)="onEdit\(task\)"/.test(html), 'onEdit binding is valid');
+  assert(!/\)\}/.test(html), 'leftover JSX )} closer is removed');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const broken = `<mat-sidenav-container class="layout">
+<div class="layout">
+      <mat-sidenav position="end" mode="over" [opened]="sidebarOpen">
+        <app-item-editor></app-item-editor>
+      </mat-sidenav>
+<mat-sidenav-content>
+      <mat-toolbar></mat-toolbar>
+      <main class="content"></main>
+    </div>
+</mat-sidenav-content>
+</mat-sidenav-container>
+`;
+  const fixed = repairMismatchedHtmlClosingTags(broken);
+  assert(
+    !/<\/div>\s*<\/mat-sidenav-content>/s.test(fixed),
+    'layout </div> is not left inside mat-sidenav-content'
+  );
+  assert(
+    /<mat-sidenav-container[\s\S]*<mat-sidenav\b[\s\S]*<\/mat-sidenav>\s*<mat-sidenav-content>[\s\S]*<\/mat-sidenav-content>\s*<\/mat-sidenav-container>/s.test(
+      fixed
+    ),
+    'sidenav tags are direct children of the container'
+  );
+  const opensDiv = (fixed.match(/<div\b/g) || []).length;
+  const closesDiv = (fixed.match(/<\/div>/g) || []).length;
+  assert(opensDiv === closesDiv, 'div open/close tags are balanced after sidenav repair');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng5002-sidenav-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'item-list');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'item-list.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({ selector: 'app-item-list', standalone: true, templateUrl: './item-list.component.html' })
+export class ItemListComponent {}
+`
+  );
+  fs.writeFileSync(path.join(dir, 'item-list.component.html'), broken);
+  const n = fixAngularCompileErrors(
+    tmp,
+    `NG5002: Unexpected closing tag "div". It may happen when the tag has already been closed by another tag.
+src/app/pages/item-list/item-list.component.html:31:4: </div>
+Error occurs in the template of component ItemListComponent.
+src/app/pages/item-list/item-list.component.ts:36:15: templateUrl: './item-list.component.html'
+NG5002: Unexpected closing tag "mat-sidenav-content".
+src/app/pages/item-list/item-list.component.html:32:0: </mat-sidenav-content>
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs NG5002 sidenav layout closes');
+  const html = fs.readFileSync(path.join(dir, 'item-list.component.html'), 'utf-8');
+  assert(/<mat-sidenav-content>/.test(html), 'mat-sidenav-content remains');
+  assert(!/<\/div>\s*<\/mat-sidenav-content>/s.test(html), 'compile repair moves the stray layout close');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
   const voidHtml = `<mat-form-field appearance="outline"><mat-label>Title</mat-label><input matInput [value]="title"></input></mat-form-field>`;
   const fixedVoid = repairSelfClosingNonVoidTags(voidHtml);
   assert(!/<\/input>/.test(fixedVoid), 'void input end tags are stripped');
@@ -2061,6 +2162,302 @@ Unknown reference.
   const ts2 = fs.readFileSync(path.join(dir, 'item-editor.component.ts'), 'utf-8');
   assert(/ReactiveFormsModule/.test(ts2), 'repair keeps ReactiveFormsModule intact');
   assert(!/\bReactive\b/.test(ts2.replace(/ReactiveFormsModule/g, '')), 'repair does not reintroduce bare Reactive');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ts2554-arity-'));
+  const dir = path.join(tmp, 'src', 'app', 'components', 'item-editor');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.ts'),
+    `import { Component } from '@angular/core';
+import { ReactiveFormsModule } from '@angular/forms';
+@Component({
+  selector: 'app-item-editor',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  templateUrl: './item-editor.component.html'
+})
+export class ItemEditorComponent {
+  protected onSubmit(): void {}
+  onSave(value: unknown): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.html'),
+    `<form [formGroup]="form" (ngSubmit)="onSubmit($event)">
+  <button type="button" (click)="onSave($event)">Save</button>
+</form>
+`
+  );
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2554: Expected 0 arguments, but got 1.
+[plugin angular-compiler] src/app/components/item-editor/item-editor.component.html:8:55:
+  (ngSubmit)="onSubmit($event)"
+Error occurs in the template of component ItemEditorComponent.
+src/app/components/item-editor/item-editor.component.ts:15:15:
+  templateUrl: './item-editor.component.html'
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs TS2554 extra $event');
+  const html = fs.readFileSync(path.join(dir, 'item-editor.component.html'), 'utf-8');
+  assert(/\(ngSubmit\)="onSubmit\(\)"/.test(html), 'zero-arg onSubmit drops $event');
+  assert(/\(click\)="onSave\(\$event\)"/.test(html), 'one-arg onSave keeps $event');
+  const n2 = repairZeroArgTemplateCalls(tmp, '');
+  assert(n2 === 0, 'zero-arg template repair is idempotent');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng21-pkgs-'));
+  injectAngularWorkspaceTemplates(tmp, {
+    major: 21,
+    core: '21.2.18',
+    tooling: '21.2.12',
+    typescript: '~5.9.2',
+    zone: '~0.15.0'
+  }, { projectName: 'host-app' });
+  const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
+  assert(pkg.dependencies['@angular/core'] === '21.2.18', 'Angular 21 core is pinned');
+  assert(
+    !pkg.dependencies['@angular/platform-browser-dynamic'],
+    'Angular 21 workspace omits deprecated platform-browser-dynamic'
+  );
+  assert(
+    pkg.dependencies['@angular/animations'] === '21.2.18',
+    'Angular 21 still includes @angular/animations for provideAnimationsAsync'
+  );
+  assert(pkg.dependencies['@angular/platform-browser'] === '21.2.18', 'platform-browser remains');
+
+  pkg.dependencies['@angular/platform-browser-dynamic'] = '21.2.18';
+  pkg.dependencies['@angular/animations'] = '21.2.18';
+  fs.writeFileSync(path.join(tmp, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`);
+  enforceAngularPackageVersions(tmp, {
+    major: 21,
+    core: '21.2.18',
+    tooling: '21.2.12',
+    typescript: '~5.9.2',
+    zone: '~0.15.0'
+  });
+  const pkg2 = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
+  assert(
+    !pkg2.dependencies['@angular/platform-browser-dynamic'],
+    'enforce strips platform-browser-dynamic on Angular 21'
+  );
+  assert(
+    pkg2.dependencies['@angular/animations'] === '21.2.18',
+    'enforce keeps @angular/animations on Angular 21'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng20-anims-'));
+  injectAngularWorkspaceTemplates(tmp, {
+    major: 20,
+    core: '20.3.9',
+    tooling: '20.3.16',
+    typescript: '~5.9.2',
+    zone: '~0.15.0'
+  }, { projectName: 'host-app' });
+  const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
+  assert(
+    pkg.dependencies['@angular/animations'] === '20.3.9',
+    'Angular 20 still lists @angular/animations'
+  );
+  assert(
+    !pkg.dependencies['@angular/platform-browser-dynamic'],
+    'standalone workspaces omit platform-browser-dynamic even on Angular 20'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const numbered = splitReworkItems(`1. Fix the form submit handler
+2. Wire the delete dialog close event
+3. Type the seed list as Item[]`);
+  assert(numbered.length === 3, 'numbered rework prompt splits into 3 items');
+  assert(/form submit/.test(numbered[0]), 'first numbered item is kept');
+  assert(/delete dialog/.test(numbered[1]), 'second numbered item is kept');
+  assert(/seed list/.test(numbered[2]), 'third numbered item is kept');
+
+  const bullets = splitReworkItems(`- Fix title validation
+- Reset the sidebar on close`);
+  assert(bullets.length === 2, 'bulleted rework prompt splits into 2 items');
+
+  const single = splitReworkItems('TS2554: Expected 0 arguments, but got 1 in onSubmit($event).');
+  assert(single.length === 1, 'a single error paste is not split');
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng-models-layout-'));
+  const reactModels = path.join(tmp, 'src', 'models');
+  const appDir = path.join(tmp, 'src', 'app', 'components', 'item-table');
+  fs.mkdirSync(reactModels, { recursive: true });
+  fs.mkdirSync(appDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(reactModels, 'item.model.ts'),
+    `export type ItemStatus = 'todo' | 'done';\nexport interface Item { id: string; title: string; status: ItemStatus; }\n`
+  );
+  fs.writeFileSync(
+    path.join(appDir, 'item-table.component.ts'),
+    `import { Component } from '@angular/core';\nimport { Item } from '../../models/item.model';\n@Component({ selector: 'app-item-table', standalone: true, template: '' })\nexport class ItemTableComponent { items: Item[] = []; }\n`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `Could not resolve "../../models/item.model"
+src/app/components/item-table/item-table.component.ts:2:41:
+TS2307: Cannot find module '../../models/item.model' or its corresponding type declarations.`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors moves models into src/app/models');
+  assert(
+    fs.existsSync(path.join(tmp, 'src', 'app', 'models', 'item.model.ts')),
+    'model file is under src/app/models'
+  );
+  assert(
+    !fs.existsSync(path.join(tmp, 'src', 'models', 'item.model.ts')),
+    'React-shaped src/models copy is removed'
+  );
+  const n2 = ensureAngularAppModels(tmp);
+  assert(n2 === 0, 'ensureAngularAppModels is idempotent');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-dup-resetform-'));
+  const dir = path.join(tmp, 'src', 'app', 'components', 'item-editor');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.ts'),
+    `import { Component, Input, Output, EventEmitter, OnChanges, SimpleChanges, inject } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
+import { Item, ItemDraft } from '../../models/item.model';
+
+@Component({
+  selector: 'app-item-editor',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  templateUrl: './item-editor.component.html'
+})
+export class ItemEditorComponent implements OnChanges {
+  private readonly fb = inject(FormBuilder);
+  readonly form = this.fb.nonNullable.group({
+    title: [''],
+    description: [''],
+    status: ['']
+  });
+  resetForm(): void {
+    this.form.reset({ title: '', description: '', status: '' });
+  }
+
+  private readonly fb = inject(FormBuilder);
+
+  @Input() item: Item | null = null;
+  @Output() save = new EventEmitter<ItemDraft>();
+  @Output() cancel = new EventEmitter<void>();
+
+  taskForm: FormGroup;
+
+  constructor() {
+    this.taskForm = this.fb.group({
+      title: ['', Validators.required],
+      description: [''],
+      status: ['todo']
+    });
+  }
+
+  resetForm(): void {
+    this.taskForm.reset({ title: '', description: '', status: 'todo' });
+  }
+
+  onSubmit(): void {
+    this.save.emit(this.taskForm.value as ItemDraft);
+  }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.html'),
+    `<form [formGroup]="form" (ngSubmit)="onSubmit()">
+  <input formControlName="title" />
+</form>
+`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2393: Duplicate function implementation.
+src/app/components/item-editor/item-editor.component.ts:26:2: resetForm(): void {
+The original member "resetForm" is here:
+src/app/components/item-editor/item-editor.component.ts:41:4: resetForm(): void {
+TS2300: Duplicate identifier 'fb'.
+src/app/components/item-editor/item-editor.component.ts:35:19: private readonly fb = inject(FormBuilder);
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs duplicate resetForm/fb');
+  const ts = fs.readFileSync(path.join(dir, 'item-editor.component.ts'), 'utf-8');
+  assert(
+    (ts.match(/\bresetForm\s*\(/g) || []).length === 1,
+    'only one resetForm method remains'
+  );
+  assert(
+    (ts.match(/\bfb\s*=\s*inject\(\s*FormBuilder\s*\)/g) || []).length === 1,
+    'only one FormBuilder inject remains'
+  );
+  assert(!/\btaskForm\b/.test(ts) || /\bform\b/.test(ts), 'form group is consolidated');
+  const n2 = dedupeDuplicateClassMembers(ts);
+  assert(
+    (n2.match(/\bresetForm\s*\(/g) || []).length === 1,
+    'dedupeDuplicateClassMembers is stable on cleaned source'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // Existing taskForm must not get a second fb/form/resetForm injected
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-keep-taskform-'));
+  const dir = path.join(tmp, 'src', 'app', 'components', 'item-editor');
+  fs.mkdirSync(dir, { recursive: true });
+  const original = `import { Component, inject } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule } from '@angular/forms';
+@Component({
+  selector: 'app-item-editor',
+  standalone: true,
+  imports: [ReactiveFormsModule],
+  templateUrl: './item-editor.component.html'
+})
+export class ItemEditorComponent {
+  private readonly fb = inject(FormBuilder);
+  taskForm: FormGroup = this.fb.group({ title: [''], status: ['todo'] });
+  resetForm(): void { this.taskForm.reset({ title: '', status: 'todo' }); }
+  onSubmit(): void {}
+}
+`;
+  fs.writeFileSync(path.join(dir, 'item-editor.component.ts'), original);
+  fs.writeFileSync(
+    path.join(dir, 'item-editor.component.html'),
+    `<form [formGroup]="taskForm" (ngSubmit)="onSubmit()">
+  <input formControlName="title" />
+  <select formControlName="status"></select>
+</form>
+`
+  );
+  repairAngularComponentFile(path.join(dir, 'item-editor.component.ts'), {});
+  const ts = fs.readFileSync(path.join(dir, 'item-editor.component.ts'), 'utf-8');
+  const html = fs.readFileSync(path.join(dir, 'item-editor.component.html'), 'utf-8');
+  assert(
+    (ts.match(/\bfb\s*=\s*inject\(\s*FormBuilder\s*\)/g) || []).length === 1,
+    'existing taskForm does not get a second fb'
+  );
+  assert(
+    (ts.match(/\bresetForm\s*\(/g) || []).length === 1,
+    'existing resetForm is not duplicated'
+  );
+  assert(/\[formGroup\]="taskForm"/.test(html), 'template keeps taskForm binding');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

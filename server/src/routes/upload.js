@@ -85,6 +85,7 @@ function isValidSessionId(id) {
 
 /**
  * Reads the project name from a converted workspace's package.json.
+ * Standard migrated workspaces surface as "Migrated Angular/React Project".
  */
 function deriveProjectName(convertedPath, toTech) {
   try {
@@ -92,12 +93,18 @@ function deriveProjectName(convertedPath, toTech) {
     if (fs.existsSync(pkgPath)) {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
       if (pkg && typeof pkg.name === 'string' && pkg.name.trim()) {
-        return pkg.name.trim();
+        const name = pkg.name.trim();
+        if (/^migrated-react-project$/i.test(name)) return 'Migrated React Project';
+        if (/^migrated-angular-project$/i.test(name)) return 'Migrated Angular Project';
+        return name;
       }
     }
   } catch {
     /* ignore */
   }
+  const tech = String(toTech || '').toLowerCase();
+  if (tech.includes('react')) return 'Migrated React Project';
+  if (tech.includes('angular')) return 'Migrated Angular Project';
   return `${toTech || 'Migrated'} Project`;
 }
 

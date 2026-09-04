@@ -1062,8 +1062,10 @@ function extractDesignColors(userPrompt) {
 }
 
 /**
- * Extract a project name from the user prompt; falls back to the source
- * package.json name, then a safe default.
+ * Extract a project name from the user prompt; otherwise use the fixed
+ * migrated-angular branding (same idea as React's migrated-react-project).
+ * Do NOT reuse the uploaded source package name — that keeps the original app
+ * identity on the converted Angular workspace.
  */
 function extractProjectName(userPrompt, sourcePackageJson) {
   const text = String(userPrompt || '');
@@ -1080,13 +1082,6 @@ function extractProjectName(userPrompt, sourcePackageJson) {
     }
   }
   if (name) return toSafeProjectName(name);
-  const srcName =
-    sourcePackageJson && typeof sourcePackageJson.name === 'string'
-      ? sourcePackageJson.name.trim()
-      : '';
-  if (srcName && !/^(angular|react|my-app|demo|test|app|project|frontend|web)$/i.test(srcName)) {
-    return toSafeProjectName(srcName);
-  }
   return 'migrated-angular-project';
 }
 

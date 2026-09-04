@@ -6003,9 +6003,37 @@ function pruneUnusedNamedImports(content) {
 }
 
 function removeAngularLeftoverReactFiles(destPath) {
-  const candidates = walkFiles(path.join(destPath, 'src'), (n) =>
-    /^app\.config\.(ts|tsx)$/.test(n) || /^main\.ts$/.test(n)
+  const srcRoot = path.join(destPath, 'src');
+  const candidates = walkFiles(srcRoot, (n) =>
+    /^app\.config\.(ts|tsx)$/.test(n) ||
+    /^app\.routes\.(ts|tsx)$/.test(n) ||
+    /^app\.component\.(ts|tsx)$/.test(n) ||
+    /^main\.ts$/.test(n)
   );
+
+  // React routing lives in App.tsx. Any app.routes.* is Angular naming leftover
+  // (even when rewritten with react-router-dom + bogus *Component imports).
+  const appTsx = path.join(srcRoot, 'App.tsx');
+  const appOwnsRouter =
+    fs.existsSync(appTsx) &&
+    /react-router-dom|<BrowserRouter\b|<Routes\b/.test(fs.readFileSync(appTsx, 'utf-8'));
+
+  let workspaceText = '';
+  const readWorkspaceOnce = () => {
+    if (workspaceText) return workspaceText;
+    const parts = [];
+    for (const f of walkFiles(srcRoot, (n) => n.endsWith('.ts') || n.endsWith('.tsx'))) {
+      if (/^app\.routes\./i.test(path.basename(f))) continue;
+      try {
+        parts.push(fs.readFileSync(f, 'utf-8'));
+      } catch {
+        /* ignore */
+      }
+    }
+    workspaceText = parts.join('\n');
+    return workspaceText;
+  };
+
   let removed = 0;
   for (const file of candidates) {
     let content = '';
@@ -6014,9 +6042,31 @@ function removeAngularLeftoverReactFiles(destPath) {
     } catch {
       continue;
     }
+    const base = path.basename(file).toLowerCase();
+    const isRoutesFile = /^app\.routes\./.test(base);
+    const routesUnused =
+      isRoutesFile &&
+      (appOwnsRouter ||
+        !/\bAppRoutes\b|\bfrom\s+['"][^'"]*app\.routes['"]/.test(readWorkspaceOnce()));
+    const isAngularRoutes =
+      isRoutesFile &&
+      (/:\s*Routes\b/.test(content) ||
+        /\bcomponent:\s*\w+Component\b/.test(content) ||
+        /\bredirectTo\s*:/.test(content) ||
+        /@angular\/router/.test(content) ||
+        /\w+Component['"]/.test(content) ||
+        /from\s+['"][^'"]*TaskListComponent['"]/.test(content) ||
+        (!/react-router/.test(content) && /export\s+const\s+routes\s*:/.test(content)));
     const isAngular =
-      /ApplicationConfig|provideZoneChangeDetection|provideRouter|@angular\/|bootstrapApplication/.test(content);
-    if (!isAngular) continue;
+      routesUnused ||
+      isAngularRoutes ||
+      /ApplicationConfig|provideZoneChangeDetection|provideRouter|@angular\/|bootstrapApplication|@Component\s*\(/.test(
+        content
+      );
+    // React uses main.tsx; a bare main.ts with Angular bootstrap is always leftover.
+    if (!isAngular && !(/^main\.ts$/.test(base) && /bootstrapApplication|@angular\//.test(content))) {
+      continue;
+    }
     try {
       fs.unlinkSync(file);
       removed += 1;
@@ -6058,6 +6108,15 @@ function stripAngularTestDepsFromReactPackage(destPath) {
 export function fixReactTypeErrors(destPath, buildErrors) {
   const errorText = String(buildErrors || '');
   let changedFiles = 0;
+  if (
+    /app\.routes\.(ts|tsx)/.test(errorText) ||
+    (/Cannot find name 'Routes'/.test(errorText) && /routes/.test(errorText)) ||
+    (/Cannot find name '\w+Component'/.test(errorText) && /app\.routes/.test(errorText)) ||
+    (/Cannot find module/.test(errorText) && /TaskListComponent|app\.routes/.test(errorText)) ||
+    (/TS2307/.test(errorText) && /app\.routes|TaskListComponent/.test(errorText))
+  ) {
+    changedFiles += removeAngularLeftoverReactFiles(destPath);
+  }
   if (/Types of property/.test(errorText) && /\/models\//.test(errorText) && /\/store\//.test(errorText)) {
     changedFiles += dedupeStoreModelTypes(destPath);
   }

@@ -478,6 +478,111 @@ export function AdminShell({ children }) { return <div><Bell className="w-5 h-5"
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
+// --- React: Angular app.routes.ts leftover must be deleted (TS2304 Routes) ---
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-react-routes-leftover-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'pages', 'task-list'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'package.json'),
+    JSON.stringify(
+      {
+        name: 'migrated-react-project',
+        dependencies: { react: '^19.0.0', 'react-dom': '^19.0.0', 'react-router-dom': '^7.0.0' }
+      },
+      null,
+      2
+    )
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'tsconfig.json'),
+    JSON.stringify({ compilerOptions: { jsx: 'react-jsx' }, include: ['src'] }, null, 2)
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'),
+    `export default function TaskList() {\n  return <div>tasks</div>;\n}\n`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'App.tsx'),
+    `import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import TaskList from './pages/task-list/TaskList';
+export default function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<TaskList />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app.routes.ts'),
+    `import { } from './pages/task-list/TaskList';
+
+export const routes: Routes = [
+  { path: '', component: TaskListComponent },
+  { path: '**', redirectTo: '' }
+];
+`
+  );
+
+  repairReactWorkspace(tmp, {});
+  assert(
+    !fs.existsSync(path.join(tmp, 'src', 'app.routes.ts')),
+    'repairReactWorkspace removes Angular app.routes.ts leftover'
+  );
+  assert(fs.existsSync(path.join(tmp, 'src', 'App.tsx')), 'React App.tsx is kept');
+
+  // Simulate AI re-writing the leftover after repair; build-fix loop must delete it
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app.routes.ts'),
+    `export const routes: Routes = [{ path: '', component: TaskListComponent }];\n`
+  );
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/app.routes.ts(3,22): error TS2304: Cannot find name 'Routes'.
+src/app.routes.ts(4,26): error TS2304: Cannot find name 'TaskListComponent'.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors removes Angular app.routes leftover');
+  assert(!fs.existsSync(path.join(tmp, 'src', 'app.routes.ts')), 'build-fix deletes app.routes.ts');
+
+  // React-shaped app.routes.tsx with bogus *Component import (App.tsx already routes)
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app.routes.tsx'),
+    `import React from 'react';
+import { Routes, Route, Navigate } from 'react-router-dom';
+import { TaskListComponent } from './components/TaskListComponent';
+
+export const AppRoutes: React.FC = () => (
+  <Routes>
+    <Route path="/" element={<TaskListComponent />} />
+    <Route path="*" element={<Navigate to="/" replace />} />
+  </Routes>
+);
+`
+  );
+  repairReactWorkspace(tmp, {});
+  assert(
+    !fs.existsSync(path.join(tmp, 'src', 'app.routes.tsx')),
+    'unused React-shaped app.routes.tsx is removed when App.tsx owns routing'
+  );
+
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'app.routes.tsx'),
+    `import { TaskListComponent } from './components/TaskListComponent';
+export const AppRoutes = () => <TaskListComponent />;\n`
+  );
+  const n2 = fixReactTypeErrors(
+    tmp,
+    `src/app.routes.tsx(3,35): error TS2307: Cannot find module './components/TaskListComponent' or its corresponding type declarations.`
+  );
+  assert(n2 >= 1, 'fixReactTypeErrors removes app.routes.tsx on TS2307 TaskListComponent');
+  assert(!fs.existsSync(path.join(tmp, 'src', 'app.routes.tsx')), 'TS2307 build-fix deletes app.routes.tsx');
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
 // --- React: JSX written to .ts must be renamed to .tsx ---
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-jsx-ts-'));

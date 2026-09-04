@@ -63,7 +63,7 @@ prompt — obey THAT block for package.json and APIs. Do not invent a different 
   or a few \`@apply\` / nesting rules only when truly needed).
 - Global entry: Angular \`src/styles.scss\`; React \`src/index.scss\` (with \`@tailwind\` layers).
 
-### Angular structure
+### Angular structure (MANDATORY)
 \`\`\`
 src/
   main.ts
@@ -74,12 +74,26 @@ src/
     app.component.ts|html|scss
     app.config.ts
     app.routes.ts
-    pages/          # every converted feature/page
-    components/     # shared UI from the source
-    services/       # services / hooks converted from the source
-    lib/            # utils
+    pages/                    # feature areas (auth/, admin/, …)
+      <area>/                 # e.g. auth/, admin/
+        <feature>/            # e.g. test-task/
+          pages/              # ONLY screens listed in app.routes.ts
+            task-list/
+          components/         # feature-local UI (add/edit sidebars, etc.)
+            task-add-edit/
+    components/               # shared UI used by multiple features (modals, etc.)
+    services/
+    models/
+    lib/
 \`\`\`
-- One feature per folder. Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
+- Route screens live under \`pages/<area>/<feature>/pages/<screen>/\`.
+- Feature-local sidebars / add-edit forms live under
+  \`pages/<area>/<feature>/components/\` — not under shared \`app/components/\`.
+- Shared modals and cross-feature widgets live under \`app/components/\`.
+- Keep source feature/area names when present; do not invent auth/admin trees
+  the source does not have. A single-feature app may use one feature folder
+  (e.g. \`pages/app/tasks/pages/task-list/\`).
+- Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
 - \`styleUrl: './name.component.scss'\` (never \`.css\`).
 - \`standalone: true\` everywhere. \`providedIn: 'root'\` for app-wide services.
 - Clear names, small focused components, no dead code, no unused imports.
@@ -88,25 +102,42 @@ src/
 - Convert EVERY source feature. Do not keep a starter-kit tree. Do not drop
   pages to "auth + dashboard only" unless the user explicitly asks.
 
-### React best structure
+### Angular forms (MANDATORY)
+- Always use **Reactive Forms** (\`FormBuilder\` / \`FormGroup\` / \`ReactiveFormsModule\`).
+  Never use template-driven \`[(ngModel)]\` for add/edit forms.
+- Add/update sidebar forms MUST reset when closed (cancel, sidenav close, or
+  after successful save): \`form.reset()\`, clear touched/dirty state, and clear
+  the editing entity input so the next open starts empty / correctly hydrated.
+
+### React best structure (MANDATORY)
 \`\`\`
 src/
   main.tsx
   App.tsx
-  App.scss
   index.scss
-  components/     # shared presentational UI
-  features/       # feature modules (auth/, dashboard/, …)
-  pages/          # route-level screens (optional if features own routes)
-  hooks/          # shared custom hooks
-  lib/            # utils (cn, formatters)
-  services/       # API clients
+  pages/                      # feature areas (auth/, admin/, …)
+    <area>/
+      <feature>/
+        pages/                # route-level screens
+          task-list/
+        components/           # feature-local UI (add/edit sidebars)
+          task-add-edit/
+  components/                 # shared UI used by multiple features (modals, etc.)
+  features/
+  hooks/
+  lib/
+  services/
+  models/
+  store/
 \`\`\`
 - Entry is \`src/main.tsx\` → \`src/App.tsx\` (never Angular-style \`src/app/\`).
 - Import \`./index.scss\` from main; component styles as \`.scss\` only.
-- Feature-first folders; co-locate feature components with the feature.
-- Typed props, pure presentational components where possible, hooks for state/
-  side effects. No unused vars/imports. Prefer composition over giant files.
+- Route screens under \`pages/<area>/<feature>/pages/\`; feature-local sidebars
+  under \`pages/<area>/<feature>/components/\`; shared modals under \`components/\`.
+- Keep source feature/area names when present; do not invent areas the source
+  does not have.
+- Follow React best practices: functional components + hooks, typed props,
+  composition, no unused vars/imports.
 `;
 
 /**
@@ -177,9 +208,13 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Use .tsx for any file that returns JSX (pages, components, layouts). Never put JSX in a .ts file — that causes TS1161 Unterminated regular expression literal.
 - Utils, hooks, services, stores, and types stay .ts.
 - Functional components + hooks only (React 19).
-- Prefer folders: components/, features/, hooks/, lib/, services/, pages/.
+- Prefer the feature-module tree: \`pages/<area>/<feature>/pages|components/\`,
+  plus shared \`components/\`, \`features/\`, \`hooks/\`, \`lib/\`, \`services/\`, \`store/\`.
 - Keep source folder names when they already exist (e.g. Angular
-  \`src/app/components/task-form-sidebar/\` → \`src/components/task-form-sidebar/TaskFormSidebar.tsx\`).
+  \`src/app/pages/admin/tasks/components/item-editor/\` →
+  \`src/pages/admin/tasks/components/item-editor/ItemEditor.tsx\`).
+  Shared Angular \`src/app/components/confirm-dialog/\` →
+  \`src/components/confirm-dialog/ConfirmDialog.tsx\`).
 - Routing: react-router-dom (BrowserRouter or createBrowserRouter).
 - Do NOT generate angular.json, tsconfig.app.json, or Angular workspace files.
 - High code quality: typed props, no unused imports, small focused modules.
@@ -196,15 +231,16 @@ export const ANGULAR_TO_REACT_PROMPT = `
 - Only real npm deps in package.json; skip @angular/* packages in the React app.
 
 ### Domain types & store (MANDATORY — copy source, do not invent)
-- Copy \`models/*.ts\` field-for-field. If Task has \`status: 'todo' | 'in-progress' | 'done'\`,
-  use those literals exactly. Never add fields the source model does not have
-  (no \`priority\`, \`completed\`, \`dueDate\`). Never write \`in_progress\`.
-- NGXS \`TaskState.items\` stays \`items\` on the zustand store. Pages may alias
-  \`const { items: tasks } = useTaskStore()\`. Do not invent \`state.tasks\`.
-- Import \`Task\` / \`TaskDraft\` / \`TaskStatus\` from \`models/task.model\` (the copied source
-  file). Never invent \`types/task\`, \`interfaces/task\`, or \`services/task.service\`.
-- \`useTaskStore\` must be a real \`create()\` export (or a barrel that re-exports that file).
-  Do not emit \`export { useTaskStore } from './taskStore'\` unless \`taskStore.ts\` exists.
+- Copy \`models/*.ts\` field-for-field. Keep source union literals exactly
+  (never rewrite hyphenated values as underscores). Never add fields the source
+  model does not have (no invented \`priority\`, \`completed\`, \`dueDate\`).
+- NGXS \`@State\` defaults keep the same field names on the zustand store
+  (e.g. \`items\` stays \`items\`). Pages may alias
+  \`const { items: rows } = useXStore()\`. Do not invent a second collection field.
+- Import domain types from the copied \`models/*.ts\` (or \`*.model.ts\`) file.
+  Never invent \`types/<name>\`, \`interfaces/<name>\`, or \`services/<name>.service\`.
+- \`useXStore\` must be a real \`create()\` export (or a barrel that re-exports that file).
+  Do not emit \`export { useXStore } from './xStore'\` unless that file exists.
 
 ### Library mapping (MANDATORY)
 - @ngxs/store → zustand. \`create((set, get) => ({ ... }))\`. No @State/@Action/dispatch(new X()).
@@ -274,7 +310,9 @@ Do NOT use default project names — use the EXTRACTED name.
 
 ### Angular quality
 - Target the mandated Angular version APIs only (signals, inject(), standalone, @if/@for).
-- Follow page-folder structure under src/app/pages plus components/services as needed.
+- Follow feature-module folders under \`src/app/pages/<area>/<feature>/pages|components/\`;
+  put shared modals in \`src/app/components/\`. Use Reactive Forms for all forms;
+  reset add/edit sidebar forms on close.
 - Strong typing; matching .ts/.html/.scss; Tailwind in templates; no hallucinated modules.
 - Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
 - Always \`export const routes\` from app.routes.ts (never unexported \`const routes\`).
@@ -310,6 +348,9 @@ Do NOT use default project names — use the EXTRACTED name.
   Never bind \`(onSave)\` unless the child actually declares \`@Output() onSave\`.
   In child templates, call the wrapper method (\`(click)="onRemove(task)"\`) —
   do not write \`onRemove.emit(task)\` when \`onRemove\` is a method.
+- NEVER ship empty handlers that only compile. Copy SOURCE logic for save, update,
+  delete, submit, validation, and dialogs into the class methods. \`onSave(): void {}\`
+  while the React source actually adds/updates items is a failed conversion.
 - Import HostListener / Input / Output / Component from '@angular/core' when used.
 - CommonModule from '@angular/common' only (never from '@angular/core').
 - Form errors: \`errors?.['required']\` bracket access.
@@ -364,7 +405,7 @@ is built before the next one is planned.
 - React component = ONE unit: PascalCase \`Name.tsx\` then optional companion \`Name.scss\`
 - If targeting React: NEVER plan Angular triads. Forbidden paths: \`*.component.ts\`,
   \`*.component.html\`, \`*.component.scss\`, and unit ids ending in \`.component\`
-  (e.g. \`src/components/task-form-sidebar/task-form-sidebar.component\`).
+  (e.g. \`src/components/item-editor/item-editor.component\`).
   Plan \`src/components/<kebab>/<Pascal>.tsx\` instead. JSX lives in the .tsx file — no .html.
 - Services, pipes, utils, routes, configs-in-src = ONE file = ONE unit
 - Never scatter a component triad across distant steps
@@ -387,30 +428,30 @@ Each element is ONE file in the ordered plan (triad siblings listed consecutivel
     },
     {
       "step": 2,
-      "newPath": "src/app/pages/admin-users/admin-users.component.ts",
+      "newPath": "src/app/pages/admin/users/pages/admin-users/admin-users.component.ts",
       "explanationOfSource": "Admin users page TypeScript",
-      "approximateSourceFilesToRead": ["src/routes/admin-users.tsx"],
+      "approximateSourceFilesToRead": ["src/pages/admin/users/pages/admin-users/AdminUsers.tsx"],
       "dependencies": ["src/lib/format.ts"],
       "complexity": "high",
-      "unit": "src/app/pages/admin-users/admin-users.component"
+      "unit": "src/app/pages/admin/users/pages/admin-users/admin-users.component"
     },
     {
       "step": 3,
-      "newPath": "src/app/pages/admin-users/admin-users.component.html",
+      "newPath": "src/app/pages/admin/users/pages/admin-users/admin-users.component.html",
       "explanationOfSource": "Admin users page template",
-      "approximateSourceFilesToRead": ["src/routes/admin-users.tsx"],
+      "approximateSourceFilesToRead": ["src/pages/admin/users/pages/admin-users/AdminUsers.tsx"],
       "dependencies": ["src/lib/format.ts"],
       "complexity": "high",
-      "unit": "src/app/pages/admin-users/admin-users.component"
+      "unit": "src/app/pages/admin/users/pages/admin-users/admin-users.component"
     },
     {
       "step": 4,
-      "newPath": "src/app/pages/admin-users/admin-users.component.scss",
+      "newPath": "src/app/pages/admin/users/pages/admin-users/admin-users.component.scss",
       "explanationOfSource": "Admin users page styles (minimal SCSS)",
       "approximateSourceFilesToRead": [],
       "dependencies": ["src/lib/format.ts"],
       "complexity": "low",
-      "unit": "src/app/pages/admin-users/admin-users.component"
+      "unit": "src/app/pages/admin/users/pages/admin-users/admin-users.component"
     }
   ]
 }
@@ -423,15 +464,15 @@ When targeting React, use this shape instead (never .component / .html):
   "incrementalPlan": [
     {
       "step": 1,
-      "newPath": "src/components/task-form-sidebar/TaskFormSidebar.tsx",
-      "explanationOfSource": "Sidebar form as a React function component",
+      "newPath": "src/pages/admin/tasks/components/item-editor/ItemEditor.tsx",
+      "explanationOfSource": "Feature-local sidebar form as a React function component",
       "approximateSourceFilesToRead": [
-        "src/app/components/task-form-sidebar/task-form-sidebar.component.ts",
-        "src/app/components/task-form-sidebar/task-form-sidebar.component.html"
+        "src/app/pages/admin/tasks/components/item-editor/item-editor.component.ts",
+        "src/app/pages/admin/tasks/components/item-editor/item-editor.component.html"
       ],
-      "dependencies": ["src/models/task.model.ts"],
+      "dependencies": ["src/models/item.model.ts"],
       "complexity": "medium",
-      "unit": "src/components/task-form-sidebar/TaskFormSidebar.tsx"
+      "unit": "src/pages/admin/tasks/components/item-editor/ItemEditor.tsx"
     }
   ]
 }

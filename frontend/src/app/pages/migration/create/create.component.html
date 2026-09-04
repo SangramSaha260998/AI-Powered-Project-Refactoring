@@ -30,7 +30,8 @@
         <div class="project-summary-item">
           <span class="project-summary-label">Progress</span>
           <span class="project-summary-value">
-            {{ (activeProject()?.completedUnitIndex ?? -1) + 1 }} / {{ activeProject()?.unitTotal }} units saved
+            {{ (activeProject()?.completedUnitIndex ?? -1) + 1 }} /
+            {{ activeProject()?.unitTotal }} units saved
           </span>
         </div>
       }
@@ -38,8 +39,8 @@
     @if (activeProject()?.resumable) {
       <p class="prompt-hint pause-hint">
         Conversion paused because every free-tier provider hit a rate limit. Progress is saved.
-        Click Continue conversion — you do not need to upload the ZIP again.
-        Mid-run 429s on a single unit are retried and then skipped automatically.
+        Click Continue conversion — you do not need to upload the ZIP again. Mid-run 429s on a
+        single unit are retried and then skipped automatically.
       </p>
     }
   </section>
@@ -51,10 +52,10 @@
       [value]="reworkPrompt()"
       (input)="onReworkPromptChange($event)"
       rows="6"
-      placeholder="Describe the changes you need or paste the errors you are facing..."
+      placeholder="Describe the changes you need or paste the errors you are facing. For several issues, number them (1. 2. 3.)"
     ></textarea>
     <p class="prompt-hint">
-      The AI will apply your changes to the existing project and give you a new ZIP.
+      The AI applies every listed change to the existing project (in order) and gives you a new ZIP.
     </p>
   </section>
 

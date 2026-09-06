@@ -199,8 +199,29 @@
     </div>
   </section>
 
+  <section class="config-card">
+    <h3>3. Migration Scope</h3>
+    <div class="dropdown-group">
+      <div class="control-field">
+        <label for="migrationScope">What to convert first:</label>
+        <select
+          id="migrationScope"
+          [value]="migrationScope()"
+          (change)="onMigrationScopeChange($event)"
+        >
+          <option value="landing-first">Landing page first (recommended for large apps)</option>
+          <option value="full">Full application (all pages &amp; features)</option>
+        </select>
+      </div>
+    </div>
+    <p class="prompt-hint">
+      <strong>Landing page first</strong> converts only the home/landing screen and components it uses —
+      with full functionality — so big React apps finish faster. Add other routes in a later pass.
+    </p>
+  </section>
+
   <section class="prompt-card">
-    <h3>3. Describe Your Migration Prompt</h3>
+    <h3>4. Describe Your Migration Prompt</h3>
     <textarea
       class="prompt-textarea"
       [value]="prompt()"
@@ -212,7 +233,7 @@
   </section>
 
   <section class="upload-card">
-    <h3>4. Upload Source Code Bundle</h3>
+    <h3>5. Upload Source Code Bundle</h3>
     <div
       class="dropzone"
       [class.dragover]="isDragging()"

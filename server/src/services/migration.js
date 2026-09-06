@@ -42,6 +42,12 @@ import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
+  applyMigrationScope,
+  getLandingFirstScopePrompt,
+  isLandingFirstScope,
+  normalizeMigrationScope,
+} from './migrationScope.js';
+import {
   angularDestForReactSource,
   isReactBootstrapPath,
   isMisplacedAngularAppComponentPath,
@@ -3585,6 +3591,7 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
     enableVisualQa = false,
     visualQaRoutes = ['/'],
     resume = false,
+    migrationScope: optionsMigrationScope = 'full',
   } = options;
   const isSameFramework = (fromTech || '').toLowerCase() === (toTech || '').toLowerCase();
   const report = (phase, message, extra = {}) => {
@@ -3598,6 +3605,9 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
 
   const checkpoint = readCheckpoint(sessionId);
   const isResume = Boolean(resume && checkpoint?.units?.length);
+  const migrationScope = normalizeMigrationScope(
+    optionsMigrationScope || (isResume ? checkpoint?.migrationScope : null) || 'full',
+  );
 
   // --- Resolve target versions ---
   // If an explicit targetVersion was provided via UI, inject it into the prompt
@@ -3676,14 +3686,48 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
     throw new Error('No readable source files found inside the uploaded ZIP.');
   }
 
-  // Convert EVERY readable source file — do not strip features.
-  const essentialFilesMap = filesMap;
+  // Convert source files — scope may limit to landing page + dependencies only.
+  const fullSourceFilesMap = filesMap;
+  let essentialFilesMap = filesMap;
+  let fileTree = '';
+  let filesContextSummary = '';
+  const rebuildMigrationContext = () => {
+    fileTree = Object.keys(essentialFilesMap).map((f) => `- ${f}`).join('\n');
+    filesContextSummary = buildFilesContext(essentialFilesMap);
+  };
+  rebuildMigrationContext();
 
-  const fileTree = Object.keys(essentialFilesMap).map((f) => `- ${f}`).join('\n');
-  const filesContextSummary = buildFilesContext(essentialFilesMap);
+  let sourceAnalysis = null;
+  const landingScopePrompt = isLandingFirstScope(migrationScope) ? getLandingFirstScopePrompt() : '';
+
+  const applyScopeToSourceContext = () => {
+    if (!isLandingFirstScope(migrationScope)) {
+      essentialFilesMap = fullSourceFilesMap;
+      rebuildMigrationContext();
+      return;
+    }
+    try {
+      if (!sourceAnalysis) {
+        sourceAnalysis = analyzeSourceProject(extractPath);
+      }
+    } catch (err) {
+      console.warn(`[${sessionId}] Landing scope: source analysis failed (${err.message})`);
+    }
+    const scoped = applyMigrationScope(fullSourceFilesMap, sourceAnalysis, migrationScope);
+    essentialFilesMap = scoped.filesMap;
+    rebuildMigrationContext();
+    console.log(
+      `[${sessionId}] Landing-first scope: ${Object.keys(essentialFilesMap).length}/` +
+      `${Object.keys(fullSourceFilesMap).length} source files in context. ` +
+      `Seeds: ${scoped.landingSeeds.join(', ') || '(auto)'}`,
+    );
+  };
+
+  applyScopeToSourceContext();
 
   console.log(
-    `[${sessionId}] Read ${Object.keys(filesMap).length} source file(s); converting all of them (no template strip-down).`
+    `[${sessionId}] Read ${Object.keys(filesMap).length} source file(s); ` +
+    `migration scope: ${migrationScope}.`
   );
 
   // Read the source package.json once (project name + dependency carry-over)
@@ -3757,12 +3801,14 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   // -----------------------------------------------------------------------
   // 2c. ANALYZER STAGE (ChatGPT workflow): analyze source + reference projects
   // -----------------------------------------------------------------------
-  let sourceAnalysis = null;
   let referenceAnalysis = null;
   let migrationPlanPreview = null;
   try {
     report('analyze', 'Analyzing source project structure...');
-    sourceAnalysis = analyzeSourceProject(extractPath);
+    if (!sourceAnalysis) {
+      sourceAnalysis = analyzeSourceProject(extractPath);
+      applyScopeToSourceContext();
+    }
     console.log(
       `[${sessionId}] Analyzer: source project = ${sourceAnalysis.framework}, ` +
       `${sourceAnalysis.fileCount} files, ${sourceAnalysis.components.length} components, ` +
@@ -3805,15 +3851,16 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   const angularPatternGuides = targetLower.includes('angular') ? getAngularPatternGuides() : '';
 
   const sameFrameworkInstruction = `
-You are a code architect converting EVERY uploaded source file (same framework).
-
+You are a code architect converting uploaded source file(s) (same framework).
+${isLandingFirstScope(migrationScope) ? landingScopePrompt : `
 RULES:
 - Convert the FULL app. Do NOT strip features. Do NOT drop CRUD, settings, admin, or extra pages.
-- Plan a target file for every meaningful source file (components, pages, routes, services, hooks, utils, styles).
+- Plan a target file for every meaningful source file (components, pages, routes, services, hooks, utils, styles).`}
+
 - Plan ONLY src/ files. Do NOT plan config files (package.json, angular.json, tsconfig*.json, index.html, vite.config).
 - For Angular components, use templateUrl + styleUrl (NOT inline templates); plan full .ts + .html + .scss triads.
 - There is NO starter-kit template. You must plan app.component, app.routes, and every feature from the source tree.
-- The app must compile and run with the same user-visible functionality as the source.
+- The app must compile and run with the same user-visible functionality as the source${isLandingFirstScope(migrationScope) ? ' for the IN-SCOPE landing experience' : ''}.
 - Output ONLY raw JSON (no markdown, no backticks, no explanation).
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
@@ -3821,15 +3868,19 @@ ${angularPatternGuides}
 `;
 
   const crossFrameworkInstruction = `
-You are a Principal Software Architect. Convert the incoming source codebase COMPLETELY into the target framework.
+You are a Principal Software Architect. Convert the incoming source codebase into the target framework.
+${isLandingFirstScope(migrationScope) ? landingScopePrompt : ''}
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
 ${angularPatternGuides}
 
-COMPLETE CONVERSION (MANDATORY):
+${isLandingFirstScope(migrationScope) ? `PHASED CONVERSION (MANDATORY):
+- Only plan and implement the landing/home page and components it directly uses (see LANDING PAGE FIRST block).
+- Do NOT plan full conversions for dashboard, admin, auth, CRUD, or other routes in this pass.
+- app.routes.ts may omit or stub out-of-scope routes so the app compiles.` : `COMPLETE CONVERSION (MANDATORY):
 - Plan a target file for EVERY source application file (pages, routes, components, services, hooks, utils, styles).
 - Do NOT omit features. Do NOT reduce the app to auth + dashboard. CRUD, settings, admin, and extra pages MUST be converted.
-- There is NO starter-kit template. Do not assume src/app/core, shared, store, or auth pages already exist.
+- There is NO starter-kit template. Do not assume src/app/core, shared, store, or auth pages already exist.`}
 
 - If targeting Angular: convert components into Angular Standalone Components under src/app/. NEVER plan paths like src/admin or src/pages outside src/app/.
 - If targeting React: convert Angular components into React functional components with hooks. Plan PascalCase .tsx files (e.g. src/components/item-editor/ItemEditor.tsx). NEVER plan .component.ts / .component.html / .component.scss or a unit id ending in .component. DO NOT create tsconfig.app.json, angular.json, or any Angular-specific config files.
@@ -3864,6 +3915,7 @@ ${filesContextSummary}
 
 [MIGRATION CORE MANDATE]
 ${enhancedPrompt}
+${landingScopePrompt}
 
 [PRIORITY RULES — DECISION HIERARCHY]
 ${priorityRulesPrompt}
@@ -4174,7 +4226,8 @@ ${enhancedPrompt}`
     designColors,
     units: migrationUnits,
     completedUnitIndex: -1,
-    paused: false
+    paused: false,
+    migrationScope,
   });
   } // end new-plan (not resume)
 
@@ -4467,6 +4520,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
         units: migrationUnits,
         completedUnitIndex: unitIndex,
         paused: false,
+        migrationScope,
         skippedUnit: unit.label
       });
       if (unitIndex < migrationUnits.length - 1) {
@@ -4625,7 +4679,8 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       designColors,
       units: migrationUnits,
       completedUnitIndex: unitIndex,
-      paused: false
+      paused: false,
+      migrationScope,
     });
 
     // Periodic compile check — skip most units to save free-tier time/quota.
@@ -4799,9 +4854,17 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
   // -----------------------------------------------------------------------
   // 5b. Quality gate — never ship stubs, skipped pages, or a failing build
   // -----------------------------------------------------------------------
+  applyScopeToSourceContext();
+  console.log(
+    `[${sessionId}] Quality gate: migrationScope=${migrationScope}, ` +
+    `source context=${Object.keys(essentialFilesMap).length} file(s)`,
+  );
+
   if (targetLower.includes('angular')) {
     const defects = collectConversionDefects(migrationWorkspacePath);
-    const missingPages = collectMissingSourcePages(migrationWorkspacePath, essentialFilesMap);
+    const missingPages = collectMissingSourcePages(migrationWorkspacePath, essentialFilesMap, {
+      migrationScope,
+    });
     const problems = [];
     const realSkips = skippedUnits.filter(
       (s) =>
@@ -4810,22 +4873,22 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
           files: [{ newPath: s.label || s }]
         })
     );
-    if (realSkips.length) {
+    if (realSkips.length && !isLandingFirstScope(migrationScope)) {
       problems.push(`skipped units: ${realSkips.map((s) => s.label || s).join(', ')}`);
     }
     if (defects.placeholders.length) {
       problems.push(`placeholder templates: ${defects.placeholders.join(', ')}`);
     }
-    if (missingPages.length) {
+    if (missingPages.length && !isLandingFirstScope(migrationScope)) {
       problems.push(`source pages never converted: ${missingPages.join(', ')}`);
     }
     if (problems.length) {
       throw new ConversionIncompleteError(
         `Conversion incomplete — refusing to ship a stub or partial project (${problems.join('; ')}). ` +
-        `Retry the conversion, or pick a different free model.`
+        `${isLandingFirstScope(migrationScope) ? '' : 'Retry the conversion, or pick a different free model.'}`
       );
     }
-  } else if (skippedUnits.length) {
+  } else if (skippedUnits.length && !isLandingFirstScope(migrationScope)) {
     throw new ConversionIncompleteError(
       `Conversion incomplete — skipped units: ${skippedUnits.map((s) => s.label || s).join(', ')}. Refusing to ship a partial project.`
     );

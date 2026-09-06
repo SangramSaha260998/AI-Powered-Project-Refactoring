@@ -80,6 +80,7 @@ export class CreateMigrationComponent implements OnDestroy {
   toTech = signal<string>('');
   aiProvider = signal<string>('genai');
   aiModel = signal<string>('');
+  migrationScope = signal<string>('landing-first');
   targetVersion = signal<string>('');
   isDragging = signal<boolean>(false);
   selectedFile = signal<File | null>(null);
@@ -137,6 +138,15 @@ Output must compile and run after npm install.`;
 
   constructor() {
     this.loadProviderModels('genai');
+    if (this.migrationScope() === 'landing-first') {
+      this.prompt.set(
+        `Phase 1 — landing page only.\n\n` +
+          `Convert ONLY the landing/home page and every component it uses (hero, header, footer, nav, CTAs).\n` +
+          `Implement full functionality for those components — handlers, state, links, forms.\n` +
+          `Do NOT convert dashboard, admin, auth, CRUD, or other routes yet.\n` +
+          `Wire app routing so "/" shows the landing page and the project compiles.`,
+      );
+    }
     void this.checkExistingProject();
   }
 
@@ -179,6 +189,20 @@ Output must compile and run after npm install.`;
   onModelChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.aiModel.set(value);
+  }
+
+  onMigrationScopeChange(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.migrationScope.set(value);
+    if (value === 'landing-first' && (!this.prompt() || this.prompt() === this.defaultStripDownPrompt)) {
+      this.prompt.set(
+        `Phase 1 — landing page only.\n\n` +
+          `Convert ONLY the landing/home page and every component it uses (hero, header, footer, nav, CTAs).\n` +
+          `Implement full functionality for those components — handlers, state, links, forms.\n` +
+          `Do NOT convert dashboard, admin, auth, CRUD, or other routes yet.\n` +
+          `Wire app routing so "/" shows the landing page and the project compiles.`,
+      );
+    }
   }
 
   onDragOver(event: DragEvent): void {
@@ -340,6 +364,7 @@ Output must compile and run after npm install.`;
     if (this.targetVersion()) {
       formData.append('targetVersion', this.targetVersion());
     }
+    formData.append('migrationScope', this.migrationScope());
 
     this.lastMode = 'create';
 

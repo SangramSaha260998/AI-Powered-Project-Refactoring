@@ -140,7 +140,10 @@ export function collectConversionDefects(destPath) {
 /**
  * Source TSX/JSX UI files that should have a matching Angular component after conversion.
  */
-export function collectMissingSourcePages(destPath, sourceFilesMap) {
+export function collectMissingSourcePages(destPath, sourceFilesMap, options = {}) {
+  if (options.migrationScope === 'landing-first' || options.landingFirst === true) {
+    return [];
+  }
   if (!sourceFilesMap) return [];
   const destStems = new Set();
   for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'))) {
@@ -2806,6 +2809,149 @@ function repairAngularRoutes(destPath) {
   fs.writeFileSync(routesPath, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
 }
 
+/**
+ * React Router leftovers are sometimes written as src/app/router.ts with
+ * @Component + templateUrl './router.html'. Routing belongs in app.routes.ts only.
+ */
+export function repairMisplacedAngularRouterFiles(destPath) {
+  const appDir = path.join(destPath, 'src', 'app');
+  if (!fs.existsSync(appDir)) return 0;
+
+  const routesPath = path.join(appDir, 'app.routes.ts');
+  let changed = 0;
+
+  const misplaced = walkFiles(appDir, (name, full) => {
+    const rel = path.relative(appDir, full).replace(/\\/g, '/');
+    if (rel === 'app.routes.ts') return false;
+    return /^router\.ts$/i.test(rel) || /^routes\.ts$/i.test(rel);
+  });
+
+  for (const file of misplaced) {
+    let source = '';
+    try {
+      source = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const routesLiteral = extractRoutesArrayLiteral(source);
+    const importLines = extractRouteImportLines(source);
+
+    if (routesLiteral) {
+      const routesBody = `${importLines.join('\n')}\n\nexport const routes: Routes = ${routesLiteral};\n`;
+      const existing = fs.existsSync(routesPath) ? fs.readFileSync(routesPath, 'utf-8') : '';
+      const shouldReplace =
+        !existing ||
+        /Routes\s*=\s*\[\s*\]/.test(existing) ||
+        !/path\s*:/.test(existing) ||
+        /router\.ts/i.test(existing);
+
+      if (shouldReplace) {
+        const withRoutesImport = routesBody.includes("from '@angular/router'")
+          ? routesBody
+          : `import { Routes } from '@angular/router';\n${routesBody}`;
+        fs.writeFileSync(
+          routesPath,
+          withRoutesImport.endsWith('\n') ? withRoutesImport : `${withRoutesImport}\n`,
+          'utf-8',
+        );
+        console.log(`[postprocess] Merged misplaced routes from ${path.relative(destPath, file)} → app.routes.ts`);
+        changed += 1;
+      }
+    }
+
+    const base = file.replace(/\.ts$/, '');
+    for (const sibling of [`${base}.html`, `${base}.scss`, `${base}.css`]) {
+      if (fs.existsSync(sibling)) {
+        try {
+          fs.unlinkSync(sibling);
+          changed += 1;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    try {
+      fs.unlinkSync(file);
+      changed += 1;
+      console.log(`[postprocess] Removed misplaced router component file: ${path.relative(destPath, file)}`);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (changed > 0) {
+    scrubImportsOfDeletedRouterModule(destPath);
+  }
+
+  return changed;
+}
+
+function extractRoutesArrayLiteral(source) {
+  const text = String(source || '');
+  const markers = [
+    /export\s+const\s+routes\s*:\s*Routes\s*=\s*\[/i,
+    /(?:^|\n)\s*const\s+routes\s*:\s*Routes\s*=\s*\[/i,
+    /routes\s*:\s*Routes\s*=\s*\[/i,
+  ];
+  for (const re of markers) {
+    const m = text.match(re);
+    if (!m) continue;
+    const start = text.indexOf('[', m.index);
+    const block = extractBalancedBracketBlock(text, start);
+    if (block) return block;
+  }
+  return null;
+}
+
+function extractBalancedBracketBlock(text, openIndex) {
+  if (openIndex < 0 || text[openIndex] !== '[') return null;
+  let depth = 0;
+  for (let i = openIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '[') depth += 1;
+    else if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) return text.slice(openIndex, i + 1);
+    }
+  }
+  return null;
+}
+
+function extractRouteImportLines(source) {
+  const lines = [];
+  for (const m of String(source || '').matchAll(/^\s*import\s+.+$/gm)) {
+    const line = m[0].trim();
+    if (!line) continue;
+    if (/from\s*['"]@angular\/core['"]/.test(line)) continue;
+    if (/from\s*['"]@angular\/router['"]/.test(line) && !/\bRoutes\b/.test(line)) continue;
+    if (/RouterComponent|router\.component/i.test(line)) continue;
+    lines.push(line);
+  }
+  if (!lines.some((l) => /\bRoutes\b/.test(l) && /@angular\/router/.test(l))) {
+    lines.unshift(`import { Routes } from '@angular/router';`);
+  }
+  return [...new Set(lines)];
+}
+
+function scrubImportsOfDeletedRouterModule(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  const badImportRe =
+    /import\s*\{[^}]*\}\s*from\s*['"]\.\/(?:router|routes)['"]\s*;?\s*\n?/g;
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts'))) {
+    try {
+      let content = fs.readFileSync(file, 'utf-8');
+      const updated = content.replace(badImportRe, '');
+      if (updated !== content) {
+        fs.writeFileSync(file, updated.endsWith('\n') ? updated : `${updated}\n`, 'utf-8');
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function addAngularPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfigAppPath = path.join(destPath, 'tsconfig.app.json');
@@ -3830,6 +3976,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   }
 
   repairAngularAppBootstrap(destPath, sourceFilesMap);
+  repairMisplacedAngularRouterFiles(destPath);
   repairAngularRoutes(destPath);
   removeHallucinatedNgModules(destPath);
   fixBrokenRelativeComponentImports(destPath);
@@ -3990,6 +4137,9 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /TS2300/.test(text) ||
     /Duplicate function implementation/.test(text) ||
     /Duplicate identifier/.test(text);
+  const templateIssues =
+    /NG2008/.test(text) ||
+    /Could not find template file/.test(text);
   const needs =
     /NG1010/.test(text) ||
     /NG5002/.test(text) ||
@@ -4001,7 +4151,15 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /is not a known attribute/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
     /has no exported member/.test(text);
-  if (!needs && !eventIssues && !typeIssues && !arityIssues && !moduleIssues && !duplicateIssues) {
+  if (
+    !needs &&
+    !eventIssues &&
+    !typeIssues &&
+    !arityIssues &&
+    !moduleIssues &&
+    !duplicateIssues &&
+    !templateIssues
+  ) {
     return 0;
   }
 
@@ -4018,6 +4176,17 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     return map;
   };
   const beforeMap = snapshot();
+
+  if (templateIssues) {
+    try {
+      const routerRepairs = repairMisplacedAngularRouterFiles(destPath);
+      if (routerRepairs > 0) {
+        console.log(`[postprocess] Build-fix: repaired ${routerRepairs} misplaced router file(s)`);
+      }
+    } catch (err) {
+      console.warn(`[postprocess] Router file repair failed: ${err.message}`);
+    }
+  }
 
   if (moduleIssues) {
     try {

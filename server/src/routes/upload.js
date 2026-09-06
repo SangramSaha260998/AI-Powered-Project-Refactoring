@@ -760,6 +760,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
   const priorityRulesMode = (req.body.priorityRulesMode || 'react-ui').trim();
   const enableVisualQa = String(req.body.enableVisualQa || '').toLowerCase() === 'true';
   const visualQaRoutes = (req.body.visualQaRoutes || '/').split(',').map((r) => r.trim()).filter(Boolean);
+  const migrationScope = (req.body.migrationScope || 'landing-first').trim();
 
   if (!zipFile || !userPrompt) {
     return res.status(400).json({ error: 'ZIP file and migration prompt are required.' });
@@ -852,6 +853,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
     toTech,
     aiProvider,
     aiModel,
+    migrationScope,
     projectName: deriveProjectName(convertedPath, toTech),
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -889,6 +891,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
           priorityRulesMode,
           enableVisualQa,
           visualQaRoutes,
+          migrationScope,
           onProgress: (progress) => {
             setSession(id, {
               status: 'running',
@@ -914,6 +917,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
         toTech,
         aiProvider,
         aiModel,
+        migrationScope,
         projectName: deriveProjectName(convertedPath, toTech),
         referencePath: referenceZip ? referenceZip.path : null,
         createdAt: Date.now(),
@@ -1077,6 +1081,7 @@ router.post('/project/:sessionId/resume', (req, res) => {
   const toTech = checkpoint.toTech || meta.toTech || 'Unknown';
   const aiProvider = (req.body.aiProvider || checkpoint.aiProvider || meta.aiProvider || 'genai').trim();
   const aiModel = req.body.aiModel || checkpoint.aiModel || meta.aiModel || '';
+  const migrationScope = (req.body.migrationScope || checkpoint.migrationScope || meta.migrationScope || 'landing-first').trim();
   const userPrompt = checkpoint.userPrompt || '';
   const targetVersion = checkpoint.targetVersion || '';
   const priorityRulesMode = checkpoint.priorityRulesMode || 'react-ui';
@@ -1101,6 +1106,7 @@ router.post('/project/:sessionId/resume', (req, res) => {
     toTech,
     aiProvider,
     aiModel,
+    migrationScope,
     updatedAt: Date.now(),
     resumable: true,
     paused: false,
@@ -1131,6 +1137,7 @@ router.post('/project/:sessionId/resume', (req, res) => {
         aiModel: aiModel || undefined,
         targetVersion: targetVersion || undefined,
         priorityRulesMode,
+        migrationScope,
         resume: true,
         onProgress: (progress) => {
           setSession(sessionId, {

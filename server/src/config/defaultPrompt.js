@@ -8,6 +8,12 @@
  *   4. Source code — convert it; never invent missing APIs
  */
 
+import { ANGULAR_FORMS_GUIDE } from './angularFormsGuide.js';
+import { ANGULAR_LIST_GUIDE } from './angularListGuide.js';
+import { ANGULAR_NGXS_GUIDE } from './angularNgxsGuide.js';
+import { ANGULAR_TABLE_MANDATE } from './angularTableMandate.js';
+import { ANGULAR_STRUCTURE_MANDATE } from './angularStructureGuide.js';
+
 /** Shared preamble for every migration direction. */
 export const NO_HALLUCINATION_PREAMBLE = `
 ## USER PROMPT FIRST, THEN SOURCE BRANDING
@@ -314,6 +320,9 @@ Do NOT use default project names — use the EXTRACTED name.
   put shared modals in \`src/app/components/\`. Use Reactive Forms for all forms;
   reset add/edit sidebar forms on close.
 - Strong typing; matching .ts/.html/.scss; Tailwind in templates; no hallucinated modules.
+- **LIST / TABLE PAGES**: NEVER use plain HTML \`<table>\`. ALWAYS use Angular Material
+  \`mat-table\` + \`MatTableDataSource\` + \`custom-datatable-header\` / \`custom-datatable-cont\`.
+  Put the grid in \`*-list.component\` — do not create a separate \`*-table\` child for simple lists.
 - Do NOT create app.module.ts — use standalone bootstrap (main.ts + app.config.ts).
 - Always \`export const routes\` from app.routes.ts (never unexported \`const routes\`).
 - Every template member (methods/fields) MUST exist on the class; keep .ts and .html in sync.
@@ -493,6 +502,11 @@ When targeting React, use this shape instead (never .component / .html):
 - Output ONLY raw JSON — no markdown, no explanation, no backticks
 `;
 
+/** Angular UI/store pattern guides (forms, lists, NGXS) for prompts and unit writer. */
+export function getAngularPatternGuides() {
+  return `${ANGULAR_STRUCTURE_MANDATE}\n${ANGULAR_TABLE_MANDATE}\n${ANGULAR_FORMS_GUIDE}\n${ANGULAR_LIST_GUIDE}\n${ANGULAR_NGXS_GUIDE}`;
+}
+
 /**
  * Returns the appropriate default prompt based on source → target frameworks.
  *
@@ -509,7 +523,7 @@ export function getDefaultPrompt(fromTech, toTech) {
 
   // Angular → Angular
   if (isAngular(from) && isAngular(to)) {
-    return `${NO_HALLUCINATION_PREAMBLE}\n${ANGULAR_TO_ANGULAR_PROMPT}`;
+    return `${NO_HALLUCINATION_PREAMBLE}\n${ANGULAR_TO_ANGULAR_PROMPT}\n${getAngularPatternGuides()}`;
   }
 
   // React → React
@@ -519,7 +533,7 @@ export function getDefaultPrompt(fromTech, toTech) {
 
   // React → Angular
   if (isReact(from) && isAngular(to)) {
-    return `${NO_HALLUCINATION_PREAMBLE}\n${DEFAULT_CROSS_FRAMEWORK_PROMPT}\n${REACT_TO_ANGULAR_PROMPT}`;
+    return `${NO_HALLUCINATION_PREAMBLE}\n${DEFAULT_CROSS_FRAMEWORK_PROMPT}\n${REACT_TO_ANGULAR_PROMPT}\n${getAngularPatternGuides()}`;
   }
 
   // Angular → React

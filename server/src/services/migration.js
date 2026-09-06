@@ -21,13 +21,26 @@ import {
   BUILD_EVERY_N_UNITS,
   MAX_BUILD_FIX_ATTEMPTS
 } from '../config/index.js';
-import { getDefaultPrompt, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
+import { getDefaultPrompt, getAngularPatternGuides, INCREMENTAL_BLUEPRINT_PROMPT } from '../config/defaultPrompt.js';
+import {
+  ANGULAR_TABLE_MANDATE,
+  ANGULAR_TABLE_RETRY_SUFFIX,
+  angularTableOutputViolatesMandate,
+  isAngularTableUnit,
+} from '../config/angularTableMandate.js';
+import {
+  ANGULAR_STRUCTURE_MANDATE,
+  ANGULAR_STRUCTURE_RETRY_SUFFIX,
+  angularStructureOutputViolatesMandate,
+  normalizeAngularMigrationPlan,
+} from '../config/angularStructureGuide.js';
 import { getPriorityRules, formatPriorityRulesPrompt } from '../config/priorityRules.js';
 import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../config/targetVersions.js';
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages } from './postprocess.js';
+import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,
   isReactBootstrapPath,
@@ -3789,6 +3802,8 @@ export async function runMigrationPipeline(sourceZipPath, userPrompt, sessionId,
   report('blueprint', 'Building migration blueprint...');
   console.log(`[${sessionId}] Stage 1: Building migration blueprint...`);
 
+  const angularPatternGuides = targetLower.includes('angular') ? getAngularPatternGuides() : '';
+
   const sameFrameworkInstruction = `
 You are a code architect converting EVERY uploaded source file (same framework).
 
@@ -3802,12 +3817,14 @@ RULES:
 - Output ONLY raw JSON (no markdown, no backticks, no explanation).
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
+${angularPatternGuides}
 `;
 
   const crossFrameworkInstruction = `
 You are a Principal Software Architect. Convert the incoming source codebase COMPLETELY into the target framework.
 
 ${INCREMENTAL_BLUEPRINT_PROMPT}
+${angularPatternGuides}
 
 COMPLETE CONVERSION (MANDATORY):
 - Plan a target file for EVERY source application file (pages, routes, components, services, hooks, utils, styles).
@@ -4113,6 +4130,18 @@ ${enhancedPrompt}`
 
   filteredPlan = dropInventedPlanPages(filteredPlan, sourceStems, sessionId);
 
+  if (targetLower.includes('angular')) {
+    const before = filteredPlan.map((item) => item.newPath);
+    filteredPlan = normalizeAngularMigrationPlan(filteredPlan);
+    for (let i = 0; i < filteredPlan.length; i += 1) {
+      if (before[i] !== filteredPlan[i].newPath) {
+        console.log(
+          `[${sessionId}] Structure remap: ${before[i]} → ${filteredPlan[i].newPath}`,
+        );
+      }
+    }
+  }
+
   if (filteredPlan.length === 0) {
     throw new Error('Migration plan contained no writable source files. Please try again with a clearer prompt.');
   }
@@ -4176,7 +4205,7 @@ PER-FILE TYPE RULES:
 - Angular .ts: TypeScript only. Use templateUrl/styleUrl. No HTML markup or CSS rules in the .ts file.
 - Angular .html: HTML only with Tailwind utility classes. No TypeScript, no CSS/SCSS.
 - Angular .scss: SCSS/CSS only. Prefer empty/minimal SCSS — styling belongs in Tailwind in the HTML. Empty files: /* component */
-- Angular layout: keep converted files under src/app (pages, components, services, lib). Do not invent a starter-kit core/shared/store tree.
+- Angular layout: route screens under src/app/pages/<area>/<feature>/pages/<screen>/; feature-local UI under src/app/pages/<area>/<feature>/components/. Only cross-feature widgets go in src/app/components/. The web_angular kit already provides core/shared/store — do not duplicate those folders.
 - React component: functional + hooks + TypeScript in a .tsx file. Tailwind className utilities; companion styles use .scss only.
 - React .scss: minimal SCSS only; prefer Tailwind in JSX.
 - Write COMPLETE code. No placeholders, no truncation, no "..." shortcuts.
@@ -4224,6 +4253,9 @@ CRITICAL RULES:
 38. For React: @ngxs/store → zustand (\`import { create } from 'zustand'\`). No @State, @Action, Store.dispatch(new X()), or provideStore. Export a useXStore hook with the same CRUD methods.
 39. For React: @angular/material → @mui/material. MatSidenav → Drawer, MatDialog → Dialog/DialogTitle/DialogContent/DialogActions, MatToolbar → AppBar+Toolbar, mat-icon → Icon (Material Icons font) or lucide-react, mat-button → Button, mat-icon-button → IconButton. Do not leave mat-* tags or @angular/material imports in React files.
 40. Write COMPLETE files. Never truncate, never end with "...", never skip a listed unit. If a file uses JSX it MUST be .tsx.
+${targetLower.includes('angular') ? `
+41. ANGULAR PATTERN GUIDES (folder structure, tables, forms, lists, NGXS — NON-NEGOTIABLE):
+${getAngularPatternGuides()}` : ''}
 `;
 
   const generatedFiles = {};
@@ -4293,9 +4325,12 @@ Do not wrap the whole response in markdown fences. Each file must be complete.`;
 
     const targetSpecificContext = sourceContextForUnit(unit, essentialFilesMap);
     const expectedPaths = unit.files.map((f) => f.newPath);
+    const tableUnit = targetLower.includes('angular') && isAngularTableUnit(unit);
     const unitPrompt = `
 [TARGET FILES IN THIS UNIT]
 ${expectedPaths.map((p) => `- ${p}`).join('\n')}
+${targetLower.includes('angular') ? `\n[ANGULAR FOLDER STRUCTURE — THIS UNIT MUST FOLLOW]\n${ANGULAR_STRUCTURE_MANDATE}\n` : ''}
+${tableUnit ? `\n[ANGULAR TABLE MANDATE — THIS UNIT MUST FOLLOW]\n${ANGULAR_TABLE_MANDATE}\n` : ''}
 
 [RELEVANT SOURCE CODE]
 ${targetSpecificContext || '(no matched source files — convert from the unit purpose)'}
@@ -4323,6 +4358,32 @@ Never write placeholder pages (no "HomeComponent placeholder", no empty stub cla
         const placeholders = parsedFiles.filter((f) =>
           isPlaceholderGeneratedFile(f.path, f.content)
         );
+        if (
+          targetLower.includes('angular') &&
+          parsedFiles.length > 0 &&
+          angularStructureOutputViolatesMandate(parsedFiles)
+        ) {
+          console.warn(
+            `[${sessionId}] Folder structure violation for ${unit.label} (attempt ${attempt}/${maxUnitAttempts}) — retrying`
+          );
+          bundleRaw = null;
+          parsedFiles = [];
+          unitPromptAttempt = `${unitPrompt}${ANGULAR_STRUCTURE_RETRY_SUFFIX}`;
+          continue;
+        }
+        if (
+          tableUnit &&
+          parsedFiles.length > 0 &&
+          angularTableOutputViolatesMandate(parsedFiles)
+        ) {
+          console.warn(
+            `[${sessionId}] Table mandate violation for ${unit.label} (attempt ${attempt}/${maxUnitAttempts}) — retrying`
+          );
+          bundleRaw = null;
+          parsedFiles = [];
+          unitPromptAttempt = `${unitPrompt}${ANGULAR_TABLE_RETRY_SUFFIX}`;
+          continue;
+        }
         if (placeholders.length > 0) {
           console.warn(
             `[${sessionId}] Placeholder output for ${unit.label} (attempt ${attempt}/${maxUnitAttempts}) — retrying`

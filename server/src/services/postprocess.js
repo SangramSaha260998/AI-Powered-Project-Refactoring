@@ -9,6 +9,8 @@ import {
   resolveLucidePascalName
 } from './lucideInlineSvg.js';
 import { WEB_ANGULAR_PATH_ALIASES, webAngularNpmDeps } from '../config/webAngular.js';
+import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
+import { enforceAngularFolderStructure } from './angularStructureEnforce.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
@@ -1619,6 +1621,61 @@ const MATERIAL_ENTRY_EXCEPTIONS = {
   MatLine: '@angular/material/core'
 };
 
+/** Table column/row/cell defs are exported from MatTableModule — not separate entry points. */
+const MAT_TABLE_PACKAGE = '@angular/material/table';
+
+const MAT_TABLE_IMPORT_SYMBOLS = new Set([
+  'MatTableModule',
+  'MatTable',
+  'MatTableDataSource',
+  'MatColumnDef',
+  'MatColumnDefModule',
+  'MatHeaderCellDef',
+  'MatHeaderCellDefModule',
+  'MatCellDef',
+  'MatCellDefModule',
+  'MatFooterCellDef',
+  'MatFooterCellDefModule',
+  'MatHeaderRowDef',
+  'MatHeaderRowDefModule',
+  'MatRowDef',
+  'MatRowDefModule',
+  'MatFooterRowDef',
+  'MatFooterRowDefModule',
+  'MatHeaderCell',
+  'MatCell',
+  'MatFooterCell',
+  'MatHeaderRow',
+  'MatRow',
+  'MatFooterRow',
+  'MatNoDataRow',
+]);
+
+const INVALID_MAT_TABLE_ENTRY_RE =
+  /^@angular\/material\/(?:cell-def|header-cell-def|footer-cell-def|header-row-def|row-def|footer-row-def|column-def|def)$/;
+
+function isMatTableMaterialSymbol(symbol) {
+  if (!symbol) return false;
+  if (MAT_TABLE_IMPORT_SYMBOLS.has(symbol)) return true;
+  return /^Mat(Header|Footer)?(Cell|Row)Def(Module)?$/.test(symbol) ||
+    /^MatColumnDef(Module)?$/.test(symbol);
+}
+
+function matTableSymbolsFromImports(source) {
+  const found = new Set();
+  for (const m of String(source || '').matchAll(
+    /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g,
+  )) {
+    const from = m[2];
+    if (from !== MAT_TABLE_PACKAGE && !INVALID_MAT_TABLE_ENTRY_RE.test(from)) continue;
+    for (const part of m[1].split(',')) {
+      const sym = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+      if (isMatTableMaterialSymbol(sym)) found.add(sym);
+    }
+  }
+  return found;
+}
+
 function pascalToKebab(name) {
   return String(name || '')
     .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
@@ -1649,6 +1706,7 @@ function findImportPathForSymbol(source, symbol) {
 
 function inferMaterialPackage(symbol) {
   if (MATERIAL_ENTRY_EXCEPTIONS[symbol]) return MATERIAL_ENTRY_EXCEPTIONS[symbol];
+  if (isMatTableMaterialSymbol(symbol)) return MAT_TABLE_PACKAGE;
   if (!/^Mat[A-Z]/.test(symbol)) return null;
   let rest = symbol.replace(/^Mat/, '').replace(/Module$/, '');
   if (
@@ -1711,8 +1769,17 @@ export function declarablesNeededByHtml(html) {
   const add = (sym) => {
     if (sym && !needed.includes(sym)) needed.push(sym);
   };
+  const hasMatTable =
+    /\bmat-table\b/i.test(h) ||
+    /\bmatColumnDef\b/i.test(h) ||
+    /\bmat(?:Header|Footer)?(?:Cell|Row)Def\b/i.test(h);
+
   for (const m of h.matchAll(/<mat-([a-z0-9-]+)/gi)) {
-    add(moduleFromMatFeature(m[1]));
+    const feature = m[1];
+    if (hasMatTable && /^(table|header-cell|cell|footer-cell|header-row|row|footer-row|column)$/i.test(feature)) {
+      continue;
+    }
+    add(moduleFromMatFeature(feature));
   }
   if (
     /\bmat-(?:flat-|raised-|stroked-|icon-)?button\b|\bmatButton\b|\bmat-fab\b|\bmat-mini-fab\b/.test(
@@ -1721,8 +1788,12 @@ export function declarablesNeededByHtml(html) {
   ) {
     add('MatButtonModule');
   }
-  for (const m of h.matchAll(/\bmat([A-Z][A-Za-z]+)\b/g)) {
-    add(`Mat${m[1]}Module`);
+  if (hasMatTable) {
+    add('MatTableModule');
+  } else {
+    for (const m of h.matchAll(/\bmat([A-Z][A-Za-z]+)\b/g)) {
+      add(`Mat${m[1]}Module`);
+    }
   }
   if (/\bngModel\b|\[\(ngModel\)\]/.test(h)) add('FormsModule');
   if (/\[formGroup\]|formControlName|\[formControl\]/.test(h)) add('ReactiveFormsModule');
@@ -3585,6 +3656,90 @@ export function ensureAngularAppModels(destPath, sourceFilesMap = null) {
   return changed;
 }
 
+/**
+ * Strip hallucinated per-directive Material table imports (e.g. @angular/material/cell-def)
+ * and consolidate on MatTableModule from @angular/material/table.
+ */
+export function repairInvalidMaterialTableImports(destPath) {
+  const srcRoot = path.join(destPath, 'src');
+  if (!fs.existsSync(srcRoot)) return 0;
+
+  const tableDefModules = [
+    'MatColumnDefModule',
+    'MatHeaderCellDefModule',
+    'MatCellDefModule',
+    'MatFooterCellDefModule',
+    'MatHeaderRowDefModule',
+    'MatRowDefModule',
+    'MatFooterRowDefModule',
+    'MatColumnDef',
+    'MatHeaderCellDef',
+    'MatCellDef',
+    'MatFooterCellDef',
+    'MatHeaderRowDef',
+    'MatRowDef',
+    'MatFooterRowDef',
+  ];
+
+  let changed = 0;
+  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.ts'))) {
+    let source = fs.readFileSync(file, 'utf-8');
+    const original = source;
+    const htmlPath = file.replace(/\.ts$/, '.html');
+    const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
+    const needsTable =
+      /\bmat-table\b/i.test(html) ||
+      /\bmatColumnDef\b/i.test(html) ||
+      /\bmat(?:Header|Footer)?(?:Cell|Row)Def\b/i.test(html) ||
+      matTableSymbolsFromImports(source).size > 0 ||
+      INVALID_MAT_TABLE_ENTRY_RE.test(source);
+
+    // Remove imports from invalid Material entry points
+    source = source.replace(
+      /import\s*\{([^}]*)\}\s*from\s*['"]@angular\/material\/(?:cell-def|header-cell-def|footer-cell-def|header-row-def|row-def|footer-row-def|column-def|def)['"]\s*;?\s*\n?/g,
+      '',
+    );
+
+    if (needsTable) {
+      for (const sym of tableDefModules) {
+        source = removeNamedImport(source, sym, MAT_TABLE_PACKAGE);
+        for (const badPkg of [
+          '@angular/material/cell-def',
+          '@angular/material/header-cell-def',
+          '@angular/material/footer-cell-def',
+          '@angular/material/header-row-def',
+          '@angular/material/row-def',
+          '@angular/material/footer-row-def',
+          '@angular/material/column-def',
+          '@angular/material/def',
+        ]) {
+          source = removeNamedImport(source, sym, badPkg);
+        }
+        source = removeDecoratorImport(source, sym);
+      }
+
+      if (!/from\s*['"]@angular\/material\/table['"]/.test(source)) {
+        source = ensureImport(source, 'MatTableModule', MAT_TABLE_PACKAGE);
+      } else if (!/\bMatTableModule\b/.test(source)) {
+        source = ensureImport(source, 'MatTableModule', MAT_TABLE_PACKAGE);
+      }
+      source = ensureDecoratorImport(source, 'MatTableModule');
+
+      if (/\bMatTableDataSource\b/.test(source) && !/from\s*['"]@angular\/material\/table['"]/.test(
+        source.match(/import\s*\{[^}]*MatTableDataSource/)?.[0] || '',
+      )) {
+        source = ensureImport(source, 'MatTableDataSource', MAT_TABLE_PACKAGE);
+      }
+    }
+
+    if (source !== original) {
+      fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 export function repairAngularWorkspace(destPath, options = {}) {
   const { sourceFilesMap = null, sourcePackageJson = null } = options;
 
@@ -3594,6 +3749,21 @@ export function repairAngularWorkspace(destPath, options = {}) {
   ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
   ensureAngularMaterialPackages(destPath, sourcePackageJson, sourceFilesMap);
+
+  const structureMoves = enforceAngularFolderStructure(destPath);
+  if (structureMoves > 0) {
+    console.log(`[postprocess] Relocated ${structureMoves} file(s) onto feature-module folder structure`);
+  }
+
+  const tableImportRepairs = repairInvalidMaterialTableImports(destPath);
+  if (tableImportRepairs > 0) {
+    console.log(`[postprocess] Fixed invalid Material table imports in ${tableImportRepairs} file(s)`);
+  }
+
+  const tableRepairs = repairPlainHtmlTablesToMatTable(destPath);
+  if (tableRepairs > 0) {
+    console.log(`[postprocess] Converted ${tableRepairs} plain HTML table(s) to mat-table`);
+  }
 
   const componentFiles = walkFiles(path.join(destPath, 'src'), (name) =>
     name.endsWith('.component.ts')
@@ -3811,7 +3981,10 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   const moduleIssues =
     /TS2307/.test(text) ||
     /Could not resolve ['"].*models\//.test(text) ||
-    /Cannot find module ['"].*models\//.test(text);
+    /Cannot find module ['"].*models\//.test(text) ||
+    /Could not resolve ["']@angular\/material\/(?:cell-def|header-cell-def|footer-cell-def|header-row-def|row-def|footer-row-def|column-def|def)["']/.test(
+      text,
+    );
   const duplicateIssues =
     /TS2393/.test(text) ||
     /TS2300/.test(text) ||
@@ -3851,6 +4024,16 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       ensureAngularAppModels(destPath);
     } catch (err) {
       console.warn(`[postprocess] Angular model layout repair failed: ${err.message}`);
+    }
+    try {
+      const tableImportRepairs = repairInvalidMaterialTableImports(destPath);
+      if (tableImportRepairs > 0) {
+        console.log(
+          `[postprocess] Build-fix: repaired invalid Material table imports in ${tableImportRepairs} file(s)`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[postprocess] Material table import repair failed: ${err.message}`);
     }
   }
 

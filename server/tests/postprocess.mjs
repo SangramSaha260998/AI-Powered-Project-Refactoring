@@ -31,6 +31,7 @@ import {
   pinSourceDomainArtifacts,
   ensureReactAppShell,
   fixAngularCompileErrors,
+  repairInvalidMaterialTableImports,
   repairAngularStrictNullAndStatusTypes,
   ensureAngularMaterialPackages,
   inferDeclarablePackage,
@@ -1498,6 +1499,76 @@ export class HostPageComponent {}
   assert(htmlNeeded.includes('MatTreeModule'), 'template <mat-tree> needs MatTreeModule');
   assert(htmlNeeded.includes('MatGridListModule'), 'template <mat-grid-list> needs MatGridListModule');
   assert(htmlNeeded.includes('MatButtonModule'), 'mat-flat-button attribute needs MatButtonModule');
+}
+
+// --- Mat-table defs must use @angular/material/table, not fake *-def entry points ---
+{
+  assert(
+    inferDeclarablePackage('MatCellDefModule') === '@angular/material/table',
+    'MatCellDefModule → @angular/material/table',
+  );
+  assert(
+    inferDeclarablePackage('MatHeaderRowDefModule') === '@angular/material/table',
+    'MatHeaderRowDefModule → @angular/material/table',
+  );
+  const tableHtml = `<table mat-table [dataSource]="dataSource">
+    <ng-container matColumnDef="name">
+      <th mat-header-cell *matHeaderCellDef>Name</th>
+      <td mat-cell *matCellDef="let row">{{ row.name }}</td>
+    </ng-container>
+    <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
+    <tr mat-row *matRowDef="let row; columns: displayedColumns"></tr>
+  </table>`;
+  const tableNeeded = declarablesNeededByHtml(tableHtml);
+  assert(tableNeeded.includes('MatTableModule'), 'mat-table template needs MatTableModule');
+  assert(
+    !tableNeeded.includes('MatCellDefModule'),
+    'mat-table template must not add MatCellDefModule separately',
+  );
+  assert(
+    !tableNeeded.includes('MatHeaderRowDefModule'),
+    'mat-table template must not add MatHeaderRowDefModule separately',
+  );
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-mat-table-import-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'list');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'list.component.ts'),
+    `import { Component } from '@angular/core';
+import { MatTableDataSource } from '@angular/material/table';
+import { MatHeaderCellDefModule } from '@angular/material/header-cell-def';
+import { MatCellDefModule } from '@angular/material/cell-def';
+import { MatHeaderRowDefModule } from '@angular/material/header-row-def';
+import { MatRowDefModule } from '@angular/material/row-def';
+import { MatFooterRowDefModule } from '@angular/material/footer-row-def';
+
+@Component({
+  selector: 'app-list',
+  standalone: true,
+  imports: [
+    MatHeaderCellDefModule,
+    MatCellDefModule,
+    MatHeaderRowDefModule,
+    MatRowDefModule,
+    MatFooterRowDefModule,
+  ],
+  templateUrl: './list.component.html',
+})
+export class ListComponent {
+  dataSource = new MatTableDataSource([]);
+  displayedColumns = ['name'];
+}
+`,
+  );
+  fs.writeFileSync(path.join(dir, 'list.component.html'), tableHtml);
+  const fixed = repairInvalidMaterialTableImports(tmp);
+  assert.equal(fixed, 1);
+  const ts = fs.readFileSync(path.join(dir, 'list.component.ts'), 'utf-8');
+  assert.doesNotMatch(ts, /@angular\/material\/cell-def/);
+  assert.doesNotMatch(ts, /@angular\/material\/header-row-def/);
+  assert.match(ts, /@angular\/material\/table/);
+  assert.match(ts, /MatTableModule/);
 }
 
 {

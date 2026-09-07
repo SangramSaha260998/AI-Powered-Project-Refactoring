@@ -531,6 +531,87 @@ function classHasMember(source, name) {
   return re.test(source);
 }
 
+const LIFECYCLE_HOOKS = [
+  { iface: 'OnInit', method: 'ngOnInit' },
+  { iface: 'OnDestroy', method: 'ngOnDestroy' },
+  { iface: 'AfterViewInit', method: 'ngAfterViewInit' },
+  { iface: 'AfterContentInit', method: 'ngAfterContentInit' },
+  { iface: 'AfterViewChecked', method: 'ngAfterViewChecked' },
+  { iface: 'AfterContentChecked', method: 'ngAfterContentChecked' },
+  { iface: 'OnChanges', method: 'ngOnChanges', extraImport: 'SimpleChanges' },
+  { iface: 'DoCheck', method: 'ngDoCheck' }
+];
+
+function implementedLifecycleInterfaces(source) {
+  const m = String(source || '').match(/export\s+class\s+\w+[^{]*\bimplements\s+([^{]+)\{/);
+  if (!m) return [];
+  return m[1]
+    .split(',')
+    .map((s) => s.trim().split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+/**
+ * TS2420: AI copies `implements OnInit, OnDestroy` from list/NGXS samples
+ * without writing the matching methods.
+ */
+function ensureLifecycleMethods(source) {
+  let updated = String(source || '');
+  const ifaces = implementedLifecycleInterfaces(updated);
+  if (!ifaces.length) return updated;
+  const snippets = [];
+  for (const hook of LIFECYCLE_HOOKS) {
+    if (!ifaces.includes(hook.iface)) continue;
+    if (classHasMember(updated, hook.method) || classHasMethod(updated, hook.method)) continue;
+    if (hook.extraImport) {
+      updated = ensureImport(updated, hook.extraImport, '@angular/core');
+    }
+    if (hook.iface === 'OnDestroy' && /\bsubscriptions\b/.test(updated)) {
+      snippets.push(
+        '  ngOnDestroy(): void {\n    this.subscriptions.forEach((s) => s.unsubscribe());\n  }'
+      );
+    } else if (hook.iface === 'OnChanges') {
+      snippets.push('  ngOnChanges(_changes: SimpleChanges): void {\n  }');
+    } else {
+      snippets.push(`  ${hook.method}(): void {\n  }`);
+    }
+  }
+  if (!snippets.length) return updated;
+  return insertIntoClassBody(updated, snippets.join('\n'));
+}
+
+export function repairMissingAngularLifecycleHooks(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const srcRoot = path.join(destPath, 'src');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/((?:src\/)?[\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].map((rel) => path.join(destPath, rel)).filter((f) => fs.existsSync(f))
+      : walkFiles(srcRoot, (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'));
+
+  let changed = 0;
+  for (const file of files) {
+    let content;
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    const next = ensureLifecycleMethods(content);
+    if (next !== content) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Added missing lifecycle methods in ${changed} Angular file(s)`);
+  }
+  return changed;
+}
+
 function findMatchingBrace(src, openIdx) {
   let depth = 0;
   for (let i = openIdx; i < src.length; i++) {
@@ -542,6 +623,23 @@ function findMatchingBrace(src, openIdx) {
     }
   }
   return -1;
+}
+
+function extractExportedClassBody(source) {
+  const s = String(source || '');
+  const m = s.match(/export\s+class\s+\w+[^{]*\{/);
+  if (!m || m.index == null) return { start: -1, end: -1, body: '' };
+  const open = m.index + m[0].length - 1;
+  const close = findMatchingBrace(s, open);
+  if (close < 0) return { start: open, end: s.length - 1, body: s.slice(open) };
+  return { start: open, end: close, body: s.slice(open, close + 1) };
+}
+
+function stripInputDecoratorsOutsideClass(source) {
+  const { start, end } = extractExportedClassBody(source);
+  if (start < 0) return source;
+  const clean = (chunk) => String(chunk || '').replace(/@Input\s*\([^)]*\)\s*/g, '');
+  return `${clean(source.slice(0, start))}${source.slice(start, end + 1)}${clean(source.slice(end + 1))}`;
 }
 
 function removeNamedClassMethods(source, name) {
@@ -1450,11 +1548,312 @@ function unwrapSidenavContainerInnerWrapper(html) {
   );
 }
 
+function skipQuotedString(s, i) {
+  const q = s[i];
+  let j = i + 1;
+  while (j < s.length) {
+    if (s[j] === '\\') {
+      j += 2;
+      continue;
+    }
+    if (s[j] === q) return j + 1;
+    j += 1;
+  }
+  return s.length;
+}
+
+function skipBalancedBraces(s, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      i = skipQuotedString(s, i) - 1;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return s.length;
+}
+
+function skipBalancedParens(s, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      i = skipQuotedString(s, i) - 1;
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return s.length;
+}
+
+function stripJsxObjectLiteralAttrs(html) {
+  const re = /\s(?:sx|slots|slotProps|PaperProps|InputProps|style)=\{/gi;
+  let s = String(html || '');
+  const cuts = [];
+  let m;
+  while ((m = re.exec(s))) {
+    const end = skipBalancedBraces(s, m.index + m[0].length - 1);
+    cuts.push([m.index, end]);
+    re.lastIndex = end;
+  }
+  for (const [start, end] of cuts.reverse()) {
+    s = `${s.slice(0, start)}${s.slice(end)}`;
+  }
+  return s;
+}
+
+function rewriteJsxAttrsInTags(html) {
+  return String(html || '').replace(
+    /<([A-Za-z][\w-]*)(\s[\s\S]*?)(\s*\/?)>/g,
+    (full, tag, attrs, slash) => {
+      if (/<\/[A-Za-z]/.test(attrs)) return full;
+      let a = attrs.replace(/\s+key=\{[^}]+\}/g, '');
+      a = a.replace(
+        /\s([A-Za-z_][\w]*)=\{([^{}]+)\}/g,
+        (m, name, expr) => {
+          if (name.startsWith('ng') || name === 'let' || name === 'ref') return m;
+          if (/^on[A-Z]/.test(name)) {
+            const evt = name.slice(2);
+            const evName = evt.charAt(0).toLowerCase() + evt.slice(1);
+            const trimmed = String(expr || '').trim();
+            const call = /^\w+$/.test(trimmed) ? `${trimmed}($event)` : trimmed;
+            return ` (${evName})="${call}"`;
+          }
+          return ` [${name}]="${String(expr).trim()}"`;
+        }
+      );
+      return `<${tag}${a}${slash}>`;
+    }
+  );
+}
+
+function rewriteLeftoverJsxMaps(html) {
+  const re = /\{(\w+(?:\.\w+)*)\.map\(\s*\(?\s*(\w+)(?:\s*:\s*[^)]*)?\)?\s*=>\s*\(/g;
+  let s = String(html || '');
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(s))) {
+    const innerStart = m.index + m[0].length;
+    const closeParenAt = skipBalancedParens(s, innerStart - 1) - 1;
+    if (closeParenAt < innerStart) break;
+    const inner = s.slice(innerStart, closeParenAt);
+    let end = closeParenAt + 1;
+    while (end < s.length && /\s/.test(s[end])) end += 1;
+    if (s[end] === ')') end += 1;
+    while (end < s.length && /\s/.test(s[end])) end += 1;
+    if (s[end] === '}') end += 1;
+    out += s.slice(last, m.index);
+    out += `@for (${m[2]} of ${m[1]}; track ${m[2]}) {\n${inner}\n}`;
+    last = end;
+    re.lastIndex = end;
+  }
+  return out + s.slice(last);
+}
+
+function rewriteLeftoverJsxConditionals(html) {
+  let s = String(html || '');
+
+  const rewriteAnd = () => {
+    const re = /\{([^{}&]{1,160}?)\s*&&\s*\(/g;
+    let out = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(s))) {
+      const innerStart = m.index + m[0].length;
+      const closeAt = skipBalancedParens(s, innerStart - 1) - 1;
+      if (closeAt < innerStart) break;
+      let end = closeAt + 1;
+      while (end < s.length && /\s/.test(s[end])) end += 1;
+      if (s[end] === '}') end += 1;
+      out += s.slice(last, m.index);
+      out += `@if (${m[1].trim()}) {\n${s.slice(innerStart, closeAt)}\n}`;
+      last = end;
+      re.lastIndex = end;
+    }
+    s = out + s.slice(last);
+  };
+
+  const rewriteTernary = () => {
+    const re = /\{([^{}?]{1,160}?)\?\s*\(/g;
+    let out = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(s))) {
+      const trueStart = m.index + m[0].length;
+      const trueClose = skipBalancedParens(s, trueStart - 1) - 1;
+      if (trueClose < trueStart) break;
+      let i = trueClose + 1;
+      while (i < s.length && /\s/.test(s[i])) i += 1;
+      if (s[i] !== ':') {
+        re.lastIndex = trueClose + 1;
+        continue;
+      }
+      i += 1;
+      while (i < s.length && /\s/.test(s[i])) i += 1;
+      const trueInner = s.slice(trueStart, trueClose);
+      let replacement;
+      if (/^(null|undefined|false)\b/.test(s.slice(i))) {
+        i += s.slice(i).match(/^(null|undefined|false)/)[1].length;
+        while (i < s.length && /\s/.test(s[i])) i += 1;
+        if (s[i] === '}') i += 1;
+        replacement = `@if (${m[1].trim()}) {\n${trueInner}\n}`;
+      } else if (s[i] === '(') {
+        const elseClose = skipBalancedParens(s, i) - 1;
+        const elseInner = s.slice(i + 1, elseClose);
+        i = elseClose + 1;
+        while (i < s.length && /\s/.test(s[i])) i += 1;
+        if (s[i] === '}') i += 1;
+        replacement = `@if (${m[1].trim()}) {\n${trueInner}\n} @else {\n${elseInner}\n}`;
+      } else {
+        re.lastIndex = trueClose + 1;
+        continue;
+      }
+      out += s.slice(last, m.index);
+      out += replacement;
+      last = i;
+      re.lastIndex = i;
+    }
+    s = out + s.slice(last);
+  };
+
+  rewriteTernary();
+  rewriteAnd();
+  return s;
+}
+
+function isControlFlowOpenBrace(preceding) {
+  const tail = String(preceding || '').slice(-400);
+  return (
+    /@(?:else\s+if|if|for|switch|case|let)\s*\((?:[^()]|\([^()]*\))*\)\s*$/.test(tail) ||
+    /@(?:else|empty|default|placeholder|loading|error|defer)\s*$/.test(tail)
+  );
+}
+
+function rewriteBareIcuExpressions(html) {
+  const s = String(html || '');
+  let i = 0;
+  let out = '';
+  while (i < s.length) {
+    if (s.startsWith('<!--', i)) {
+      const end = s.indexOf('-->', i + 4);
+      const j = end < 0 ? s.length : end + 3;
+      out += s.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (s[i] === '<') {
+      const close = s.indexOf('>', i + 1);
+      const j = close < 0 ? s.length : close + 1;
+      out += s.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (s.startsWith('{{', i)) {
+      const end = s.indexOf('}}', i + 2);
+      const j = end < 0 ? s.length : end + 2;
+      out += s.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (s[i] === '{') {
+      const rest = s.slice(i);
+      const m = rest.match(/^\{([A-Za-z_$][\w.?![\]]*?)\}/);
+      if (m && !isControlFlowOpenBrace(out)) {
+        out += `{{ ${m[1]} }}`;
+        i += m[0].length;
+        continue;
+      }
+    }
+    out += s[i];
+    i += 1;
+  }
+  return out;
+}
+
+function closeUnbalancedControlFlow(html) {
+  const s = String(html || '');
+  let i = 0;
+  let depth = 0;
+  while (i < s.length) {
+    if (s.startsWith('<!--', i)) {
+      const end = s.indexOf('-->', i + 4);
+      i = end < 0 ? s.length : end + 3;
+      continue;
+    }
+    if (s.startsWith('{{', i)) {
+      const end = s.indexOf('}}', i + 2);
+      i = end < 0 ? s.length : end + 2;
+      continue;
+    }
+    if (s[i] === '<') {
+      const close = s.indexOf('>', i + 1);
+      i = close < 0 ? s.length : close + 1;
+      continue;
+    }
+    if (s[i] === '@') {
+      const kw = s
+        .slice(i)
+        .match(
+          /^@(?:else\s+if|if|for|switch|case|else|empty|default|placeholder|loading|error|defer|let)\b/
+        );
+      if (kw) {
+        i += kw[0].length;
+        while (i < s.length && s[i] !== '{' && s[i] !== '@' && s[i] !== '<') {
+          if (s[i] === '"' || s[i] === "'") {
+            i = skipQuotedString(s, i);
+            continue;
+          }
+          i += 1;
+        }
+        if (s[i] === '{') {
+          depth += 1;
+          i += 1;
+        }
+        continue;
+      }
+    }
+    if (s[i] === '}' && depth > 0) depth -= 1;
+    i += 1;
+  }
+  if (depth <= 0) return s;
+  return `${s.replace(/\s*$/, '')}\n${'}'.repeat(depth)}\n`;
+}
+
+/**
+ * NG5002 Invalid ICU / unescaped `{`: leftover JSX `{expr}`, `.map()`, and
+ * unclosed `@if`/`@for` blocks after React → Angular conversion.
+ */
+export function repairJsxAndIcuBraces(html) {
+  let s = String(html || '');
+  s = s.replace(/\{\/\*[\s\S]*?\*\/\}/g, '');
+  s = stripJsxObjectLiteralAttrs(s);
+  s = rewriteJsxAttrsInTags(s);
+  s = rewriteLeftoverJsxMaps(s);
+  s = rewriteLeftoverJsxConditionals(s);
+  s = rewriteBareIcuExpressions(s);
+  s = s.replace(/(<\/[A-Za-z][\w-]*>)\s*\)\}/g, '$1\n}');
+  s = s.replace(/\)\s*\)\}/g, '\n}');
+  s = closeUnbalancedControlFlow(s);
+  return s;
+}
+
 /**
  * Repair Angular HTML leftovers that commonly break ng serve after React conversions.
  */
 function repairAngularTemplateHtml(html, source) {
-  let updated = repairSelfClosingNonVoidTags(html);
+  let updated = repairJsxAndIcuBraces(html);
+  updated = repairSelfClosingNonVoidTags(updated);
   updated = repairMismatchedHtmlClosingTags(updated);
 
   // Doubled attribute closers: (click)="fn()""> confuses the parser into NG5002 on </button>
@@ -1620,6 +2019,35 @@ const MATERIAL_ENTRY_EXCEPTIONS = {
   MatRippleModule: '@angular/material/core',
   MatLine: '@angular/material/core'
 };
+
+/**
+ * Directives like matSuffix/matPrefix are not NgModules. AI and
+ * `\bmat([A-Z]…)` scans invent MatSuffixModule etc., which TS2305/NG1010.
+ */
+const MAT_MODULE_ALIASES = {
+  MatSuffixModule: 'MatFormFieldModule',
+  MatPrefixModule: 'MatFormFieldModule',
+  MatHintModule: 'MatFormFieldModule',
+  MatErrorModule: 'MatFormFieldModule',
+  MatLabelModule: 'MatFormFieldModule',
+  MatPlaceholderModule: 'MatFormFieldModule',
+  MatOptionModule: 'MatSelectModule',
+  MatOptgroupModule: 'MatSelectModule',
+  MatIconButtonModule: 'MatButtonModule',
+  MatMiniFabButtonModule: 'MatButtonModule',
+  MatFabButtonModule: 'MatButtonModule',
+  MatFlatButtonModule: 'MatButtonModule',
+  MatRaisedButtonModule: 'MatButtonModule',
+  MatStrokedButtonModule: 'MatButtonModule',
+  MatAnchorModule: 'MatButtonModule',
+  MatDatepickerToggleModule: 'MatDatepickerModule',
+  MatDatepickerInputModule: 'MatDatepickerModule'
+};
+
+function canonicalMatDeclarable(symbol) {
+  const s = String(symbol || '');
+  return MAT_MODULE_ALIASES[s] || s;
+}
 
 /** Table column/row/cell defs are exported from MatTableModule — not separate entry points. */
 const MAT_TABLE_PACKAGE = '@angular/material/table';
@@ -1792,7 +2220,7 @@ export function declarablesNeededByHtml(html) {
     add('MatTableModule');
   } else {
     for (const m of h.matchAll(/\bmat([A-Z][A-Za-z]+)\b/g)) {
-      add(`Mat${m[1]}Module`);
+      add(canonicalMatDeclarable(moduleFromMatFeature(pascalToKebab(m[1]))));
     }
   }
   if (/\bngModel\b|\[\(ngModel\)\]/.test(h)) add('FormsModule');
@@ -1869,7 +2297,7 @@ function preferImportedMaterialSymbol(source, moduleName) {
  */
 function syncNgComponentImports(source, html) {
   if (!/@Component\s*\(/.test(source)) return source;
-  let updated = rewriteMaterialBarrelImports(source);
+  let updated = remapHallucinatedMaterialSymbols(rewriteMaterialBarrelImports(source));
   const imported = () => collectImportedValueNames(updated);
   const local = new Set(
     [...String(updated).matchAll(/\b(?:export\s+)?class\s+(\w+)/g)].map((m) => m[1])
@@ -1878,7 +2306,7 @@ function syncNgComponentImports(source, html) {
   const fromDecorator = parseDecoratorImportItems(updated).filter(
     (name) => /^[A-Z]/.test(name) && !local.has(name)
   );
-  const needed = [...declarablesNeededByHtml(html), ...fromDecorator];
+  const needed = [...declarablesNeededByHtml(html), ...fromDecorator].map(canonicalMatDeclarable);
 
   for (const raw of needed) {
     const symbol = preferImportedMaterialSymbol(updated, raw);
@@ -1918,6 +2346,26 @@ function syncNgComponentImports(source, html) {
     }
   );
 
+  return updated;
+}
+
+/**
+ * Rewrite fake Mat*Module names (MatSuffixModule, MatIconButtonModule, …)
+ * onto the real Material NgModule that exports the directive.
+ */
+function remapHallucinatedMaterialSymbols(source) {
+  let updated = String(source || '');
+  for (const [fake, real] of Object.entries(MAT_MODULE_ALIASES)) {
+    if (!new RegExp(`\\b${fake}\\b`).test(updated)) continue;
+    const fakeFrom = findImportPathForSymbol(updated, fake);
+    if (fakeFrom) updated = removeNamedImport(updated, fake, fakeFrom);
+    updated = removeDecoratorImport(updated, fake);
+    const pkg = inferDeclarablePackage(real, updated) || inferMaterialPackage(real);
+    if (pkg) {
+      updated = ensureImport(updated, real, pkg);
+      updated = ensureDecoratorImport(updated, real);
+    }
+  }
   return updated;
 }
 
@@ -1976,6 +2424,7 @@ function repairHallucinatedAngularApis(source) {
 
   // Bare `Reactive` is a common corruption of ReactiveFormsModule (FormsModule suffix strip)
   updated = repairBogusAngularFormsImports(updated);
+  updated = remapHallucinatedMaterialSymbols(updated);
 
   // Input used as a generic type (React children leftover): actions: Input<X> = () => null
   updated = updated.replace(
@@ -2581,6 +3030,7 @@ function repairAngularComponentFile(tsPath, options = {}) {
   }
   source = syncNgComponentImports(source, readAllTemplates(source, tsPath));
   source = dedupeImports(source);
+  source = ensureLifecycleMethods(source);
 
   // Ensure default sibling css exists / is valid
   const cssFiles = new Set(
@@ -3148,24 +3598,174 @@ const SKIP_AUTO_INPUT = new Set([
   'cdkDrag', 'cdkDropList', 'matTooltip', 'matMenuTriggerFor'
 ]);
 
+function classHasInput(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  const hay = extractExportedClassBody(source).body || source;
+  return (
+    new RegExp(`@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\b`).test(hay) ||
+    new RegExp(`\\b${esc}\\s*=\\s*input(?:\\.required)?\\s*(?:<[^>]*>)?\\s*\\(`).test(hay)
+  );
+}
+
+function parentFieldAllowsNull(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  return (
+    new RegExp(`\\b${esc}\\s*!?:\\s*[^;=\\n]*\\|\\s*null`).test(source) ||
+    new RegExp(`\\b${esc}\\s*=\\s*(?:signal|input)\\s*<[^>]*\\|\\s*null`).test(source) ||
+    new RegExp(`\\b${esc}\\s*=\\s*null\\s*;`).test(source)
+  );
+}
+
+function inputAllowsNull(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  if (
+    new RegExp(`@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\s*!?:\\s*[^;=\\n]*\\|\\s*null`).test(
+      source
+    )
+  ) {
+    return true;
+  }
+  if (
+    new RegExp(`@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\s*!?:\\s*(?:any|unknown|null)\\b`).test(
+      source
+    )
+  ) {
+    return true;
+  }
+  if (new RegExp(`@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\s*!?:[^=;\\n]*=\\s*null`).test(source)) {
+    return true;
+  }
+  if (
+    new RegExp(
+      `\\b${esc}\\s*=\\s*input(?:\\.required)?\\s*<[^>]*(?:\\|\\s*null|\\bany\\b|\\bunknown\\b)`
+    ).test(source)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function widenInputTypeToNullable(source, name) {
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return source;
+  let updated = source;
+
+  updated = updated.replace(
+    new RegExp(`@Input\\s*\\(\\s*\\{([^}]*)\\}\\s*\\)\\s*((?:readonly\\s+)?${esc}\\b)`, 'g'),
+    (full, inner, rest) => {
+      if (!/\brequired\s*:\s*true\b/.test(inner)) return full;
+      const nextInner = inner
+        .replace(/\brequired\s*:\s*true\s*,\s*/, '')
+        .replace(/,\s*\brequired\s*:\s*true\b/, '')
+        .replace(/\brequired\s*:\s*true\b/, '')
+        .trim();
+      if (!nextInner) return `@Input() ${rest}`;
+      return `@Input({ ${nextInner} }) ${rest}`;
+    }
+  );
+
+  updated = updated.replace(
+    new RegExp(
+      `(@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\s*)!(\\s*:\\s*)([^;=\\n]+)(\\s*;)`,
+      'g'
+    ),
+    (full, pre, colon, type, semi) => {
+      if (/\|\s*null/.test(type) || /\bany\b|\bunknown\b|\bnull\b/.test(type)) {
+        return `${pre}${colon}${type.trim()} = null${semi}`;
+      }
+      return `${pre}${colon}${type.trim()} | null = null${semi}`;
+    }
+  );
+
+  updated = updated.replace(
+    new RegExp(
+      `(@Input\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?${esc}\\s*:\\s*)([^;=\\n]+)(\\s*(?:=\\s*[^;\\n]+)?;)`,
+      'g'
+    ),
+    (full, pre, type, rest) => {
+      if (/\|\s*null/.test(type) || /\bany\b|\bunknown\b|\bundefined\b/.test(type)) return full;
+      if (/=/.test(rest)) return `${pre}${type.trim()} | null${rest}`;
+      return `${pre}${type.trim()} | null = null;`;
+    }
+  );
+
+  updated = updated.replace(
+    new RegExp(
+      `(\\b(?:readonly\\s+)?${esc}\\s*=\\s*)input\\.required\\s*(<[^>]+>)?\\s*\\(\\s*\\)`,
+      'g'
+    ),
+    (full, pre, gen) => {
+      const inner = gen ? gen.slice(1, -1).trim() : 'any';
+      const t = /\|\s*null/.test(inner) ? inner : `${inner} | null`;
+      return `${pre}input<${t}>(null)`;
+    }
+  );
+
+  updated = updated.replace(
+    new RegExp(
+      `(\\b(?:readonly\\s+)?${esc}\\s*=\\s*input\\s*)(<[^>]+>)(\\s*\\()([^)]*)(\\))`,
+      'g'
+    ),
+    (full, pre, gen, open, args, close) => {
+      const inner = gen.slice(1, -1).trim();
+      if (/\|\s*null/.test(inner) || /\bany\b|\bunknown\b|\bnull\b/.test(inner)) return full;
+      const nextArgs = String(args || '').trim() ? args : 'null';
+      return `${pre}<${inner} | null>${open}${nextArgs}${close}`;
+    }
+  );
+
+  return updated;
+}
+
+function promoteFieldToInput(source, name) {
+  let updated = stripInputDecoratorsOutsideClass(source);
+  if (classHasInput(updated, name)) return updated;
+  const classBody = extractExportedClassBody(updated).body;
+  if (classBody && classHasMethod(classBody, name)) return updated;
+  const esc = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  updated = ensureImport(updated, 'Input', '@angular/core');
+  const slice = extractExportedClassBody(updated);
+  const fieldRe = new RegExp(
+    `^([ \\t]*)((?:(?:public|protected|private|readonly)\\s+)*)(${esc}\\s*!?:)`,
+    'm'
+  );
+  if (slice.body && fieldRe.test(slice.body)) {
+    const nextBody = slice.body.replace(fieldRe, `$1@Input() $2$3`);
+    return `${updated.slice(0, slice.start)}${nextBody}${updated.slice(slice.end + 1)}`;
+  }
+  return insertIntoClassBody(updated, `  @Input() ${name}: any = null;`);
+}
+
+function skipAutoInputName(name) {
+  return (
+    SKIP_AUTO_INPUT.has(name) ||
+    name.startsWith('attr.') ||
+    name.startsWith('class.') ||
+    name.startsWith('style.')
+  );
+}
+
+function skipNullableWrapTag(tag) {
+  const t = String(tag || '').toLowerCase();
+  return !t || /^(mat-|ng-|router-|cdk-|svg:)/.test(t) || !t.includes('-');
+}
+
 /**
  * Ensure child components declare `@Input()` for parent property bindings like `[description]`.
+ * Also widen child inputs that reject `T | null` (strictTemplates TS2322 on `[task]="deletingTask"`).
  */
 function ensureInputsFromParentPropertyBindings(destPath) {
   const srcRoot = path.join(destPath, 'src');
-  const bySelector = new Map();
-  for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
-    try {
-      const content = fs.readFileSync(file, 'utf-8');
-      const sel = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
-      if (sel) bySelector.set(sel[1].toLowerCase(), file);
-    } catch {
-      /* ignore */
-    }
-  }
+  const { bySelector, byClass } = indexAngularComponents(srcRoot);
 
-  /** @type {Map<string, Set<string>>} */
+  /** @type {Map<string, Map<string, { nullable: boolean }>>} */
   const needed = new Map();
+  /** @type {Array<{ htmlFile: string, html: string, parentTs: string }>} */
+  const htmlDocs = [];
+
   for (const htmlFile of walkFiles(srcRoot, (n) => n.endsWith('.html'))) {
     let html;
     try {
@@ -3173,33 +3773,71 @@ function ensureInputsFromParentPropertyBindings(destPath) {
     } catch {
       continue;
     }
-    for (const m of html.matchAll(
-      /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b([^>]*)>/gi
-    )) {
-      const tag = m[1].toLowerCase();
-      const attrs = m[2] || '';
-      const file = bySelector.get(tag);
+    const parentTsPath = htmlFile.replace(/\.html$/, '.ts');
+    let parentTs = '';
+    try {
+      if (fs.existsSync(parentTsPath)) parentTs = fs.readFileSync(parentTsPath, 'utf-8');
+    } catch {
+      parentTs = '';
+    }
+    htmlDocs.push({ htmlFile, html, parentTs });
+
+    for (const m of html.matchAll(/\[([A-Za-z_][A-Za-z0-9_]*)\]\s*=\s*(["'])([^"']*)\2/g)) {
+      const inputName = m[1];
+      const expr = String(m[3] || '').trim();
+      if (skipAutoInputName(inputName)) continue;
+      const tag = nearestOpenTagName(html, m.index || 0);
+      const file = resolveChildComponentFile(tag, bySelector, byClass);
       if (!file) continue;
-      for (const am of attrs.matchAll(/\[([A-Za-z_][A-Za-z0-9_]*)\]\s*=/g)) {
-        const inputName = am[1];
-        if (SKIP_AUTO_INPUT.has(inputName) || inputName.startsWith('attr.')) continue;
-        if (!needed.has(file)) needed.set(file, new Set());
-        needed.get(file).add(inputName);
-      }
+      const ident = expr.match(/^([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+      const nullable = ident ? parentFieldAllowsNull(parentTs, ident) : false;
+      if (!needed.has(file)) needed.set(file, new Map());
+      const prev = needed.get(file).get(inputName) || { nullable: false };
+      needed.get(file).set(inputName, { nullable: prev.nullable || nullable });
     }
   }
 
-  for (const [file, names] of needed) {
+  for (const [file, inputs] of needed) {
     let source = fs.readFileSync(file, 'utf-8');
     const original = source;
-    for (const name of names) {
-      if (classHasMember(source, name)) continue;
-      source = ensureImport(source, 'Input', '@angular/core');
-      source = insertIntoClassBody(source, `  @Input() ${name}: any = null;`);
+    for (const [name, meta] of inputs) {
+      if (!classHasInput(source, name)) {
+        source = promoteFieldToInput(source, name);
+      }
+      if (meta.nullable) {
+        source = widenInputTypeToNullable(source, name);
+      }
     }
     if (source !== original) {
       source = repairNullAssignedPrimitives(source);
       fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+    }
+  }
+
+  for (const doc of htmlDocs) {
+    const { htmlFile, html, parentTs } = doc;
+    const next = html.replace(
+      /\[([A-Za-z_][A-Za-z0-9_]*)\]="([A-Za-z_][A-Za-z0-9_]*)"/g,
+      (full, inputName, ident, offset) => {
+        if (skipAutoInputName(inputName)) return full;
+        if (!parentFieldAllowsNull(parentTs, ident)) return full;
+        const tag = nearestOpenTagName(html, offset);
+        if (skipNullableWrapTag(tag)) return full;
+        const childFile = resolveChildComponentFile(tag, bySelector, byClass);
+        if (childFile) {
+          let childSrc = '';
+          try {
+            childSrc = fs.readFileSync(childFile, 'utf-8');
+          } catch {
+            childSrc = '';
+          }
+          if (childSrc && inputAllowsNull(childSrc, inputName)) return full;
+        }
+        return `[${inputName}]="$any(${ident})"`;
+      }
+    );
+    if (next !== html) {
+      fs.writeFileSync(htmlFile, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
     }
   }
 }
@@ -3239,6 +3877,11 @@ const BARE_OUTPUT_ALIASES = new Set(
   [...PROMOTE_TO_OUTPUT].map((n) => outputNameWithoutOnPrefix(n)).filter(Boolean)
 );
 
+function isLikelyOutputBindingName(name) {
+  const n = String(name || '');
+  return PROMOTE_TO_OUTPUT.has(n) || BARE_OUTPUT_ALIASES.has(n);
+}
+
 function nearestOpenTagName(html, index) {
   const before = String(html || '').slice(0, index);
   const lt = before.lastIndexOf('<');
@@ -3254,6 +3897,9 @@ function resolveChildComponentFile(tag, bySelector, byClass) {
   if (!raw) return null;
   const lower = raw.toLowerCase();
   if (bySelector.has(lower)) return bySelector.get(lower);
+  const stripped = lower.replace(/^app-/, '');
+  if (stripped && bySelector.has(stripped)) return bySelector.get(stripped);
+  if (stripped && bySelector.has(`app-${stripped}`)) return bySelector.get(`app-${stripped}`);
   if (byClass.has(raw)) return byClass.get(raw);
   if (byClass.has(`${raw}Component`)) return byClass.get(`${raw}Component`);
   const kebab = raw
@@ -3263,7 +3909,49 @@ function resolveChildComponentFile(tag, bySelector, byClass) {
   if (bySelector.has(kebab)) return bySelector.get(kebab);
   const withApp = kebab.startsWith('app-') ? kebab : `app-${kebab}`;
   if (bySelector.has(withApp)) return bySelector.get(withApp);
+  const noApp = kebab.replace(/^app-/, '');
+  if (noApp && bySelector.has(noApp)) return bySelector.get(noApp);
+  for (const [sel, file] of bySelector) {
+    if (sel === lower || (stripped && (sel.endsWith(`-${stripped}`) || sel.endsWith(stripped)))) {
+      return file;
+    }
+  }
+  const pascal = noApp
+    .split('-')
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join('');
+  if (pascal && byClass.has(pascal)) return byClass.get(pascal);
+  if (pascal && byClass.has(`${pascal}Component`)) return byClass.get(`${pascal}Component`);
   return null;
+}
+
+function repairNg8002MissingInputs(destPath, buildErrors) {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  if (!/NG8002|Can't bind to/.test(text)) return 0;
+  const srcRoot = path.join(destPath, 'src');
+  const { bySelector, byClass } = indexAngularComponents(srcRoot);
+  let changed = 0;
+  for (const m of text.matchAll(
+    /Can't bind to '([^']+)' since it isn't a known property of '([^']+)'/g
+  )) {
+    const inputName = m[1];
+    const tag = m[2];
+    if (skipAutoInputName(inputName) || isLikelyOutputBindingName(inputName)) continue;
+    const file = resolveChildComponentFile(tag, bySelector, byClass);
+    if (!file || !fs.existsSync(file)) continue;
+    let source = fs.readFileSync(file, 'utf-8');
+    const original = source;
+    source = promoteFieldToInput(source, inputName);
+    if (source !== original) {
+      fs.writeFileSync(file, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Added missing @Input() bindings for NG8002 in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 function indexAngularComponents(srcRoot) {
@@ -3588,12 +4276,17 @@ function ensureNgSymbolsFromBuildErrors(source, buildErrors) {
   const inDecorator = new Set(parseDecoratorImportItems(updated));
   const seen = new Set();
   for (const m of text.matchAll(/\b([A-Z][A-Za-z0-9]*)\b/g)) {
-    const symbol = m[1];
+    const symbol = canonicalMatDeclarable(m[1]);
     if (seen.has(symbol)) continue;
     seen.add(symbol);
-    if (!inDecorator.has(symbol) && !/^Mat[A-Z]/.test(symbol)) continue;
+    if (!inDecorator.has(symbol) && !inDecorator.has(m[1]) && !/^Mat[A-Z]/.test(symbol)) continue;
     const pkg = inferDeclarablePackage(symbol, updated);
     if (!pkg) continue;
+    if (symbol !== m[1]) {
+      const fakeFrom = findImportPathForSymbol(updated, m[1]);
+      if (fakeFrom) updated = removeNamedImport(updated, m[1], fakeFrom);
+      updated = removeDecoratorImport(updated, m[1]);
+    }
     updated = ensureImport(updated, symbol, pkg);
     updated = ensureDecoratorImport(updated, symbol);
   }
@@ -3974,7 +4667,19 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /TS2531/.test(text) ||
     /Object is possibly 'null'/.test(text) ||
     /is not assignable to type '\w+'/.test(text) ||
+    /is not assignable to type/.test(text) ||
     /Type 'string' is not assignable to type/.test(text);
+  const lifecycleIssues =
+    /TS2420/.test(text) ||
+    /incorrectly implements interface/.test(text) ||
+    /Property 'ngOnInit' is missing/.test(text) ||
+    /Property 'ngOnDestroy' is missing/.test(text);
+  const bindingIssues =
+    /NG8002/.test(text) ||
+    /Can't bind to/.test(text) ||
+    /isn['’]t a known property/.test(text) ||
+    /is not a known property/.test(text) ||
+    (/Error occurs in the template/.test(text) && /\[[A-Za-z_][\w]*\]=/.test(text));
   const arityIssues =
     /TS2554/.test(text) ||
     /Expected 0 arguments, but got 1/.test(text);
@@ -3999,9 +4704,20 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /Unknown reference/.test(text) ||
     /is not a known element/.test(text) ||
     /is not a known attribute/.test(text) ||
+    /Can't bind to/.test(text) ||
+    /NG8002/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
     /has no exported member/.test(text);
-  if (!needs && !eventIssues && !typeIssues && !arityIssues && !moduleIssues && !duplicateIssues) {
+  if (
+    !needs &&
+    !eventIssues &&
+    !typeIssues &&
+    !arityIssues &&
+    !moduleIssues &&
+    !duplicateIssues &&
+    !lifecycleIssues &&
+    !bindingIssues
+  ) {
     return 0;
   }
 
@@ -4043,6 +4759,24 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       repairCallbackEmitInTemplates(destPath);
     } catch (err) {
       console.warn(`[postprocess] Output/emit repair failed: ${err.message}`);
+    }
+  }
+
+  if (lifecycleIssues) {
+    try {
+      repairMissingAngularLifecycleHooks(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Lifecycle hook repair failed: ${err.message}`);
+    }
+  }
+
+  if (bindingIssues || typeIssues || needs) {
+    try {
+      repairNg8002MissingInputs(destPath, text);
+      ensureInputsFromParentPropertyBindings(destPath);
+      ensureOutputsFromParentEventBindings(destPath);
+    } catch (err) {
+      console.warn(`[postprocess] Input binding repair failed: ${err.message}`);
     }
   }
 

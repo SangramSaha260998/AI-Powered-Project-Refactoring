@@ -102,9 +102,13 @@ src/
 - Matching \`.ts\` + \`.html\` + \`.scss\` triad per component.
 - \`styleUrl: './name.component.scss'\` (never \`.css\`).
 - \`standalone: true\` everywhere. \`providedIn: 'root'\` for app-wide services.
+- Only \`implements OnInit\` / \`OnDestroy\` when the class actually defines
+  \`ngOnInit()\` / \`ngOnDestroy()\`. In-memory UIs with no subscriptions skip both.
 - Clear names, small focused components, no dead code, no unused imports.
 - Strict typing; no \`any\` unless unavoidable. Public template API only
   (public/protected — never private in templates).
+- Angular templates: never leave JSX \`{expr}\` (that is ICU). Use \`{{ expr }}\`,
+  \`[attr]="expr"\`, and \`@if\` / \`@for\` with matching \`}\`.
 - Convert EVERY source feature. Do not keep a starter-kit tree. Do not drop
   pages to "auth + dashboard only" unless the user explicitly asks.
 
@@ -114,6 +118,15 @@ src/
 - Add/update sidebar forms MUST reset when closed (cancel, sidenav close, or
   after successful save): \`form.reset()\`, clear touched/dirty state, and clear
   the editing entity input so the next open starts empty / correctly hydrated.
+- Entity \`@Input()\`s bound from a nullable parent field (\`editingTask\`,
+  \`deletingTask\`, …) MUST be typed \`Entity | null\` — never required \`Entity\`.
+- NEVER put \`@Input()\` on an \`export interface\` field. \`[task]="deletingTask"\`
+  requires \`@Input() task\` on the **component class**. \`MAT_DIALOG_DATA\` /
+  \`TaskDeleteDialogData.task\` is not a template input.
+- Dialogs: pick one style. Either \`MatDialog.open(DialogComponent, { data })\`
+  with **no** \`<app-*-dialog [task]>\` in the parent template, or an inline
+  \`<app-task-delete-dialog [open] [task] (onClose)>\` whose class declares those
+  \`@Input\` / \`@Output\` members. Do not mix both.
 
 ### React best structure (MANDATORY)
 \`\`\`

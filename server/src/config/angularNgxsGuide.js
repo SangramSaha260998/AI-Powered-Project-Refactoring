@@ -430,6 +430,8 @@ export class FeatureListComponent implements OnInit, OnDestroy {
 \`\`\`
 
 **Component rules:**
+- Only \`implements OnInit\` / \`OnDestroy\` when \`ngOnInit()\` / \`ngOnDestroy()\` exist.
+  In-memory UIs with no store fetch or subscriptions must omit both interfaces.
 - \`private list$ = this._store.select(FeatureState.selector)\` at class level.
 - Always \`dispatch(...).subscribe()\` for API actions (component waits for completion).
 - Use \`selectSnapshot(State.selector)\` for one-time read after dispatch success.

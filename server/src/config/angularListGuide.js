@@ -21,6 +21,12 @@ Use this for every **list/index** page under
 - Show skeleton loader on first load; show \`no-records-table\` when empty.
 - Use \`accessControl\` directive on action columns/buttons.
 - Unsubscribe all \`subscriptions\` in \`ngOnDestroy\`.
+- Only \`implements OnInit\` / \`OnDestroy\` when those methods exist. Skip both
+  for in-memory lists that do not fetch on init.
+- Confirmation / delete dialogs opened with \`MatDialog.open()\` must **not** also
+  appear as \`<app-task-delete-dialog [task]="deletingTask">\` in the list template.
+  If you keep a child tag, that child **class** needs \`@Input()\` / \`@Output()\`
+  for every binding — never decorate interface fields.
 
 ---
 

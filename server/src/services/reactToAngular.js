@@ -4,7 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairMismatchedHtmlClosingTags, repairInferredTemplateHandlers } from './postprocess.js';
+import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairMismatchedHtmlClosingTags, repairInferredTemplateHandlers, repairJsxAndIcuBraces } from './postprocess.js';
 
 export function isReactBootstrapPath(rel) {
   const p = String(rel || '').replace(/\\/g, '/');
@@ -367,6 +367,7 @@ function convertJsxToAngularHtml(jsx) {
   h = convertCustomTags(h);
   h = closeCustomSelfClosing(h);
   h = convertInterpolations(h);
+  h = repairJsxAndIcuBraces(h);
   h = cleanupHtml(h);
   if (/<mat-sidenav\b/.test(h) && !/<mat-sidenav-container\b/.test(h)) {
     h = unwrapRootLayoutAroundSidenav(h);

@@ -40,7 +40,9 @@ import {
   repairMismatchedHtmlClosingTags,
   repairZeroArgTemplateCalls,
   ensureAngularAppModels,
-  dedupeDuplicateClassMembers
+  dedupeDuplicateClassMembers,
+  repairMissingAngularLifecycleHooks,
+  repairJsxAndIcuBraces
 } from '../src/services/postprocess.js';
 import { rewriteHtmlLucideToInlineSvg } from '../src/services/lucideInlineSvg.js';
 import {
@@ -1499,6 +1501,14 @@ export class HostPageComponent {}
   assert(htmlNeeded.includes('MatTreeModule'), 'template <mat-tree> needs MatTreeModule');
   assert(htmlNeeded.includes('MatGridListModule'), 'template <mat-grid-list> needs MatGridListModule');
   assert(htmlNeeded.includes('MatButtonModule'), 'mat-flat-button attribute needs MatButtonModule');
+  const suffixNeeded = declarablesNeededByHtml(
+    `<mat-form-field appearance="outline"><input matInput /><button matIconButton matSuffix type="button"><mat-icon>close</mat-icon></button></mat-form-field>`
+  );
+  assert(suffixNeeded.includes('MatFormFieldModule'), 'matSuffix needs MatFormFieldModule');
+  assert(suffixNeeded.includes('MatInputModule'), 'matInput needs MatInputModule');
+  assert(suffixNeeded.includes('MatButtonModule'), 'matIconButton needs MatButtonModule');
+  assert(!suffixNeeded.includes('MatSuffixModule'), 'matSuffix does not invent MatSuffixModule');
+  assert(!suffixNeeded.includes('MatIconButtonModule'), 'matIconButton does not invent MatIconButtonModule');
 }
 
 // --- Mat-table defs must use @angular/material/table, not fake *-def entry points ---
@@ -2055,6 +2065,81 @@ src/app/pages/item-list/item-list.component.html:32:0: </mat-sidenav-content>
 }
 
 {
+  const leftover = `
+<mat-select [ngModel]="statusFilter">
+  <mat-option value="all">All statuses</mat-option>
+  {statusOptions.map((status) => (
+    <mat-option key={status} value={status}>
+      {statusLabels[status]}
+    </mat-option>
+  ))}
+</mat-select>
+@if (search) {
+  <button type="button" (click)="search = ''">
+    <mat-icon>close</mat-icon>
+  </button>
+`;
+  const fixed = repairJsxAndIcuBraces(leftover);
+  assert(/@for\s*\(\s*status of statusOptions;\s*track status\)/.test(fixed), 'JSX .map becomes @for');
+  assert(/\{\{\s*statusLabels\[status\]\s*\}\}/.test(fixed), 'JSX {statusLabels[status]} becomes interpolation');
+  assert(/\[value\]="status"/.test(fixed), 'JSX value={status} becomes [value]');
+  assert(!/key=\{/.test(fixed), 'React key={} is stripped');
+  assert(!/\{statusOptions\.map/.test(fixed), 'JSX map opener is gone');
+  assert(/@if\s*\(\s*search\s*\)\s*\{/.test(fixed) && /<\/button>\s*\}/s.test(fixed), 'unclosed @if gets a closing brace');
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng5002-icu-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  statusOptions: string[] = [];
+  statusLabels: Record<string, string> = {};
+  search = '';
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'task-list.component.html'),
+    `<mat-select>
+  {statusOptions.map((status) => (
+    <mat-option value={status}>{statusLabels[status]}</mat-option>
+  ))}
+</mat-select>
+@if (search) {
+  <button type="button">clear</button>
+`
+  );
+  const n = fixAngularCompileErrors(
+    tmp,
+    `NG5002: Invalid ICU message. Missing '}'.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:77:0:
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:45:15: templateUrl: './task-list.component.html'
+NG5002: Unexpected character "EOF" (Do you have an unescaped "{" in your template? Use "{{ '{' }}" to escape it.)
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:77:0:
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:45:15: templateUrl: './task-list.component.html'
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs NG5002 ICU / unescaped braces');
+  const html = fs.readFileSync(path.join(dir, 'task-list.component.html'), 'utf-8');
+  assert(/@for\s*\(\s*status of statusOptions/.test(html), 'compile repair converts leftover .map');
+  assert(/\{\{\s*statusLabels\[status\]\s*\}\}/.test(html), 'compile repair converts ICU {expr}');
+  assert(!/\{statusOptions\.map/.test(html), 'compile repair removes JSX map');
+  assert(/<\/button>\s*\}/s.test(html), 'compile repair closes unclosed @if');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
   const voidHtml = `<mat-form-field appearance="outline"><mat-label>Title</mat-label><input matInput [value]="title"></input></mat-form-field>`;
   const fixedVoid = repairSelfClosingNonVoidTags(voidHtml);
   assert(!/<\/input>/.test(fixedVoid), 'void input end tags are stripped');
@@ -2342,6 +2427,59 @@ Unknown reference.
 }
 
 {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-mat-suffix-'));
+  const dir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { MatFormFieldModule, MatSuffixModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
+import { MatIconModule } from '@angular/material/icon';
+import { MatButtonModule } from '@angular/material/button';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [MatFormFieldModule, MatInputModule, MatIconModule, MatButtonModule, MatSuffixModule],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  search = '';
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dir, 'task-list.component.html'),
+    `<mat-form-field appearance="outline">
+  <input matInput [(ngModel)]="search" />
+  <button matIconButton matSuffix type="button" (click)="search = ''">
+    <mat-icon>close</mat-icon>
+  </button>
+</mat-form-field>
+`
+  );
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2305: Module '"@angular/material/form-field"' has no exported member 'MatSuffixModule'.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.ts:10:29:
+  import { MatFormFieldModule, MatSuffixModule } from '@angular/material/form-field';
+NG1010: 'imports' must be an array of components, directives, pipes, or NgModules. Value could not be determined statically.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.ts:43:286:
+  imports: [MatFormFieldModule, MatInputModule, MatIconModule, MatButtonModule, MatSuffixModule],
+Unknown reference.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:43:286:
+  MatSuffixModule
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs hallucinated MatSuffixModule');
+  const ts = fs.readFileSync(path.join(dir, 'task-list.component.ts'), 'utf-8');
+  assert(!/\bMatSuffixModule\b/.test(ts), 'MatSuffixModule is removed');
+  assert(/MatFormFieldModule/.test(ts), 'MatFormFieldModule remains for matSuffix');
+  assert(/from '@angular\/material\/form-field'/.test(ts), 'form-field import remains');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ts2554-arity-'));
   const dir = path.join(tmp, 'src', 'app', 'components', 'item-editor');
   fs.mkdirSync(dir, { recursive: true });
@@ -2384,6 +2522,202 @@ src/app/components/item-editor/item-editor.component.ts:15:15:
   assert(/\(click\)="onSave\(\$event\)"/.test(html), 'one-arg onSave keeps $event');
   const n2 = repairZeroArgTemplateCalls(tmp, '');
   assert(n2 === 0, 'zero-arg template repair is idempotent');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ts2420-task-input-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const dialogDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-delete-dialog');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(dialogDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component, OnInit, OnDestroy } from '@angular/core';
+import { TaskDeleteDialogComponent } from '../../components/task-delete-dialog/task-delete-dialog.component';
+export interface Task { id: string; title: string; }
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskDeleteDialogComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent implements OnInit, OnDestroy {
+  deletingTask: Task | null = null;
+  onDeleteClose(_confirmed: boolean): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-delete-dialog [open]="deletingTask !== null" [task]="deletingTask" (close)="onDeleteClose($event)" />\n`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component, EventEmitter, Input, Output } from '@angular/core';
+export interface Task { id: string; title: string; }
+@Component({
+  selector: 'app-task-delete-dialog',
+  standalone: true,
+  templateUrl: './task-delete-dialog.component.html'
+})
+export class TaskDeleteDialogComponent {
+  @Input() open = false;
+  @Input() task: Task;
+  @Output() close = new EventEmitter<boolean>();
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.html'),
+    `<p>{{ task?.title }}</p>\n`
+  );
+
+  const errText = `[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:58:63: [task]="deletingTask" (close)="onDeleteClose"
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:46:15: templateUrl: './task-list.component.html'
+TS2420: Class 'TaskListComponent' incorrectly implements interface 'OnInit'. Property 'ngOnInit' is missing in type 'TaskListComponent' but required in type 'OnInit'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:49:13: export class TaskListComponent implements OnInit, OnDestroy {
+`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  assert(n >= 1, 'fixAngularCompileErrors repairs TS2420 and nullable [task] binding');
+  const listTs = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  const dialogTs = fs.readFileSync(path.join(dialogDir, 'task-delete-dialog.component.ts'), 'utf-8');
+  assert(/ngOnInit\s*\(\s*\)\s*:\s*void/.test(listTs), 'missing ngOnInit is stubbed');
+  assert(/ngOnDestroy\s*\(\s*\)\s*:\s*void/.test(listTs), 'missing ngOnDestroy is stubbed');
+  assert(
+    /@Input\(\)\s+task:\s*Task\s*\|\s*null/.test(dialogTs),
+    'child [task] input accepts Task | null'
+  );
+
+  const n2 = repairMissingAngularLifecycleHooks(tmp, errText);
+  assert(n2 === 0, 'lifecycle hook repair is idempotent');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng8002-task-input-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'task-list');
+  const dialogDir = path.join(tmp, 'src', 'app', 'components', 'task-delete-dialog');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(dialogDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { TaskDeleteDialogComponent } from '../../components/task-delete-dialog/task-delete-dialog.component';
+export interface Task { id: string; title: string; }
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskDeleteDialogComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  deletingTask: Task | null = null;
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-delete-dialog [open]="deletingTask !== null" [task]="deletingTask"></app-task-delete-dialog>\n`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({
+  selector: 'app-task-delete-dialog',
+  standalone: true,
+  templateUrl: './task-delete-dialog.component.html'
+})
+export class TaskDeleteDialogComponent {}
+`
+  );
+  fs.writeFileSync(path.join(dialogDir, 'task-delete-dialog.component.html'), `<p>Delete?</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `NG8002: Can't bind to 'task' since it isn't a known property of 'app-task-delete-dialog'.
+[plugin angular-compiler] src/app/pages/task-list/task-list.component.html:1:40: [task]="deletingTask"
+Error occurs in the template of component TaskListComponent.
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors repairs NG8002 missing [task] input');
+  const dialogTs = fs.readFileSync(path.join(dialogDir, 'task-delete-dialog.component.ts'), 'utf-8');
+  assert(/@Input\(\)\s+task\s*:/.test(dialogTs), 'missing task input is added');
+  assert(/@Input\(\)\s+open\s*:/.test(dialogTs), 'missing open input is added');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng8002-dialog-data-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const dialogDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-delete-dialog');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(dialogDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { TaskDeleteDialogComponent } from '../../components/task-delete-dialog/task-delete-dialog.component';
+export interface Task { id: string; title: string; }
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskDeleteDialogComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  deletingTask: Task | null = null;
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-delete-dialog
+  [open]="deletingTask !== null"
+  [task]="deletingTask"
+  (close)="onDeleteClose($event)"
+/>
+`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component, Inject } from '@angular/core';
+import { MAT_DIALOG_DATA, MatDialogRef } from '@angular/material/dialog';
+export interface Task { id: string; title: string; }
+export interface TaskDeleteDialogData {
+  task: Task;
+}
+@Component({
+  selector: 'app-task-delete-dialog',
+  standalone: true,
+  templateUrl: './task-delete-dialog.component.html'
+})
+export class TaskDeleteDialogComponent {
+  constructor(
+    private readonly dialogRef: MatDialogRef<TaskDeleteDialogComponent, boolean>,
+    @Inject(MAT_DIALOG_DATA) public data: TaskDeleteDialogData
+  ) {}
+}
+`
+  );
+  fs.writeFileSync(path.join(dialogDir, 'task-delete-dialog.component.html'), `<p>{{ data.task.title }}</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `NG8002: Can't bind to 'task' since it isn't a known property of 'app-task-delete-dialog'. 1. If 'app-task-delete-dialog' is an Angular component and it has 'task' input, then verify that it is included in the '@Component.imports' of this component.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:65:6: [task]="deletingTask"
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:42:15: templateUrl: './task-list.component.html'
+`
+  );
+  assert(n >= 1, 'fixAngularCompileErrors adds @Input() task on MatDialog-style child');
+  const dialogTs = fs.readFileSync(path.join(dialogDir, 'task-delete-dialog.component.ts'), 'utf-8');
+  assert(/export class TaskDeleteDialogComponent[\s\S]*@Input\(\)\s+task\s*:/s.test(dialogTs), 'class has @Input() task');
+  assert(/export class TaskDeleteDialogComponent[\s\S]*@Input\(\)\s+open\s*:/s.test(dialogTs), 'class has @Input() open');
+  assert(/from '@angular\/core'/.test(dialogTs) && /Input/.test(dialogTs), 'Input is imported from @angular/core');
+  assert(!/export interface TaskDeleteDialogData \{[^}]*@Input\(\)/.test(dialogTs), 'interface task field is not decorated');
+  assert(/task:\s*Task/.test(dialogTs), 'dialog data interface still has task');
+  assert(/@Output\(\)\s+close\s*=/.test(dialogTs), 'parent (close) becomes @Output() close');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

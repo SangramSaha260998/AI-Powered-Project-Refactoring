@@ -6,7 +6,8 @@ import {
   rewriteHtmlLucideToInlineSvg,
   stripLucidePackageUsage,
   normalizeLucideSlug,
-  resolveLucidePascalName
+  resolveLucidePascalName,
+  isLucideIconComponentSymbol
 } from './lucideInlineSvg.js';
 import { WEB_ANGULAR_PATH_ALIASES, webAngularNpmDeps } from '../config/webAngular.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
@@ -442,6 +443,147 @@ export function dedupeDuplicateClassMembers(source) {
     updated = `${updated.slice(0, cut.start)}${updated.slice(cut.end)}`;
   }
   return updated.replace(/\n{3,}/g, '\n\n');
+}
+
+function projectRootFromSrcFile(tsPath) {
+  const norm = String(tsPath || '').replace(/\\/g, '/');
+  const idx = norm.indexOf('/src/');
+  if (idx >= 0) return norm.slice(0, idx);
+  return path.dirname(path.dirname(path.dirname(tsPath)));
+}
+
+function taskModelImportPath(source, tsPath, destPath) {
+  const m = String(source || '').match(/from\s+['"]([^'"]*models\/[^'"]+)['"]/);
+  if (m) return m[1];
+  const shape = readTaskInterfaceShape(destPath);
+  if (shape?.file && tsPath) return relativeModulePath(tsPath, shape.file);
+  return '../../models/task.model';
+}
+
+/**
+ * TaskStatus is a string union in the copied model; templates must not use
+ * `{ id, label }` objects (`status.id` / `status.label`).
+ */
+function repairTaskStatusOptionAccess(html) {
+  let h = String(html || '');
+  if (!/statusOptions|status\.(?:id|label|value|name)/.test(h)) return h;
+
+  h = h.replace(
+    /@for\s*\(\s*(\w+)\s+of\s+statusOptions;\s*track\s+\1\.(?:id|value)\s*\)/g,
+    '@for ($1 of statusOptions; track $1)'
+  );
+
+  const loopVars = [
+    ...new Set([...h.matchAll(/@for\s*\(\s*(\w+)\s+of\s+statusOptions/g)].map((m) => m[1]))
+  ];
+  for (const v of loopVars) {
+    h = h.replace(new RegExp(`\\[value\\]="${v}\\.(?:id|value)"`, 'g'), `[value]="${v}"`);
+    h = h.replace(
+      new RegExp(`\\{\\{\\s*${v}\\.(?:label|name)\\s*\\}\\}`, 'g'),
+      `{{ statusLabels[${v}] }}`
+    );
+  }
+
+  if (loopVars.length === 0) {
+    h = h.replace(/\[value\]="status\.(?:id|value)"/g, '[value]="status"');
+    h = h.replace(/\{\{\s*status\.(?:label|name)\s*\}\}/g, '{{ statusLabels[status] }}');
+  }
+
+  return h;
+}
+
+function ensureTaskStatusOptionFields(source, html, tsPath, destPath) {
+  let updated = String(source || '');
+  const h = String(html || '');
+  const needsOptions = /statusOptions/.test(h) || /statusOptions/.test(updated);
+  const needsLabels = /statusLabels\[/.test(h) || /status\.(?:label|name)/.test(h);
+  if (!needsOptions && !needsLabels) return updated;
+
+  const modelRel = taskModelImportPath(updated, tsPath, destPath);
+  const shape = readTaskInterfaceShape(destPath);
+
+  if (needsLabels) {
+    updated = updated.replace(
+      /(?:readonly\s+)?statusLabels\s*:\s*Record<[^>]+>\s*=\s*\{\s*\}\s*;/g,
+      'readonly statusLabels = TASK_STATUS_LABELS;'
+    );
+    updated = updated.replace(
+      /(?:readonly\s+)?statusLabels\s*:\s*\{\s*\[key:\s*string\]\s*:\s*string\s*\}\s*=\s*\{\s*\}\s*;/g,
+      'readonly statusLabels = TASK_STATUS_LABELS;'
+    );
+    if (!/\bstatusLabels\s*=\s*TASK_STATUS_LABELS/.test(updated) && !/\bstatusLabels\b/.test(updated)) {
+      updated = insertIntoClassBody(updated, '  readonly statusLabels = TASK_STATUS_LABELS;\n');
+    }
+    updated = ensureImport(updated, 'TASK_STATUS_LABELS', modelRel);
+  }
+
+  if (needsOptions) {
+    updated = updated.replace(
+      /(?:readonly\s+)?statusOptions\s*:\s*(?:string\[\]|TaskStatus\[\])\s*=\s*\[\s*\]\s*;/g,
+      'readonly statusOptions = TASK_STATUS_OPTIONS;'
+    );
+    if (!/\bstatusOptions\s*=\s*TASK_STATUS_OPTIONS/.test(updated) && !/\bstatusOptions\b/.test(updated)) {
+      updated = insertIntoClassBody(updated, '  readonly statusOptions = TASK_STATUS_OPTIONS;\n');
+    }
+    updated = ensureImport(updated, 'TASK_STATUS_OPTIONS', modelRel);
+    if (shape?.statusTypeName) {
+      updated = ensureImport(updated, shape.statusTypeName, modelRel);
+    }
+  }
+
+  return updated;
+}
+
+export function repairTaskStatusOptionTemplates(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.(?:ts|html))/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+
+  const htmlCandidates = new Set();
+  for (const file of mentioned) {
+    if (file.endsWith('.html') && fs.existsSync(file)) htmlCandidates.add(file);
+    if (file.endsWith('.ts') && fs.existsSync(file.replace(/\.ts$/, '.html'))) {
+      htmlCandidates.add(file.replace(/\.ts$/, '.html'));
+    }
+  }
+  if (htmlCandidates.size === 0) {
+    for (const f of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.html'))) {
+      const content = fs.readFileSync(f, 'utf-8');
+      if (/status\.(?:id|label|value)/.test(content) || /statusOptions/.test(content)) {
+        htmlCandidates.add(f);
+      }
+    }
+  }
+
+  let changed = 0;
+  for (const htmlFile of htmlCandidates) {
+    const tsFile = htmlFile.replace(/\.html$/, '.ts');
+    if (!fs.existsSync(tsFile)) continue;
+
+    let html = fs.readFileSync(htmlFile, 'utf-8');
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const origHtml = html;
+    const origSource = source;
+
+    html = repairTaskStatusOptionAccess(html);
+    source = ensureTaskStatusOptionFields(source, html, tsFile, destPath);
+
+    if (html !== origHtml) {
+      fs.writeFileSync(htmlFile, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+      changed += 1;
+    }
+    if (source !== origSource) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired task status option templates in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 /**
@@ -917,6 +1059,213 @@ function fieldFromValueHandler(name) {
 function fieldFromBlurHandler(name) {
   const m = String(name || '').match(/^(?:on|handle)([A-Z]\w+)Blur$/);
   return m ? uncapitalizeIdent(m[1]) : '';
+}
+
+function methodAssignsFieldInSource(source, methodName, field) {
+  const escMethod = String(methodName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escField = String(field || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escMethod || !escField) return false;
+  return new RegExp(
+    `\\b${escMethod}\\s*\\([^)]*\\)\\s*(?::[^{]+)?\\{[^}]*\\b(?:this\\.)?${escField}\\s*=`,
+    's'
+  ).test(String(source || ''));
+}
+
+function dedupeDuplicateDataSourceField(source) {
+  const re = /(?:(?:public|protected|private|readonly)\s+)*\bdataSource\s*=\s*new\s+MatTableDataSource[^;]+;/g;
+  const matches = [...String(source || '').matchAll(re)];
+  if (matches.length <= 1) return source;
+  let updated = String(source || '');
+  for (let i = matches.length - 1; i >= 1; i--) {
+    const m = matches[i];
+    if (m.index == null) continue;
+    updated = `${updated.slice(0, m.index)}${updated.slice(m.index + m[0].length)}`;
+  }
+  return updated.replace(/\{\s*;/g, '{ ').replace(/;\s*;/g, ';');
+}
+
+/**
+ * mat-table repair adds `dataSource = new MatTableDataSource(...)` while AI also
+ * stubs `@Input() dataSource: any` → TS2300 / TS2717.
+ */
+const TASKS_INPUT_FIELD_LINE_RE =
+  /^[ \t]*@Input\s*\([^)]*\)\s+(?:(?:public|protected|private|readonly)\s+)*tasks\s*!?:[^;\n]*;\s*\n?/gm;
+const TASKS_INPUT_FIELD_INLINE_RE =
+  /@Input\s*\([^)]*\)\s+(?:(?:public|protected|private|readonly)\s+)*tasks\s*!?:\s*([^;\n=]+)(?:\s*=\s*[^;]+)?;/;
+const TASKS_INPUT_ACCESSOR_BLOCK_RE =
+  /@Input\s*\([^)]*\)\s+set\s+tasks\s*\([^)]*\)\s*\{[\s\S]*?\}\s*\n\s*get\s+tasks\s*\(\)\s*:[^{]+\{[\s\S]*?\}\s*\n\s*private\s+_tasks\s*:[^;]+;/g;
+
+function dedupeMatTableTasksInput(source) {
+  let updated = String(source || '');
+  if (/\bset\s+tasks\s*\(/.test(updated)) {
+    updated = updated.replace(TASKS_INPUT_FIELD_LINE_RE, '');
+  }
+  const blocks = [...updated.matchAll(TASKS_INPUT_ACCESSOR_BLOCK_RE)];
+  if (blocks.length > 1) {
+    for (let i = blocks.length - 1; i >= 1; i--) {
+      const b = blocks[i];
+      if (b.index == null) continue;
+      updated = `${updated.slice(0, b.index)}${updated.slice(b.index + b[0].length)}`;
+    }
+  }
+  return updated;
+}
+
+function repairMatTableDataSourceConflicts(source) {
+  let updated = String(source || '');
+  const hasDsField = /\bdataSource\s*=\s*new\s+MatTableDataSource/.test(updated);
+  const hasInputDs = /@Input\s*\([^)]*\)\s+dataSource\b/.test(updated);
+
+  if (hasInputDs) {
+    updated = updated.replace(
+      /^[ \t]*@Input\s*\([^)]*\)\s+dataSource\s*!?:[^;\n]*;\s*\n?/gm,
+      ''
+    );
+  }
+
+  const tasksMatch = updated.match(TASKS_INPUT_FIELD_INLINE_RE);
+  if (
+    tasksMatch &&
+    (hasDsField || /\bdataSource\s*=\s*new\s+MatTableDataSource/.test(updated)) &&
+    !/\bset\s+tasks\s*\(/.test(updated)
+  ) {
+    const typeName = tasksMatch[1].trim();
+    updated = updated.replace(
+      TASKS_INPUT_FIELD_INLINE_RE,
+      `@Input() set tasks(value: ${typeName}) {
+    this._tasks = value || [];
+    this.dataSource.data = this._tasks;
+  }
+  get tasks(): ${typeName} {
+    return this._tasks;
+  }
+  private _tasks: ${typeName} = [];`
+    );
+  }
+
+  updated = dedupeMatTableTasksInput(updated);
+
+  if (/\bdataSource\b/.test(updated)) {
+    updated = dedupeDuplicateDataSourceField(updated);
+  }
+  return updated;
+}
+
+function methodFirstParamType(source, methodName) {
+  const method = extractNamedMethod(source, methodName);
+  if (!method) return null;
+  const sig = String(method.signature || '').trim();
+  if (!sig) return null;
+  const first = sig.split(',')[0].trim();
+  if (!first.includes(':')) return null;
+  return first.split(':').slice(1).join(':').trim();
+}
+
+function isTrivialFieldSetter(method, field) {
+  if (!method || !field) return false;
+  const body = String(method.body || '')
+    .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+    .trim();
+  const lines = body.split(';').map((s) => s.trim()).filter(Boolean);
+  if (lines.length !== 1) return false;
+  const esc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const firstParam = String(method.signature || '').split(',')[0].trim();
+  const param = firstParam.includes(':')
+    ? firstParam.split(':')[0].trim()
+    : firstParam.split(/\s+/)[0];
+  const escParam = param
+    ? param.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    : '\\w+';
+  return new RegExp(`^(?:this\\.)?${esc}\\s*=\\s*${escParam}$`).test(lines[0]);
+}
+
+function openTagChunk(html, offset) {
+  const before = String(html || '').slice(0, offset);
+  const tagStart = before.lastIndexOf('<');
+  if (tagStart < 0) return '';
+  const after = String(html || '').slice(offset);
+  const tagEnd = after.indexOf('>');
+  return String(html).slice(tagStart, offset + (tagEnd >= 0 ? tagEnd + 1 : 0));
+}
+
+function ngModelFieldOnTag(html, offset) {
+  const chunk = openTagChunk(html, offset);
+  const m = chunk.match(/\[ngModel\]\s*=\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
+
+/**
+ * TS2345: `(ngModelChange)="onSearchChange($event)"` is typed as DOM `Event` when
+ * FormsModule is missing or the handler should receive the model value (string).
+ */
+function repairNgModelValueEventBindings(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const srcRoot = path.join(destPath, 'src');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.(?:html|ts))/g)) {
+    mentioned.add(
+      path
+        .join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, ''))
+        .replace(/\.html$/, '.ts')
+    );
+  }
+  const tsFiles =
+    mentioned.size > 0
+      ? [...mentioned].filter((f) => fs.existsSync(f))
+      : walkFiles(srcRoot, (n) => n.endsWith('.component.ts'));
+
+  let changed = 0;
+  for (const tsFile of tsFiles) {
+    const htmlFile = tsFile.replace(/\.ts$/, '.html');
+    if (!fs.existsSync(htmlFile)) continue;
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    let html = fs.readFileSync(htmlFile, 'utf-8');
+    const originalSource = source;
+    const originalHtml = html;
+
+    if (/\bngModel\b|\(ngModelChange\)/.test(html)) {
+      source = ensureImport(source, 'FormsModule', '@angular/forms');
+      source = ensureDecoratorImport(source, 'FormsModule');
+    }
+
+    html = html.replace(
+      /\(ngModelChange\)\s*=\s*"([A-Za-z_]\w*)\(\$event\)"/g,
+      (full, handler, offset) => {
+        if (/\$any\(\s*\$event\s*\)/.test(full)) return full;
+        const ngModelField = ngModelFieldOnTag(html, offset);
+        const inferredField = fieldFromValueHandler(handler);
+        const field = ngModelField || inferredField;
+        const method = extractNamedMethod(source, handler);
+        const paramType = methodFirstParamType(source, handler);
+        const assignsField =
+          field &&
+          (isTrivialFieldSetter(method, field) || methodAssignsFieldInSource(source, handler, field));
+        if (field && (assignsField || (ngModelField && inferredField === ngModelField))) {
+          return `(ngModelChange)="${field} = $event"`;
+        }
+        if (paramType && !/\bEvent\b/.test(paramType)) {
+          return `(ngModelChange)="${handler}($any($event))"`;
+        }
+        if (field || /string/.test(String(paramType || ''))) {
+          return `(ngModelChange)="${handler}($any($event))"`;
+        }
+        return full;
+      }
+    );
+
+    if (source !== originalSource) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+    if (html !== originalHtml) {
+      fs.writeFileSync(htmlFile, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired ngModelChange value bindings in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 /**
@@ -1853,6 +2202,8 @@ export function repairJsxAndIcuBraces(html) {
  */
 function repairAngularTemplateHtml(html, source) {
   let updated = repairJsxAndIcuBraces(html);
+  updated = repairTaskStatusOptionAccess(updated);
+  updated = repairPhantomDirectiveTemplateAttrs(updated);
   updated = repairSelfClosingNonVoidTags(updated);
   updated = repairMismatchedHtmlClosingTags(updated);
 
@@ -1956,17 +2307,432 @@ function repairAngularTemplateHtml(html, source) {
   return updated;
 }
 
+/** Classes/types that must never appear in `@Component({ imports })`. */
+const NON_DECLARABLE_COMPONENT_IMPORTS = new Set([
+  'MatTableDataSource',
+  'MatDialog',
+  'MatDialogRef',
+  'MatSnackBar',
+  'MatSnackBarRef',
+  'FormGroup',
+  'FormControl',
+  'FormArray',
+  'FormBuilder',
+  'PageEvent',
+  'Observable',
+  'Subject',
+  'BehaviorSubject',
+  'Subscription',
+  'EventEmitter',
+  'Signal',
+  'WritableSignal',
+  'DestroyRef',
+  'Injector',
+  'ChangeDetectorRef',
+  'ElementRef',
+  'Renderer2',
+  'ViewContainerRef',
+  'TemplateRef',
+  'NgZone',
+  'ActivatedRoute',
+  'Router',
+  'Location',
+  'DatePipe',
+  'CurrencyPipe',
+  'DecimalPipe',
+  'PercentPipe',
+  'JsonPipe',
+  'AsyncPipe',
+  'TitleCasePipe',
+  'LowerCasePipe',
+  'UpperCasePipe',
+  'SlicePipe',
+  'KeyValuePipe'
+]);
+
+function resolveRelativeTsImport(tsPath, importPath) {
+  const rel = String(importPath || '').replace(/\.ts$/, '');
+  if (!rel.startsWith('.')) return null;
+  let abs = path.resolve(path.dirname(tsPath), rel);
+  if (fs.existsSync(`${abs}.ts`)) return `${abs}.ts`;
+  if (fs.existsSync(`${abs}.tsx`)) return `${abs}.tsx`;
+  if (fs.existsSync(path.join(abs, 'index.ts'))) return path.join(abs, 'index.ts');
+  return null;
+}
+
+function isWorkspacePathAlias(importPath) {
+  const p = String(importPath || '');
+  return (
+    /^@(app|core|shared|env|pages|store|configs)\//.test(p) ||
+    p.startsWith('@/')
+  );
+}
+
+function resolveAliasImportFile(destPath, importPath) {
+  const paths = {
+    ...WEB_ANGULAR_PATH_ALIASES,
+    ...(readJsonSafe(path.join(destPath, 'tsconfig.json'))?.compilerOptions?.paths || {}),
+    ...(readJsonSafe(path.join(destPath, 'tsconfig.app.json'))?.compilerOptions?.paths || {})
+  };
+  const wanted = String(importPath || '').replace(/\\/g, '/');
+  for (const [alias, targets] of Object.entries(paths)) {
+    if (!alias.endsWith('/*')) continue;
+    const prefix = alias.slice(0, -2);
+    if (!wanted.startsWith(`${prefix}/`)) continue;
+    const suffix = wanted.slice(prefix.length + 1);
+    for (const target of targets) {
+      const targetBase = String(target).replace(/\*$/, '').replace(/\/$/, '');
+      const abs = path.join(destPath, targetBase, suffix);
+      if (fs.existsSync(`${abs}.ts`)) return `${abs}.ts`;
+      if (fs.existsSync(path.join(abs, 'index.ts'))) return path.join(abs, 'index.ts');
+    }
+  }
+  return null;
+}
+
+function exportSymbolExists(filePath, symbol) {
+  if (!filePath || !fs.existsSync(filePath)) return false;
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const esc = String(symbol || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return (
+    new RegExp(`export\\s+(?:declare\\s+)?(?:class|function|const|let|var|interface|type|enum)\\s+${esc}\\b`).test(
+      content
+    ) || new RegExp(`export\\s*\\{[^}]*\\b${esc}\\b`).test(content)
+  );
+}
+
+function collectUnresolvedAliasImports(source, destPath) {
+  const unresolved = [];
+  const re = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s+['"]([^'"]+)['"]/g;
+  for (const m of String(source || '').matchAll(re)) {
+    const from = m[2];
+    if (!isWorkspacePathAlias(from)) continue;
+    const file = resolveAliasImportFile(destPath, from);
+    const symbols = m[1]
+      .split(',')
+      .map((s) => s.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    if (!file) {
+      for (const sym of symbols) unresolved.push({ sym, from });
+      continue;
+    }
+    for (const sym of symbols) {
+      if (!exportSymbolExists(file, sym)) unresolved.push({ sym, from });
+    }
+  }
+  return unresolved;
+}
+
+function repairUnresolvedAliasImports(source, tsPath, destPath) {
+  let updated = String(source || '');
+  const unresolved = collectUnresolvedAliasImports(updated, destPath);
+  if (!unresolved.length) return updated;
+  for (const { sym, from } of unresolved) {
+    updated = removeDecoratorImport(updated, sym);
+    updated = removeNamedImport(updated, sym, from);
+  }
+  updated = stripInvalidDecoratorImports(updated, tsPath);
+  return dedupeImports(updated);
+}
+
+function repairPhantomDirectiveTemplateAttrs(html) {
+  let h = String(html || '');
+  if (!/\b(appPagination|accessControl|clickOutside)\b/.test(h)) return h;
+  h = h.replace(/\s+appPagination\b/g, '');
+  h = h.replace(/\s+accessControl(?:="[^"]*")?/g, '');
+  h = h.replace(/\s+clickOutside\b/g, '');
+  return h;
+}
+
+function projectHasNpmPackage(destPath, packageName) {
+  const pkg = readJsonSafe(path.join(destPath, 'package.json'));
+  const name = String(packageName || '');
+  return Boolean(pkg?.dependencies?.[name] || pkg?.devDependencies?.[name]);
+}
+
+function stripNgxSkeletonLoaderMarkup(html) {
+  let h = String(html || '');
+  if (!/ngx-skeleton-loader/i.test(h)) return h;
+  while (/<ngx-skeleton-loader\b/i.test(h)) {
+    h = h.replace(/<ngx-skeleton-loader[\s\S]*?(?:\/>|<\/ngx-skeleton-loader>)/gi, '');
+  }
+  h = h.replace(
+    /@if\s*\(\s*isShowSkeletonLoader\s*\)\s*\{[\s\S]*?\}\s*@else\s*\{([\s\S]*?)\}/g,
+    '$1'
+  );
+  return h.replace(/\n{3,}/g, '\n\n');
+}
+
+function repairPhantomSkeletonLoaderSource(source, tsPath, destPath) {
+  if (projectHasNpmPackage(destPath, 'ngx-skeleton-loader')) return source;
+  let updated = String(source || '');
+  for (const sym of ['NgxSkeletonLoaderModule', 'NgxSkeletonLoaderComponent']) {
+    updated = removeDecoratorImport(updated, sym);
+    updated = removeNamedImport(updated, sym, 'ngx-skeleton-loader');
+  }
+  updated = updated.replace(/^\s*isShowSkeletonLoader\s*=\s*[^;\n]+;\s*\n?/gm, '');
+  updated = updated.replace(/^\s*isShowSkeletonLoader\s*:\s*boolean\s*=\s*[^;\n]+;\s*\n?/gm, '');
+  return dedupeImports(updated);
+}
+
+export function repairPhantomSkeletonLoader(destPath, buildErrors = '') {
+  if (projectHasNpmPackage(destPath, 'ngx-skeleton-loader')) return 0;
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.(?:ts|html))/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+  const tsFiles =
+    mentioned.size > 0
+      ? [...mentioned]
+          .filter((f) => f.endsWith('.ts') && fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'));
+
+  if (tsFiles.length === 0) {
+    for (const f of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.html'))) {
+      const content = fs.readFileSync(f, 'utf-8');
+      if (/ngx-skeleton-loader/i.test(content)) tsFiles.push(f.replace(/\.html$/, '.ts'));
+    }
+  }
+
+  let changed = 0;
+  for (const tsFile of [...new Set(tsFiles)].filter((f) => fs.existsSync(f))) {
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const originalSource = source;
+    source = repairPhantomSkeletonLoaderSource(source, tsFile, destPath);
+    const htmlPath = tsFile.replace(/\.ts$/, '.html');
+    if (fs.existsSync(htmlPath)) {
+      let html = fs.readFileSync(htmlPath, 'utf-8');
+      const originalHtml = html;
+      html = stripNgxSkeletonLoaderMarkup(html);
+      if (html !== originalHtml) {
+        fs.writeFileSync(htmlPath, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+        changed += 1;
+      }
+    }
+    if (source !== originalSource) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Removed ngx-skeleton-loader from ${changed} file(s)`);
+  }
+  return changed;
+}
+
+export function repairUnresolvedAppAliasImports(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].filter((f) => fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts') || n.endsWith('.page.ts'));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const original = source;
+    source = repairUnresolvedAliasImports(source, tsFile, destPath);
+    const htmlPath = tsFile.replace(/\.ts$/, '.html');
+    if (fs.existsSync(htmlPath)) {
+      let html = fs.readFileSync(htmlPath, 'utf-8');
+      const origHtml = html;
+      html = repairPhantomDirectiveTemplateAttrs(html);
+      if (html !== origHtml) {
+        fs.writeFileSync(htmlPath, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+        changed += 1;
+      }
+    }
+    if (source !== original) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Removed unresolved @app alias imports in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+function isStandaloneAngularDeclarable(symbol, source, tsPath) {
+  const bare = String(symbol || '').split(/\s+as\s+/)[0].trim();
+  if (!bare || !/^[A-Z]/.test(bare)) return false;
+  if (NON_DECLARABLE_COMPONENT_IMPORTS.has(bare)) return false;
+  if (isLucideIconComponentSymbol(bare)) return false;
+  if (inferDeclarablePackage(bare, source)) return true;
+  if (
+    /^Mat[A-Z]/.test(bare) &&
+    !/DataSource$|Ref$|Config$|State$/.test(bare) &&
+    (inferMaterialPackage(bare) || inferMaterialPackage(`${bare}Module`))
+  ) {
+    return true;
+  }
+  const importPath = findImportPathForSymbol(source, bare);
+  if (!importPath?.startsWith('.')) return false;
+  const file = resolveRelativeTsImport(tsPath, importPath);
+  if (!file || !fs.existsSync(file)) return false;
+  let content = '';
+  try {
+    content = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return false;
+  }
+  if (/@NgModule\s*\(/.test(content)) return true;
+  if (/@Pipe\s*\(/.test(content) && /\bstandalone\s*:\s*true/.test(content)) return true;
+  if (/@Directive\s*\(/.test(content) && /\bstandalone\s*:\s*true/.test(content)) return true;
+  if (/@Component\s*\(/.test(content) && /\bstandalone\s*:\s*true/.test(content)) return true;
+  return false;
+}
+
+function stripInvalidDecoratorImports(source, tsPath) {
+  if (!/@Component\s*\(/.test(source) || !/\bimports\s*:\s*\[/.test(source)) return source;
+  const candidates = new Set([
+    ...parseDecoratorImportItems(source),
+    ...[...collectImportedValueNames(source)].filter((n) =>
+      /^(?:[A-Z].*Component|Mat[A-Z]\w+)$/.test(n)
+    )
+  ]);
+  let updated = source.replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    (full, start, mid, end) => {
+      const items = mid
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((item) => isStandaloneAngularDeclarable(item, source, tsPath));
+      return `${start}${[...new Set(items)].join(', ')}${end}`;
+    }
+  );
+  for (const sym of candidates) {
+    if (isStandaloneAngularDeclarable(sym, updated, tsPath)) continue;
+    updated = removeDecoratorImport(updated, sym);
+    const from = findImportPathForSymbol(updated, sym);
+    if (from && !symbolUsedOutsideComponentImports(updated, sym)) {
+      updated = removeNamedImport(updated, sym, from);
+    }
+  }
+  return updated;
+}
+
+function symbolUsedOutsideComponentImports(source, symbol) {
+  const esc = String(symbol || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!esc) return false;
+  const check = String(source || '').replace(
+    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
+    '$1$3'
+  );
+  return new RegExp(`\\b${esc}\\b`).test(check);
+}
+
+function repairMatDialogRefSource(source, tsPath) {
+  if (!/\bdialogRef\b/.test(source) || !/\.close\s*\(/.test(source)) return source;
+  const className = componentClassNameFromFile(tsPath);
+  let updated = ensureImport(source, 'MatDialogRef', '@angular/material/dialog');
+  if (/@Inject\s*\(\s*MAT_DIALOG_DATA\s*\)/.test(updated)) {
+    updated = ensureImport(updated, 'Inject', '@angular/core');
+    updated = ensureImport(updated, 'MAT_DIALOG_DATA', '@angular/material/dialog');
+  }
+  updated = updated.replace(
+    /\binject\s*\(\s*MatDialogRef\s*\)/g,
+    `inject(MatDialogRef<${className}, boolean>)`
+  );
+  updated = updated.replace(
+    /(\b(?:private|public|protected|readonly)\s+(?:readonly\s+)?dialogRef\s*:\s*)\{\}/g,
+    `$1MatDialogRef<${className}, boolean>`
+  );
+  updated = updated.replace(
+    /(constructor\s*\([^)]*dialogRef\s*:\s*)\{\}/g,
+    `$1MatDialogRef<${className}, boolean>`
+  );
+  updated = updated.replace(
+    /\bdialogRef\s*:\s*\{\}/g,
+    `dialogRef: MatDialogRef<${className}, boolean>`
+  );
+  updated = updated.replace(
+    /:\s*MatDialogRef(?!\s*<)/g,
+    `: MatDialogRef<${className}, boolean>`
+  );
+  if (
+    /\.dialogRef\.close/.test(updated) &&
+    !/\b(?:private|public|protected|readonly)\s+(?:readonly\s+)?dialogRef\b/.test(updated) &&
+    !/\bconstructor\s*\([^)]*dialogRef\b/.test(updated)
+  ) {
+    updated = insertIntoClassBody(
+      updated,
+      `  private readonly dialogRef = inject(MatDialogRef<${className}, boolean>);`
+    );
+    updated = ensureImport(updated, 'inject', '@angular/core');
+  }
+  return updated;
+}
+
+function ensureMaterialValueImports(source, tsPath) {
+  let updated = String(source || '');
+  if (/\bMatTableDataSource\b/.test(updated) || /\bnew\s+MatTableDataSource\b/.test(updated)) {
+    updated = ensureImport(updated, 'MatTableDataSource', MAT_TABLE_PACKAGE);
+  }
+  if (/\bmat-table\b/i.test(updated)) {
+    updated = ensureImport(updated, 'MatTableModule', MAT_TABLE_PACKAGE);
+    updated = ensureDecoratorImport(updated, 'MatTableModule');
+  }
+  updated = repairMatDialogRefSource(updated, tsPath);
+  updated = repairMatTableDataSourceConflicts(updated);
+  return updated;
+}
+
+function repairAngularMaterialValueImports(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].filter((f) => fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const original = source;
+    source = ensureMaterialValueImports(source, tsFile);
+    const htmlPath = tsFile.replace(/\.ts$/, '.html');
+    const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
+    const needsMatTableRepair =
+      /\bdataSource\b/.test(source) ||
+      /\bmat-table\b/i.test(html) ||
+      /\bset\s+tasks\s*\(/.test(source) ||
+      TASKS_INPUT_FIELD_INLINE_RE.test(source);
+    if (needsMatTableRepair) {
+      source = repairMatTableDataSourceConflicts(source);
+      source = dedupeDuplicateClassMembers(source);
+    }
+    if (source !== original) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Restored Material value imports in ${changed} file(s)`);
+  }
+  return changed;
+}
+
 /**
  * Remove non-declarables (e.g. cn helper) from @Component imports arrays.
  */
-function sanitizeStandaloneImports(source) {
+function sanitizeStandaloneImports(source, tsPath = '') {
   if (!/@Component\s*\(/.test(source)) return source;
 
   const bannedExact = new Set([
     'cn', 'clsx', 'twMerge', 'cva', 'classNames', 'classnames', 'React', 'Fragment', 'Reactive'
   ]);
 
-  return source.replace(
+  let updated = source.replace(
     /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
     (full, start, mid, end) => {
       const items = mid
@@ -1976,6 +2742,8 @@ function sanitizeStandaloneImports(source) {
         .filter((item) => {
           const bare = item.split(/\s+as\s+/)[0].trim();
           if (bannedExact.has(bare)) return false;
+          if (NON_DECLARABLE_COMPONENT_IMPORTS.has(bare)) return false;
+          if (isLucideIconComponentSymbol(bare)) return false;
           // Lowercase identifiers are almost never Angular declarables
           if (/^[a-z]/.test(bare) && bare !== 'forwardRef') return false;
           return true;
@@ -1985,6 +2753,10 @@ function sanitizeStandaloneImports(source) {
       return `${start}${uniq.join(', ')}${end}`;
     }
   );
+  if (tsPath) {
+    updated = stripInvalidDecoratorImports(updated, tsPath);
+  }
+  return updated;
 }
 
 /**
@@ -2163,7 +2935,9 @@ export function inferDeclarablePackage(symbol, source = '') {
   if (!symbol || !/^[A-Z]/.test(symbol)) return null;
   const existing = findImportPathForSymbol(source, symbol);
   if (existing && !existing.startsWith('.') && existing !== '@angular/material') {
-    return existing;
+    if (!isWorkspacePathAlias(existing)) {
+      return existing;
+    }
   }
   if (NG_PLATFORM_PACKAGES[symbol]) return NG_PLATFORM_PACKAGES[symbol];
   return inferMaterialPackage(symbol);
@@ -2295,7 +3069,7 @@ function preferImportedMaterialSymbol(source, moduleName) {
  * Ensure every declarable used in the template or listed in
  * `@Component({ imports })` has a value import and is present in that array.
  */
-function syncNgComponentImports(source, html) {
+function syncNgComponentImports(source, html, tsPath = '') {
   if (!/@Component\s*\(/.test(source)) return source;
   let updated = remapHallucinatedMaterialSymbols(rewriteMaterialBarrelImports(source));
   const imported = () => collectImportedValueNames(updated);
@@ -2304,7 +3078,10 @@ function syncNgComponentImports(source, html) {
   );
 
   const fromDecorator = parseDecoratorImportItems(updated).filter(
-    (name) => /^[A-Z]/.test(name) && !local.has(name)
+    (name) =>
+      /^[A-Z]/.test(name) &&
+      !local.has(name) &&
+      (!tsPath || isStandaloneAngularDeclarable(name, updated, tsPath))
   );
   const needed = [...declarablesNeededByHtml(html), ...fromDecorator].map(canonicalMatDeclarable);
 
@@ -2338,6 +3115,7 @@ function syncNgComponentImports(source, html) {
         .filter(Boolean)
         .filter((item) => {
           const bare = item.split(/\s+as\s+/)[0].trim();
+          if (tsPath && !isStandaloneAngularDeclarable(bare, updated, tsPath)) return false;
           if (!/^Mat[A-Z]\w+Module$/.test(bare) && !/^Mat[A-Z]\w+$/.test(bare)) return true;
           if (inferDeclarablePackage(bare, updated)) return true;
           return stillImported.has(bare) || local.has(bare);
@@ -2765,7 +3543,7 @@ function repairAngularComponentFile(tsPath, options = {}) {
   // Keep lucide imports until templates are rewritten to inline SVG, then strip packages
   source = repairEmblaImports(source);
   source = repairHallucinatedAngularApis(source);
-  source = sanitizeStandaloneImports(source);
+  source = sanitizeStandaloneImports(source, tsPath);
   source = rewriteMaterialBarrelImports(source);
 
   // import type { X } used as value — promote common Angular DI tokens
@@ -2939,6 +3717,12 @@ function repairAngularComponentFile(tsPath, options = {}) {
     let html = fs.readFileSync(targetHtml, 'utf-8');
     // React leftover event / form patterns
     html = repairAngularTemplateHtml(html, source);
+    const destPath = projectRootFromSrcFile(tsPath);
+    if (!projectHasNpmPackage(destPath, 'ngx-skeleton-loader')) {
+      html = stripNgxSkeletonLoaderMarkup(html);
+      source = repairPhantomSkeletonLoaderSource(source, tsPath, destPath);
+    }
+    source = ensureTaskStatusOptionFields(source, html, tsPath, destPath);
     // ALL lucide / React icon tags → plain inline <svg> (while lucide imports still visible)
     html = rewriteLegacyLucideHtmlTags(html, source, sourceContent);
     // Then drop every lucide package import — no @lucide/angular in output
@@ -3009,8 +3793,12 @@ function repairAngularComponentFile(tsPath, options = {}) {
     source = consolidateDuplicateFormGroups(source, html);
     source = dedupeDuplicateClassMembers(source);
     source = repairBogusAngularFormsImports(source);
-    source = sanitizeStandaloneImports(source);
-    source = syncNgComponentImports(source, html);
+    source = sanitizeStandaloneImports(source, tsPath);
+    source = syncNgComponentImports(source, html, tsPath);
+    source = ensureMaterialValueImports(source, tsPath);
+    source = repairMatTableDataSourceConflicts(source);
+    source = repairUnresolvedAliasImports(source, tsPath, destPath);
+    source = dedupeDuplicateClassMembers(source);
     source = dedupeImports(source);
     fs.writeFileSync(targetHtml, html, 'utf-8');
   }
@@ -3028,8 +3816,9 @@ function repairAngularComponentFile(tsPath, options = {}) {
       fs.writeFileSync(targetHtml, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
     }
   }
-  source = syncNgComponentImports(source, readAllTemplates(source, tsPath));
+  source = syncNgComponentImports(source, readAllTemplates(source, tsPath), tsPath);
   source = dedupeImports(source);
+  source = ensureMaterialValueImports(source, tsPath);
   source = ensureLifecycleMethods(source);
 
   // Ensure default sibling css exists / is valid
@@ -4270,7 +5059,7 @@ export function ensureAngularMaterialPackages(destPath, sourcePackageJson = null
   return added;
 }
 
-function ensureNgSymbolsFromBuildErrors(source, buildErrors) {
+function ensureNgSymbolsFromBuildErrors(source, buildErrors, tsPath = '') {
   let updated = String(source || '');
   const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
   const inDecorator = new Set(parseDecoratorImportItems(updated));
@@ -4279,9 +5068,14 @@ function ensureNgSymbolsFromBuildErrors(source, buildErrors) {
     const symbol = canonicalMatDeclarable(m[1]);
     if (seen.has(symbol)) continue;
     seen.add(symbol);
+    if (NON_DECLARABLE_COMPONENT_IMPORTS.has(symbol) || NON_DECLARABLE_COMPONENT_IMPORTS.has(m[1])) {
+      continue;
+    }
+    if (isLucideIconComponentSymbol(symbol) || isLucideIconComponentSymbol(m[1])) continue;
     if (!inDecorator.has(symbol) && !inDecorator.has(m[1]) && !/^Mat[A-Z]/.test(symbol)) continue;
     const pkg = inferDeclarablePackage(symbol, updated);
     if (!pkg) continue;
+    if (tsPath && !isStandaloneAngularDeclarable(symbol, updated, tsPath)) continue;
     if (symbol !== m[1]) {
       const fakeFrom = findImportPathForSymbol(updated, m[1]);
       if (fakeFrom) updated = removeNamedImport(updated, m[1], fakeFrom);
@@ -4475,6 +5269,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
     ensureInputsFromParentPropertyBindings(destPath);
     ensureOutputsFromParentEventBindings(destPath);
     repairCallbackEmitInTemplates(destPath);
+    repairNgModelValueEventBindings(destPath);
   } catch (err) {
     console.warn(`[postprocess] Input/Output binding repair failed: ${err.message}`);
   }
@@ -4653,6 +5448,53 @@ export function repairAngularStrictNullAndStatusTypes(destPath, buildErrors = ''
 }
 
 /**
+ * NG2001 (missing templateUrl) and NG2012 (invalid @Component imports).
+ */
+function repairAngularComponentDecoratorIssues(destPath, buildErrors) {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const hasNg2001 = /NG2001|missing a template/.test(text);
+  const hasNg2012 = /NG2012|Component imports must be standalone/.test(text);
+  if (!hasNg2001 && !hasNg2012) return 0;
+
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].filter((f) => fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'));
+
+  let changed = 0;
+  for (const tsPath of files) {
+    let source = fs.readFileSync(tsPath, 'utf-8');
+    if (!/@Component\s*\(/.test(source)) continue;
+    const original = source;
+    const baseName = path.basename(tsPath, '.ts');
+
+    if (hasNg2001 && !/templateUrl\s*:/.test(source) && !/\btemplate\s*:/.test(source)) {
+      source = source.replace(/(@Component\s*\(\s*\{)/, `$1\n  templateUrl: './${baseName}.html',`);
+    }
+    if (hasNg2001 || hasNg2012) {
+      source = sanitizeStandaloneImports(source, tsPath);
+      source = stripInvalidDecoratorImports(source, tsPath);
+      const htmlPath = tsPath.replace(/\.ts$/, '.html');
+      const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
+      source = syncNgComponentImports(source, html, tsPath);
+      source = dedupeImports(source);
+    }
+    if (source !== original) {
+      fs.writeFileSync(tsPath, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired @Component decorator metadata in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
  * Mechanical Angular compile repairs for NG1010 (unknown @Component imports)
  * and missing Material modules referenced by the template.
  */
@@ -4693,8 +5535,28 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   const duplicateIssues =
     /TS2393/.test(text) ||
     /TS2300/.test(text) ||
+    /TS2717/.test(text) ||
     /Duplicate function implementation/.test(text) ||
-    /Duplicate identifier/.test(text);
+    /Duplicate identifier/.test(text) ||
+    /Subsequent property declarations must have the same type/.test(text);
+  const decoratorIssues =
+    /NG2001/.test(text) ||
+    /NG2012/.test(text) ||
+    /missing a template/.test(text) ||
+    /Component imports must be standalone/.test(text);
+  const materialValueIssues =
+    (/TS2304/.test(text) && /MatTableDataSource/.test(text)) ||
+    (/TS2300/.test(text) && /dataSource/.test(text)) ||
+    (/TS2300/.test(text) && /\btasks\b/.test(text)) ||
+    (/TS2717/.test(text) && /dataSource/.test(text)) ||
+    (/TS2339/.test(text) && /dialogRef/.test(text) && /close/.test(text));
+  const statusOptionIssues =
+    (/TS2339/.test(text) && /Property '(?:id|label|value)' does not exist/.test(text)) ||
+    (/Property 'label' does not exist on type/.test(text) && /\bstatus\b/i.test(text));
+  const skeletonIssues =
+    (/NG8002/.test(text) && /ngx-skeleton-loader/i.test(text)) ||
+    /isn't a known property of 'ngx-skeleton-loader'/i.test(text) ||
+    /is not a known property of 'ngx-skeleton-loader'/i.test(text);
   const needs =
     /NG1010/.test(text) ||
     /NG5002/.test(text) ||
@@ -4716,7 +5578,11 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     !moduleIssues &&
     !duplicateIssues &&
     !lifecycleIssues &&
-    !bindingIssues
+    !bindingIssues &&
+    !decoratorIssues &&
+    !materialValueIssues &&
+    !statusOptionIssues &&
+    !skeletonIssues
   ) {
     return 0;
   }
@@ -4735,7 +5601,44 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   };
   const beforeMap = snapshot();
 
+  if (skeletonIssues) {
+    try {
+      repairPhantomSkeletonLoader(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] ngx-skeleton-loader repair failed: ${err.message}`);
+    }
+  }
+
+  if (statusOptionIssues) {
+    try {
+      repairTaskStatusOptionTemplates(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Task status option repair failed: ${err.message}`);
+    }
+  }
+
+  if (materialValueIssues || duplicateIssues) {
+    try {
+      repairAngularMaterialValueImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Material value import repair failed: ${err.message}`);
+    }
+  }
+
+  if (decoratorIssues) {
+    try {
+      repairAngularComponentDecoratorIssues(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] @Component decorator repair failed: ${err.message}`);
+    }
+  }
+
   if (moduleIssues) {
+    try {
+      repairUnresolvedAppAliasImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Unresolved @app alias repair failed: ${err.message}`);
+    }
     try {
       ensureAngularAppModels(destPath);
     } catch (err) {
@@ -4757,6 +5660,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     try {
       ensureOutputsFromParentEventBindings(destPath);
       repairCallbackEmitInTemplates(destPath);
+      repairNgModelValueEventBindings(destPath, text);
+      wrapDomEventPayloads(destPath, text);
     } catch (err) {
       console.warn(`[postprocess] Output/emit repair failed: ${err.message}`);
     }
@@ -4780,7 +5685,12 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     }
   }
 
-  if (needs || duplicateIssues) {
+  if (needs || duplicateIssues || decoratorIssues) {
+    try {
+      repairUnresolvedAppAliasImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Unresolved @app alias repair failed: ${err.message}`);
+    }
     const mentioned = new Set();
     for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
       mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
@@ -4811,17 +5721,15 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
         const htmlPath = file.replace(/\.ts$/, '.html');
         const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
         after = consolidateDuplicateFormGroups(after, html);
+        after = repairMatTableDataSourceConflicts(after);
         after = dedupeDuplicateClassMembers(after);
       }
-      const forced = ensureNgSymbolsFromBuildErrors(after, text);
-      if (forced !== after || after !== before) {
-        fs.writeFileSync(file, forced.endsWith('\n') ? forced : `${forced}\n`, 'utf-8');
+      const forced = ensureNgSymbolsFromBuildErrors(after, text, file);
+      const stripped = stripInvalidDecoratorImports(forced, file);
+      if (stripped !== after || after !== before) {
+        fs.writeFileSync(file, stripped.endsWith('\n') ? stripped : `${stripped}\n`, 'utf-8');
       }
     }
-  }
-
-  if (eventIssues) {
-    wrapDomEventPayloads(destPath, text);
   }
 
   if (typeIssues) {

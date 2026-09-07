@@ -2722,7 +2722,425 @@ src/app/pages/app/tasks/pages/task-list/task-list.component.ts:42:15: templateUr
 }
 
 {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-ng21-pkgs-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-mat-dialog-table-'));
+  const dialogDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-delete-dialog');
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  fs.mkdirSync(dialogDir, { recursive: true });
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component, Inject } from '@angular/core';
+@Component({
+  selector: 'app-task-delete-dialog',
+  standalone: true,
+  imports: [MatDialogRef],
+  templateUrl: './task-delete-dialog.component.html'
+})
+export class TaskDeleteDialogComponent {
+  constructor(private readonly dialogRef: {}) {}
+  onCancel(): void { this.dialogRef.close(false); }
+  onConfirm(): void { this.dialogRef.close(true); }
+}
+`
+  );
+  fs.writeFileSync(path.join(dialogDir, 'task-delete-dialog.component.html'), `<p>Delete?</p>\n`);
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+import { MatTableModule } from '@angular/material/table';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  imports: [MatTableModule],
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {
+  @Input() tasks: Task[] = [];
+  dataSource = new MatTableDataSource<Task>([]);
+  public dataSource = new MatTableDataSource<Task>([]);
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `<table mat-table [dataSource]="dataSource"></table>\n`
+  );
+
+  const errText = `TS2339: Property 'close' does not exist on type '{}'.
+src/app/pages/app/tasks/components/task-delete-dialog/task-delete-dialog.component.ts:31:21: this.dialogRef.close(false);
+TS2339: Property 'close' does not exist on type '{}'.
+src/app/pages/app/tasks/components/task-delete-dialog/task-delete-dialog.component.ts:38:21: this.dialogRef.close(true);
+TS2300: Duplicate identifier 'dataSource'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:27:9: public dataSource
+TS2304: Cannot find name 'MatTableDataSource'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:27:26: MatTableDataSource`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const dialogTs = fs.readFileSync(path.join(dialogDir, 'task-delete-dialog.component.ts'), 'utf-8');
+  const tableTs = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs dialogRef and dataSource issues');
+  assert(/from '@angular\/material\/dialog'/.test(dialogTs) && /MatDialogRef/.test(dialogTs), 'MatDialogRef import restored');
+  assert(
+    /dialogRef:\s*MatDialogRef</.test(dialogTs) || /inject\(MatDialogRef</.test(dialogTs),
+    'dialogRef is typed as MatDialogRef'
+  );
+  assert(!/\bimports\s*:\s*\[[^\]]*MatDialogRef/.test(dialogTs), 'MatDialogRef not in @Component imports');
+  assert(/from '@angular\/material\/table'/.test(tableTs) && /MatTableDataSource/.test(tableTs), 'MatTableDataSource import added');
+  const dataSourceDecls = tableTs.match(/\bdataSource\s*=/g) || [];
+  assert(dataSourceDecls.length === 1, 'duplicate dataSource field is removed');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+import { MatTableModule } from '@angular/material/table';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  imports: [MatTableModule],
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {
+  @Input() dataSource: any = null;
+  @Input() tasks: Task[] = [];
+  public dataSource = new MatTableDataSource<Task>([]);
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `<table mat-table [dataSource]="dataSource"></table>\n`
+  );
+
+  const errText = `TS2300: Duplicate identifier 'dataSource'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:28:9: public dataSource
+TS2717: Subsequent property declarations must have the same type. Property 'dataSource' must be of type 'any', but here has type 'MatTableDataSource<Task, MatPaginator>'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:28:9: public dataSource
+'dataSource' was also declared here.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:17:11: @Input() dataSource`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const tableTs = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs @Input dataSource vs MatTableDataSource conflict');
+  assert(!/@Input\s*\([^)]*\)\s+dataSource\b/.test(tableTs), '@Input() dataSource stub removed');
+  assert(/\bset\s+tasks\s*\(/.test(tableTs), 'tasks input wired to dataSource.data');
+  const dataSourceDecls = tableTs.match(/\bdataSource\s*=/g) || [];
+  assert(dataSourceDecls.length === 1, 'single MatTableDataSource field remains');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+import { MatTableDataSource, MatTableModule } from '@angular/material/table';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  imports: [MatTableModule],
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {
+  @Input() tasks: Task[] = [];
+  @Input() set tasks(value: Task[]) {
+    this._tasks = value || [];
+    this.dataSource.data = this._tasks;
+  }
+  get tasks(): Task[] {
+    return this._tasks;
+  }
+  private _tasks: Task[] = [];
+  public dataSource = new MatTableDataSource<Task>([]);
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `<table mat-table [dataSource]="dataSource"></table>\n`
+  );
+
+  const errText = `TS2300: Duplicate identifier 'tasks'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:18:13: @Input() set tasks
+TS2300: Duplicate identifier 'tasks'.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:22:6: get tasks`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const tableTs = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors removes duplicate tasks input field');
+  assert(
+    !/@Input\s*\([^)]*\)\s+(?:(?:public|protected|private|readonly)\s+)*tasks\s*!?:/.test(tableTs),
+    'orphan @Input() tasks field removed when accessor exists'
+  );
+  assert((tableTs.match(/\bset\s+tasks\s*\(/g) || []).length === 1, 'single tasks setter remains');
+  assert((tableTs.match(/\bget\s+tasks\s*\(/g) || []).length === 1, 'single tasks getter remains');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-status-opt-'));
+  const modelDir = path.join(tmp, 'src', 'app', 'models');
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(modelDir, { recursive: true });
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelDir, 'task.model.ts'),
+    `export type TaskStatus = 'todo' | 'in-progress' | 'done';
+export interface Task { id: string; title: string; description: string; status: TaskStatus; }
+export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
+  todo: 'To do',
+  'in-progress': 'In progress',
+  done: 'Done'
+};
+export const TASK_STATUS_OPTIONS: TaskStatus[] = ['todo', 'in-progress', 'done'];
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { MatSelectModule } from '@angular/material/select';
+import { TaskStatus } from '../../../../models/task.model';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [MatSelectModule],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  statusFilter: TaskStatus | 'all' = 'all';
+  statusOptions: TaskStatus[] = [];
+  statusLabels: Record<string, string> = {};
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<mat-select [ngModel]="statusFilter">
+  <mat-option value="all">All statuses</mat-option>
+  @for (status of statusOptions; track status.id) {
+    <mat-option [value]="status.id">{{ status.label }}</mat-option>
+  }
+</mat-select>
+`
+  );
+
+  const errText = `TS2339: Property 'id' does not exist on type 'TaskStatus'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.html:43:44: status.id
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:45:15: templateUrl: './task-list.component.html'
+TS2339: Property 'label' does not exist on type 'TaskStatus'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.html:44:28: status.label`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const html = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  const ts = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs status.id/status.label template access');
+  assert(/track status\)/.test(html) && !/status\.id/.test(html), 'status.id removed from template');
+  assert(/statusLabels\[status\]/.test(html) && !/status\.label/.test(html), 'status.label becomes statusLabels[status]');
+  assert(/\bstatusOptions\s*=\s*TASK_STATUS_OPTIONS/.test(ts), 'statusOptions wired to model constant');
+  assert(/\bstatusLabels\s*=\s*TASK_STATUS_LABELS/.test(ts), 'statusLabels wired to model constant');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-app-alias-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { MatButtonModule } from '@angular/material/button';
+import { MatPaginator } from '@angular/material/paginator';
+import { PaginatorDirective } from '@app/shared/directives';
+import { TaskFormSidebarComponent } from '../../../components/task-form-sidebar/task-form-sidebar.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [MatButtonModule, MatPaginator, PaginatorDirective, TaskFormSidebarComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<mat-paginator appPagination></mat-paginator>\n`
+  );
+
+  const errText = `TS2307: Cannot find module '@app/shared/directives' or its corresponding type declarations.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:19:35: @app/shared/directives
+NG1010: 'imports' must be an array of components, directives, pipes, or NgModules.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:24:213: PaginatorDirective
+Unknown reference. PaginatorDirective`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const ts = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  const html = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors removes phantom @app/shared/directives imports');
+  assert(!/@app\/shared\/directives/.test(ts), 'phantom @app import removed');
+  assert(!/\bPaginatorDirective\b/.test(ts), 'PaginatorDirective removed from component');
+  assert(!/\bappPagination\b/.test(html), 'appPagination stripped from template');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-skeleton-'));
+  fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({ name: 'demo', dependencies: {} }, null, 2));
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component } from '@angular/core';
+import { NgxSkeletonLoaderModule } from 'ngx-skeleton-loader';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  imports: [NgxSkeletonLoaderModule],
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {
+  isShowSkeletonLoader = true;
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `@if (isShowSkeletonLoader) {
+  <ngx-skeleton-loader count="5"
+    [theme]="{ 'border-radius': '8px', height: '60px', width: '100%' }" />
+} @else {
+  <p>Loaded</p>
+}
+`
+  );
+
+  const errText = `NG8002: Can't bind to 'theme' since it isn't a known property of 'ngx-skeleton-loader'.
+src/app/pages/app/tasks/components/task-table/task-table.component.html:71:14: [theme]
+Error occurs in the template of component TaskTableComponent.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:12:15: templateUrl`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const ts = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  const html = fs.readFileSync(path.join(tableDir, 'task-table.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors removes ngx-skeleton-loader when package missing');
+  assert(!/ngx-skeleton-loader/i.test(html), 'skeleton markup removed from template');
+  assert(!/\bNgxSkeletonLoaderModule\b/.test(ts), 'skeleton module import removed');
+  assert(!/\bisShowSkeletonLoader\b/.test(ts), 'skeleton flag removed from component');
+  assert(/Loaded/.test(html), '@else body kept after skeleton strip');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
+import { MatSelectModule } from '@angular/material/select';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [MatFormFieldModule, MatInputModule, MatSelectModule],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  search = '';
+  statusFilter = 'all';
+  onSearchChange(value: string): void { this.search = value; }
+  onStatusFilterChange(value: string): void { this.statusFilter = value; }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<mat-form-field>
+  <input matInput [ngModel]="search" (ngModelChange)="onSearchChange($event)" />
+</mat-form-field>
+<mat-form-field>
+  <mat-select [ngModel]="statusFilter" (ngModelChange)="onStatusFilterChange($event)">
+    <mat-option value="all">All</mat-option>
+  </mat-select>
+</mat-form-field>
+`
+  );
+
+  const errText = `TS2345: Argument of type 'Event' is not assignable to parameter of type 'string'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.html:29:42: (ngModelChange)="onSearchChange($event)"
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:41:15: templateUrl: './task-list.component.html'
+TS2345: Argument of type 'Event' is not assignable to parameter of type 'string'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.html:42:48: (ngModelChange)="onStatusFilterChange($event)"
+`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const listTs = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs ngModelChange TS2345');
+  assert(/FormsModule/.test(listTs), 'FormsModule is added for ngModel filters');
+  assert(/\(ngModelChange\)="search = \$event"/.test(listHtml), 'search uses inline ngModelChange');
+  assert(/\(ngModelChange\)="statusFilter = \$event"/.test(listHtml), 'statusFilter uses inline ngModelChange');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({
+  selector: 'app-task-table',
+  standalone: true,
+  templateUrl: './task-table.component.html'
+})
+export class TaskTableComponent {}
+`
+  );
+  fs.writeFileSync(path.join(tableDir, 'task-table.component.html'), `<p>table</p>\n`);
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { MatIconModule } from '@angular/material/icon';
+import { MatPaginator } from '@angular/material/paginator';
+import { MatTableDataSource } from '@angular/material/table';
+import { SearchIconComponent } from '../../components/search-icon/search-icon.component';
+import { TaskTableComponent } from '../../components/task-table/task-table.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [CommonModule, MatIconModule, SearchIconComponent, TaskTableComponent, MatTableDataSource, MatPaginator],
+})
+export class TaskListComponent {
+  dataSource = new MatTableDataSource([]);
+}
+`
+  );
+  fs.writeFileSync(path.join(listDir, 'task-list.component.html'), `<app-task-table></app-task-table>\n`);
+
+  const errText = `NG2001: @Component is missing a template. Add either a template or templateUrl
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:60:0: @Component({
+NG2012: Component imports must be standalone components, directives, pipes, or must be NgModules.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:69:240: SearchIconComponent
+NG2012: Component imports must be standalone components, directives, pipes, or must be NgModules.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:69:308: MatTableDataSource
+`;
+  const n = fixAngularCompileErrors(tmp, errText);
+  const listTs = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs NG2001/NG2012 decorator issues');
+  assert(/templateUrl:\s*'\.\/task-list\.component\.html'/.test(listTs), 'missing templateUrl is added');
+  assert(!/\bimports\s*:\s*\[[^\]]*SearchIconComponent/.test(listTs), 'SearchIconComponent removed from imports');
+  assert(!/\bimports\s*:\s*\[[^\]]*MatTableDataSource/.test(listTs), 'MatTableDataSource removed from imports');
+  assert(!/import\s*\{[^}]*SearchIconComponent/.test(listTs), 'SearchIconComponent import line removed');
+  assert(/\bimports\s*:\s*\[[^\]]*TaskTableComponent/.test(listTs), 'valid TaskTableComponent kept');
+  assert(/\bimports\s*:\s*\[[^\]]*MatPaginator/.test(listTs), 'MatPaginator kept in imports');
+  assert(/\bMatTableDataSource\b/.test(listTs), 'MatTableDataSource remains as TS import for dataSource');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
   injectAngularWorkspaceTemplates(tmp, {
     major: 21,
     core: '21.2.18',

@@ -358,6 +358,11 @@ Do NOT use default project names — use the EXTRACTED name.
   Angular Sass cannot parse \`@theme\` / \`@utility\` / \`@property\`. Use Tailwind utilities only.
 - Icons: plain inline \`<svg>...</svg>\` only — never lucide packages or lucideXxx attributes.
 - Child tags MUST match the child's \`selector\` (prefer \`app-*\`) and be listed in \`imports\`.
+- NEVER list \`MatTableDataSource\`, services, or lucide \`*IconComponent\` wrappers in
+  \`@Component({ imports })\` — only NgModules, standalone components, directives, and pipes.
+  \`MatTableDataSource\` and \`MatDialogRef\` are TypeScript imports for class bodies /
+  constructors, never decorator \`imports\`. Never type \`dialogRef\` as \`{}\`.
+  Every \`@Component\` MUST declare \`templateUrl\` (or \`template\`).
 - No \`private\` members in templates. No field + getter with the same name.
 - NEVER declare the same member twice (e.g. stub method \`onClick(...)\` AND
   \`@Input() onClick\`). One declaration only.

@@ -13,12 +13,13 @@ Use this for every **list/index** page under
 ### Rules
 - **NEVER** use plain HTML \`<table>\` — see ANGULAR TABLE MANDATE (injected separately).
 - Use \`MatTableModule\` + \`MatTableDataSource\` for the data grid.
-- Use \`MatPaginator\` with \`PaginatorDirective\` (\`appPagination\`).
+- Use \`MatPaginator\` for pagination. Only add \`PaginatorDirective\` (\`appPagination\`) when \`src/app/shared/directives\` exists in this project.
 - Filters live in \`global-filter-search\`; \`[(ngModel)]\` is allowed **only**
-  on filter controls (not on add/edit forms).
+  on filter controls (not on add/edit forms). Prefer \`(ngModelChange)="search = $event"\`
+  over \`(ngModelChange)="onSearchChange($event)"\` — and always import \`FormsModule\`.
 - Persist filter + page state in encrypted \`enc\` query params.
 - Reset \`page_no\` to \`1\` whenever filters or global search change.
-- Show skeleton loader on first load; show \`no-records-table\` when empty.
+- Show skeleton loader on first load only when \`ngx-skeleton-loader\` is in \`package.json\`; otherwise use a simple empty/loading state.
 - Use \`accessControl\` directive on action columns/buttons.
 - Unsubscribe all \`subscriptions\` in \`ngOnDestroy\`.
 - Only \`implements OnInit\` / \`OnDestroy\` when those methods exist. Skip both

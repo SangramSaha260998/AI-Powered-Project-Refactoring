@@ -135,7 +135,12 @@ function buildMatTableTs(tsSource, columns, inputName) {
     source = source.replace(/imports:\s*\[/, 'imports: [MatTableModule, ');
   }
 
-  if (!/dataSource\s*=/.test(source)) {
+  source = source.replace(
+    /^[ \t]*@Input\s*\([^)]*\)\s+dataSource\s*!?:[^;\n]*;\s*\n?/gm,
+    ''
+  );
+
+  if (!/dataSource\s*=/.test(source) && !/\bget\s+dataSource\b/.test(source)) {
     source = source.replace(
       /export class \w+[^{]*\{/,
       (m) => `${m}\n  public dataSource = new MatTableDataSource<unknown>([]);`,
@@ -161,7 +166,7 @@ function buildMatTableTs(tsSource, columns, inputName) {
   }
 
   const inputRe = new RegExp(
-    `@Input\\(\\)\\s+${inputName}\\s*:\\s*([^;=]+)(?:\\s*=\\s*[^;]+)?;`,
+    `@Input\\([^)]*\\)\\s+(?:(?:public|protected|private|readonly)\\s+)*${inputName}\\s*!?:\\s*([^;=]+)(?:\\s*=\\s*[^;]+)?;`,
   );
   if (inputRe.test(source) && !source.includes(`set ${inputName}(`)) {
     source = source.replace(inputRe, (_, typePart) => {

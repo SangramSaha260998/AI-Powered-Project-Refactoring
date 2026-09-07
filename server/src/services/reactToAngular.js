@@ -296,6 +296,8 @@ function cleanupHtml(html) {
   h = h.replace(/\s+type="button"/g, ' type="button"');
   h = h.replace(/ type="button" type="button"/g, ' type="button"');
   h = h.replace(/@for \((\w+) of statusOptions; track \1\.id\)/g, '@for ($1 of statusOptions; track $1)');
+  h = h.replace(/\[value\]="status\.id"/g, '[value]="status"');
+  h = h.replace(/\{\{\s*status\.label\s*\}\}/g, '{{ statusLabels[status] }}');
   h = h.replace(/\[opened\]=/g, (match, offset) => {
     const before = h.slice(Math.max(0, offset - 80), offset);
     return /mat-sidenav/.test(before) ? match : '[open]=';

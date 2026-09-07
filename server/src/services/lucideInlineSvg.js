@@ -336,4 +336,18 @@ export function stripLucidePackageUsage(source) {
   return updated;
 }
 
+/**
+ * AI often invents `SearchIconComponent` instead of inline SVG for lucide-react icons.
+ */
+export function isLucideIconComponentSymbol(symbol) {
+  const m = String(symbol || '').match(/^(.+?)IconComponent$/);
+  if (!m) return false;
+  const base = m[1];
+  if (icons[base]) return true;
+  const kebab = pascalToKebab(base);
+  if (icons[kebab]) return true;
+  if (LUCIDE_SLUG_ALIASES[kebab] && icons[LUCIDE_SLUG_ALIASES[kebab]]) return true;
+  return false;
+}
+
 export { pascalToKebab, kebabToPascal };

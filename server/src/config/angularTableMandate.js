@@ -21,7 +21,7 @@ export const ANGULAR_TABLE_MANDATE = `
 5. **Empty state**: \`matColumnDef="noRecords"\` footer row + \`no-records-table\` block (not a custom empty div)
 6. **Actions column**: \`list-icon-rounded\` + \`custom-table-tooltip\` + SVG from \`/scss/icons.svg\`
 7. **List page wrapper**: \`custom-page-wrapper custom-page-wrapper-list\`
-8. **Pagination** (list pages): \`mat-paginator appPagination\` + "Showing X to Y of Z"
+8. **Pagination** (list pages): \`mat-paginator\` + "Showing X to Y of Z" (add \`appPagination\` only when \`src/app/shared/directives\` exists)
 
 ### FORBIDDEN imports (do NOT use — they are not real npm entry points)
 \`\`\`typescript
@@ -39,7 +39,6 @@ import { MatRowDefModule } from '@angular/material/row-def';
 \`\`\`typescript
 import { MatTableDataSource, MatTableModule } from '@angular/material/table';
 import { MatPaginator, PageEvent } from '@angular/material/paginator';
-import { PaginatorDirective } from '@app/shared/directives';
 
 public dataSource = new MatTableDataSource<MyRow>([]);
 public displayedColumns = ['name', 'status', 'action'];

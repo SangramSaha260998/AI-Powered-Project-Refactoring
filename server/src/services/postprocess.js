@@ -12,11 +12,41 @@ import {
 import { WEB_ANGULAR_PATH_ALIASES, webAngularNpmDeps } from '../config/webAngular.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import { enforceAngularFolderStructure } from './angularStructureEnforce.js';
+import { hasUnitWriterMarkers, stripUnitWriterMarkers } from '../utils/llmOutput.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
  * Fixes the systemic issues AI conversions commonly introduce.
  */
+
+// ---------------------------------------------------------------------------
+// Unit-writer marker cleanup (===== FILE: ... ===== leaks)
+// ---------------------------------------------------------------------------
+
+/** Strip leaked multi-file markers from every source file under src/. */
+export function repairUnitWriterMarkerPollution(destPath) {
+  const srcDir = path.join(destPath, 'src');
+  if (!fs.existsSync(srcDir)) return 0;
+
+  let fixed = 0;
+  const files = walkFiles(
+    srcDir,
+    (name) => /\.(tsx?|jsx?|html|scss|css)$/i.test(name)
+  );
+  for (const file of files) {
+    const original = fs.readFileSync(file, 'utf-8');
+    if (!hasUnitWriterMarkers(original)) continue;
+    const cleaned = stripUnitWriterMarkers(original);
+    if (cleaned !== original) {
+      fs.writeFileSync(file, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`, 'utf-8');
+      fixed += 1;
+    }
+  }
+  if (fixed > 0) {
+    console.log(`[postprocess] Removed unit-writer FILE markers from ${fixed} file(s)`);
+  }
+  return fixed;
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -5238,6 +5268,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
   ensureAngularMaterialPackages(destPath, sourcePackageJson, sourceFilesMap);
+  repairUnitWriterMarkerPollution(destPath);
 
   const structureMoves = enforceAngularFolderStructure(destPath);
   if (structureMoves > 0) {
@@ -8082,6 +8113,9 @@ function stripAngularTestDepsFromReactPackage(destPath) {
 export function fixReactTypeErrors(destPath, buildErrors) {
   const errorText = String(buildErrors || '');
   let changedFiles = 0;
+  if (/TS1109|TS1005|TS1003|Expression expected/.test(errorText)) {
+    changedFiles += repairUnitWriterMarkerPollution(destPath);
+  }
   if (
     /TS5102/.test(errorText) ||
     /TS5090/.test(errorText) ||
@@ -9040,6 +9074,7 @@ function repairReactSourceFiles(destPath) {
   for (const file of files) {
     const original = fs.readFileSync(file, 'utf-8');
     let content = rewriteReactAngularLeftovers(original);
+    content = stripUnitWriterMarkers(content);
     content = stripUnusedReactDefaultImport(content);
     content = pruneUnusedNamedImports(content);
     content = removeUnusedArrowHandlers(content);
@@ -9071,6 +9106,7 @@ export function repairReactWorkspace(destPath, options = {}) {
   hoistReactSrcApp(destPath);
   addReactPathAliases(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'react');
+  repairUnitWriterMarkerPollution(destPath);
   repairReactSourceFiles(destPath);
   pinSourceDomainArtifacts(destPath, sourceFilesMap);
   consolidateDuplicateZustandStores(destPath);

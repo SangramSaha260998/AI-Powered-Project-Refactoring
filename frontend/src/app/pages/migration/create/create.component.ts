@@ -148,12 +148,21 @@ Output must compile and run after npm install.`;
   onFromChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.fromTech.set(value);
+    const opposite = this.oppositeFramework(value);
+    if (opposite) {
+      this.toTech.set(opposite);
+      this.targetVersion.set('');
+    }
     this.autoFillPromptIfSameFramework();
   }
 
   onToChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.toTech.set(value);
+    const opposite = this.oppositeFramework(value);
+    if (opposite) {
+      this.fromTech.set(opposite);
+    }
     this.targetVersion.set('');
     this.autoFillPromptIfSameFramework();
   }
@@ -595,7 +604,22 @@ Output must compile and run after npm install.`;
     const to = toRaw ? matchTech(toRaw) : '';
     if (from) this.fromTech.set(from);
     if (to) this.toTech.set(to);
-    if (from && to) this.autoFillPromptIfSameFramework();
+    if (from && !to) {
+      const opposite = this.oppositeFramework(from);
+      if (opposite) this.toTech.set(opposite);
+    } else if (to && !from) {
+      const opposite = this.oppositeFramework(to);
+      if (opposite) this.fromTech.set(opposite);
+    }
+    if (this.fromTech() && this.toTech()) this.autoFillPromptIfSameFramework();
+  }
+
+  /** React ↔ Angular cross-migration default. */
+  private oppositeFramework(tech: string): string {
+    const normalized = (tech || '').toLowerCase();
+    if (normalized === 'react') return 'Angular';
+    if (normalized === 'angular') return 'React';
+    return '';
   }
 
   private validateAndSetFile(file: File): void {

@@ -4,7 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairMismatchedHtmlClosingTags, repairInferredTemplateHandlers } from './postprocess.js';
+import { declarablesNeededByHtml, inferDeclarablePackage, repairSelfClosingNonVoidTags, repairMismatchedHtmlClosingTags, repairInferredTemplateHandlers, repairJsxAndIcuBraces } from './postprocess.js';
 
 export function isReactBootstrapPath(rel) {
   const p = String(rel || '').replace(/\\/g, '/');
@@ -296,6 +296,8 @@ function cleanupHtml(html) {
   h = h.replace(/\s+type="button"/g, ' type="button"');
   h = h.replace(/ type="button" type="button"/g, ' type="button"');
   h = h.replace(/@for \((\w+) of statusOptions; track \1\.id\)/g, '@for ($1 of statusOptions; track $1)');
+  h = h.replace(/\[value\]="status\.id"/g, '[value]="status"');
+  h = h.replace(/\{\{\s*status\.label\s*\}\}/g, '{{ statusLabels[status] }}');
   h = h.replace(/\[opened\]=/g, (match, offset) => {
     const before = h.slice(Math.max(0, offset - 80), offset);
     return /mat-sidenav/.test(before) ? match : '[open]=';
@@ -367,6 +369,7 @@ function convertJsxToAngularHtml(jsx) {
   h = convertCustomTags(h);
   h = closeCustomSelfClosing(h);
   h = convertInterpolations(h);
+  h = repairJsxAndIcuBraces(h);
   h = cleanupHtml(h);
   if (/<mat-sidenav\b/.test(h) && !/<mat-sidenav-container\b/.test(h)) {
     h = unwrapRootLayoutAroundSidenav(h);

@@ -12,6 +12,7 @@ import {
   collectConversionDefects,
   collectMissingSourcePages,
   rewriteReactAngularLeftovers,
+  stripAiBundleMarkers,
   rewriteNgxsStateToZustand,
   detectSourceStack,
   isTruncatedSource,
@@ -962,6 +963,42 @@ export function Template() {
 
   const text = rewriteReactAngularLeftovers(`<p>Delete "{{ data.task.title }}"?</p>`);
   assert(text.includes('{data.task.title}'), 'template {{ }} still becomes JSX expression');
+}
+
+// --- Leftover ===== FILE / END markers must be stripped from .tsx bodies ---
+{
+  const leaked = `===== FILE: src/components/task-task-delete-dialog/TaskDeleteDialog.tsx
+import React from 'react';
+export const TaskDeleteDialog = () => null;
+===== END =====
+`;
+  const stripped = stripAiBundleMarkers(leaked);
+  assert(!/=====/.test(stripped), 'stripAiBundleMarkers removes FILE/END tokens');
+  assert(/import React from 'react'/.test(stripped), 'keeps real source after FILE header');
+  assert(/export const TaskDeleteDialog/.test(stripped), 'keeps component body');
+
+  const viaRewrite = rewriteReactAngularLeftovers(leaked);
+  assert(!/=====/.test(viaRewrite), 'rewriteReactAngularLeftovers strips FILE markers');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-file-markers-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-delete-dialog'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-delete-dialog', 'TaskDeleteDialog.tsx'),
+    leaked
+  );
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/components/task-delete-dialog/TaskDeleteDialog.tsx(1,1): error TS1109: Expression expected.
+src/components/task-delete-dialog/TaskDeleteDialog.tsx(1,11): error TS1005: ';' expected.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors strips FILE markers on TS1109');
+  const after = fs.readFileSync(
+    path.join(tmp, 'src', 'components', 'task-delete-dialog', 'TaskDeleteDialog.tsx'),
+    'utf-8'
+  );
+  assert(!/=====/.test(after), 'workspace TS1109 fix removes markers');
+  assert(/export const TaskDeleteDialog/.test(after), 'workspace TS1109 fix keeps component');
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 // --- Module imports, store/model dedupe, react-hook-form ---

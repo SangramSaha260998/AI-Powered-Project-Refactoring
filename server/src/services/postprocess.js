@@ -8172,6 +8172,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     changedFiles += fixZustandHookUsage(destPath);
   }
   if (
+    /TS1131|TS1109|TS1128|TS1005|TS1003/.test(errorText) ||
+    /Property or signature expected|Identifier expected|Expression expected/.test(errorText)
+  ) {
+    changedFiles += stripAiBundleMarkersInWorkspace(destPath);
+  }
+  if (
     /App\.tsx/.test(errorText) &&
     /TS1003|TS1005|TS1109|TS1128|TS1131|TS1161|Identifier expected|Expression expected|Property or signature expected/.test(
       errorText
@@ -8310,10 +8316,44 @@ function ensureMuiNamedImports(content) {
 }
 
 /**
+ * Models sometimes emit `===== FILE: path =====` / `===== END =====` inside
+ * the file body (especially when the FILE header omits the closing =====).
+ * Those tokens are not TypeScript (TS1109 at column 1).
+ */
+export function stripAiBundleMarkers(content) {
+  let c = String(content || '');
+  if (!/=====/.test(c)) return c;
+  c = c.replace(/^\uFEFF?\s*===== FILE:\s*[^\r\n]*\r?\n?/i, '');
+  c = c.replace(/\r?\n?[ \t]*===== END =====[ \t]*\r?\n?$/i, '');
+  c = c.replace(/^[ \t]*===== FILE:\s*[^\r\n]*\r?\n?/gmi, '');
+  c = c.replace(/^[ \t]*===== END =====[ \t]*\r?\n?/gmi, '');
+  return c.replace(/^\s+/, '');
+}
+
+function stripAiBundleMarkersInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.tsx') || n.endsWith('.ts') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    const original = fs.readFileSync(file, 'utf-8');
+    if (!/=====/.test(original)) continue;
+    const next = stripAiBundleMarkers(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Stripped leftover AI FILE markers in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
  * Rewrite leftover Angular / NGXS / Material APIs in a React source file.
  */
 export function rewriteReactAngularLeftovers(content) {
-  let c = String(content || '');
+  let c = stripAiBundleMarkers(String(content || ''));
   c = c.replace(/from\s+['"]lucide-angular['"]/g, "from 'lucide-react'");
   c = c.replace(/from\s+['"]@lucide\/angular['"]/g, "from 'lucide-react'");
   c = rewriteNgxsStateToZustand(c);

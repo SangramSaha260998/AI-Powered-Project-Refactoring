@@ -169,9 +169,16 @@
 
       <div class="control-field">
         <label for="toTech">Target Framework (To):</label>
-        <select id="toTech" [value]="toTech()" (change)="onToChange($event)">
-          <option value="" disabled>-- Select Target Framework --</option>
-          @for (tech of technologies; track tech.id) {
+        <select
+          id="toTech"
+          [value]="toTech()"
+          (change)="onToChange($event)"
+          [disabled]="!fromTech()"
+        >
+          <option value="" disabled>
+            {{ fromTech() ? '-- Select Target Framework --' : '-- Select a source first --' }}
+          </option>
+          @for (tech of targetTechnologies; track tech.id) {
             <option [value]="tech.technology">{{ tech.technology }}</option>
           }
         </select>

@@ -154,6 +154,12 @@ Output must compile and run after npm install.`;
     return `e.g., Convert ${from} components to ${to} functional components with hooks, ensuring all lifecycle methods are replaced appropriately...`;
   }
 
+  get targetTechnologies(): TechnologyOption[] {
+    const from = this.fromTech();
+    if (!from) return [];
+    return this.technologies.filter((tech) => tech.technology !== from);
+  }
+
   get currentVersions(): VersionOption[] {
     return this.frameworkVersions[this.toTech()] || [];
   }
@@ -176,14 +182,13 @@ Output must compile and run after npm install.`;
   onFromChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.fromTech.set(value);
-    this.autoFillPromptIfSameFramework();
+    this.applyPairedTarget(value);
   }
 
   onToChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.toTech.set(value);
-    this.targetVersion.set('');
-    this.autoFillPromptIfSameFramework();
+    this.applyPairedSource(value);
   }
 
   onVersionChange(event: Event): void {
@@ -587,6 +592,30 @@ Output must compile and run after npm install.`;
     });
   }
 
+  private counterpartFramework(tech: string): string {
+    if (tech === 'Angular') return 'React';
+    if (tech === 'React') return 'Angular';
+    return '';
+  }
+
+  private applyPairedTarget(from: string): void {
+    const next = this.counterpartFramework(from);
+    if (this.toTech() !== next) {
+      this.toTech.set(next);
+      this.targetVersion.set('');
+    }
+    this.autoFillPromptIfSameFramework();
+  }
+
+  private applyPairedSource(to: string): void {
+    const next = this.counterpartFramework(to);
+    if (next && this.fromTech() !== next) {
+      this.fromTech.set(next);
+    }
+    this.targetVersion.set('');
+    this.autoFillPromptIfSameFramework();
+  }
+
   private autoFillPromptIfSameFramework(): void {
     const from = this.fromTech();
     const to = this.toTech();
@@ -622,9 +651,13 @@ Output must compile and run after npm install.`;
         ?.technology;
     const from = fromRaw ? matchTech(fromRaw) : '';
     const to = toRaw ? matchTech(toRaw) : '';
-    if (from) this.fromTech.set(from);
-    if (to) this.toTech.set(to);
-    if (from && to) this.autoFillPromptIfSameFramework();
+    if (from) {
+      this.fromTech.set(from);
+      this.applyPairedTarget(from);
+    } else if (to) {
+      this.toTech.set(to);
+      this.applyPairedSource(to);
+    }
   }
 
   private validateAndSetFile(file: File): void {

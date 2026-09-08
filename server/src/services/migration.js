@@ -39,7 +39,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, stripAiBundleMarkers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,
@@ -2228,18 +2228,19 @@ function parseUnitFileBundle(raw, expectedPaths = []) {
   }
 
   if (files.length === 0) {
-    const re = /===== FILE:\s*(.+?)\s*=====\s*\r?\n([\s\S]*?)(?====== FILE:|===== END =====|$)/g;
+    const re =
+      /===== FILE:\s*([^\n=]+?)\s*(?:=====)?\s*\r?\n([\s\S]*?)(?=\r?\n===== FILE:|\r?\n===== END =====|$)/g;
     let m;
     while ((m = re.exec(cleaned)) !== null) {
       files.push({
         path: m[1].trim().replace(/\\/g, '/').replace(/^[`'"]+|[`'"]+$/g, ''),
-        content: m[2].replace(/\n+$/, '')
+        content: stripAiBundleMarkers(m[2].replace(/\n+$/, ''))
       });
     }
   }
 
   if (files.length === 0 && expectedPaths.length === 1) {
-    files.push({ path: expectedPaths[0], content: cleaned });
+    files.push({ path: expectedPaths[0], content: stripAiBundleMarkers(cleaned) });
   }
 
   return files.filter((f) => f.path && f.content != null);
@@ -2781,6 +2782,7 @@ function sanitizeReactComponentContent(rawContent) {
  * Sanitize generated content based on destination file type.
  */
 function sanitizeGeneratedContent(relativePath, content) {
+  content = stripAiBundleMarkers(stripCodeFences(String(content || '')));
   const normalized = relativePath.replace(/\\/g, '/');
   const base = path.posix.basename(normalized);
 

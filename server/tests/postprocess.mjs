@@ -21,6 +21,8 @@ import {
   removeUnusedStoreShards,
   fixReactTypeErrors,
   repairTsconfigForModernTypeScript,
+  ensureReactViteEnvDts,
+  ensureReactTypeDevDependencies,
   consolidateDuplicateZustandStores,
   fixZustandSelectorFields,
   fixZustandHookUsage,
@@ -599,6 +601,23 @@ tsconfig.json(25,9): error TS5090: Non-relative paths are not allowed.`
     nestedBase.compilerOptions.paths['@app/*'][0] === './src/app/*',
     'nested baseUrl folded into paths'
   );
+
+  // React SCSS side-effect imports + missing @types/react-dom
+  fs.writeFileSync(path.join(tmp, 'src', 'vite-env.d.ts'), '/// <reference types="vite/client" />\n');
+  fs.writeFileSync(
+    path.join(tmp, 'package.json'),
+    JSON.stringify({ name: 'x', private: true, dependencies: { react: '^19.2.8', 'react-dom': '^19.2.8' } }, null, 2)
+  );
+  const scssFix = fixReactTypeErrors(
+    tmp,
+    `src/main.tsx(4,8): error TS2882: Cannot find module or type declarations for side-effect import of './index.scss'.
+src/main.tsx(2,22): error TS7016: Could not find a declaration file for module 'react-dom/client'.`
+  );
+  const viteEnv = fs.readFileSync(path.join(tmp, 'src', 'vite-env.d.ts'), 'utf-8');
+  const pkgAfter = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
+  assert(scssFix >= 2, 'fixReactTypeErrors repairs SCSS + React type packages');
+  assert(/declare module '\*\.scss'/.test(viteEnv), 'vite-env declares scss modules');
+  assert(pkgAfter.devDependencies['@types/react-dom'], '@types/react-dom added to package.json');
 
   // React-shaped app.routes.tsx with bogus *Component import (App.tsx already routes)
   fs.writeFileSync(

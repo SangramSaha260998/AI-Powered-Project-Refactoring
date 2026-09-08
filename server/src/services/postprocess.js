@@ -6020,6 +6020,66 @@ export function cn(...inputs: ClassValue[]) {
 // React repair
 // ---------------------------------------------------------------------------
 
+export const REACT_VITE_ENV_DTS = `/// <reference types="vite/client" />
+
+// Side-effect style imports (required when noUncheckedSideEffectImports is enabled).
+declare module '*.css';
+declare module '*.scss';
+declare module '*.sass';
+`;
+
+/**
+ * Ensure vite-env.d.ts declares CSS/SCSS modules for tsc (TS2882).
+ */
+export function ensureReactViteEnvDts(destPath) {
+  const filePath = path.join(destPath, 'src', 'vite-env.d.ts');
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+  if (
+    /declare module ['"]\*\.scss['"]/.test(existing) &&
+    /declare module ['"]\*\.css['"]/.test(existing)
+  ) {
+    return 0;
+  }
+  const next = existing.trim()
+    ? `${existing.trimEnd()}\n\ndeclare module '*.css';\ndeclare module '*.scss';\ndeclare module '*.sass';\n`
+    : REACT_VITE_ENV_DTS;
+  ensureDirectoryExists(path.dirname(filePath));
+  fs.writeFileSync(filePath, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+  return 1;
+}
+
+/**
+ * React builds need @types/* and sass in devDependencies. Render sets NODE_ENV=production
+ * which skips devDependencies unless npm install forces development mode.
+ */
+export function ensureReactTypeDevDependencies(destPath, options = {}) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+  pkg.devDependencies = pkg.devDependencies || {};
+  let changed = 0;
+  const reactVer = pkg.dependencies.react || pkg.devDependencies.react || '^19.2.8';
+  const major = Number.parseInt(String(reactVer).replace(/^[^\d]*/, ''), 10) || 19;
+  const typeDefaults =
+    major >= 19
+      ? { '@types/react': '^19.2.17', '@types/react-dom': '^19.2.3' }
+      : { '@types/react': '^18.3.18', '@types/react-dom': '^18.3.5' };
+  const required = {
+    ...typeDefaults,
+    typescript: options.typescript || '~5.9.2',
+    sass: '^1.83.0'
+  };
+  for (const [name, version] of Object.entries(required)) {
+    if (!pkg.devDependencies[name] && !pkg.dependencies[name]) {
+      pkg.devDependencies[name] = version;
+      changed += 1;
+    }
+  }
+  if (changed) writeJson(pkgPath, pkg);
+  return changed;
+}
+
 function normalizeTsconfigPathTarget(target) {
   const t = String(target || '').trim();
   if (!t) return t;
@@ -8031,6 +8091,21 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     changedFiles += repairTsconfigForModernTypeScript(destPath);
   }
   if (
+    /TS2882/.test(errorText) ||
+    /side-effect import of .*\.(?:scss|css|sass)/i.test(errorText)
+  ) {
+    changedFiles += ensureReactViteEnvDts(destPath);
+  }
+  if (
+    /TS7016/.test(errorText) &&
+    (/react-dom\/client/.test(errorText) ||
+      /react\/jsx-runtime/.test(errorText) ||
+      /@types\/react-dom/.test(errorText) ||
+      /@types\/react/.test(errorText))
+  ) {
+    changedFiles += ensureReactTypeDevDependencies(destPath);
+  }
+  if (
     /app\.routes\.(ts|tsx)/.test(errorText) ||
     (/Cannot find name 'Routes'/.test(errorText) && /routes/.test(errorText)) ||
     (/Cannot find name '\w+Component'/.test(errorText) && /app\.routes/.test(errorText)) ||
@@ -9013,6 +9088,8 @@ export function repairReactWorkspace(destPath, options = {}) {
   removeUnusedStoreShards(destPath);
   removeAngularLeftoverReactFiles(destPath);
   stripAngularTestDepsFromReactPackage(destPath);
+  ensureReactViteEnvDts(destPath);
+  ensureReactTypeDevDependencies(destPath);
   repairTsconfigForModernTypeScript(destPath);
   const renamedJsx = renameJsxTsFilesToTsx(destPath);
   if (renamedJsx > 0) {

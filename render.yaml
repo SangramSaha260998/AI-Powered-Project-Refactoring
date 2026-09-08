@@ -1,0 +1,25 @@
+# Render Blueprint — backend API (frontend deploys separately on Vercel).
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: migration-api
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GENAI_API_KEY
+        sync: false
+    disk:
+      name: migration-data
+      mountPath: /var/data
+      sizeGB: 1

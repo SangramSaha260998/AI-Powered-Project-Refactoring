@@ -7,10 +7,13 @@ export const errorInterceptorFn: HttpInterceptorFn = (req, next) => {
       let errorMessage = 'An unexpected error occurred';
 
       if (error.error instanceof ErrorEvent) {
-        // Client-side error
         errorMessage = error.error.message;
+      } else if (error.status === 0) {
+        errorMessage =
+          'Cannot reach the API. If you just deployed, the server may be waking up — wait a moment and try again.';
+      } else if (error.status === 502 || error.status === 503 || error.status === 504) {
+        errorMessage = 'API is temporarily unavailable. The server may be starting — try again shortly.';
       } else {
-        // Server-side error
         switch (error.status) {
           case 400:
             errorMessage = error.error?.error || 'Bad request';
@@ -19,7 +22,7 @@ export const errorInterceptorFn: HttpInterceptorFn = (req, next) => {
             errorMessage = 'Unauthorized. Please log in again.';
             break;
           case 403:
-            errorMessage = 'Access denied.';
+            errorMessage = error.error?.error || 'Access denied.';
             break;
           case 404:
             errorMessage = error.error?.error || 'Resource not found';

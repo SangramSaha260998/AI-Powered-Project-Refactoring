@@ -8124,6 +8124,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     changedFiles += consolidateDuplicateZustandStores(destPath);
   }
   if (
+    /Type 'string' is not assignable to type 'boolean'/.test(errorText) ||
+    (/TS2322/.test(errorText) && /TaskList|Sidebar|Dialog|open=/.test(errorText))
+  ) {
+    changedFiles += repairBooleanJsxPropsInWorkspace(destPath);
+  }
+  if (
     /Property 'open' is missing/.test(errorText) ||
     /Property 'open' does not exist/.test(errorText) ||
     /Property 'onClose' does not exist/.test(errorText) ||
@@ -8271,6 +8277,7 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     }
     content = content.replace(/: Observable<([^>]+)>/g, ': $1');
     content = rewriteReactAngularLeftovers(content);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
 
     if (content !== original) {
@@ -8888,7 +8895,7 @@ function indexComponentPropInterfaces(destPath) {
   if (!fs.existsSync(componentsRoot)) return map;
   for (const file of walkFiles(componentsRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
     const content = fs.readFileSync(file, 'utf-8');
-    for (const m of content.matchAll(/export interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
+    for (const m of content.matchAll(/(?:export\s+)?interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
       const name = m[1].replace(/Props$/, '');
       const props = new Set(
         [...m[2].matchAll(/(\w+)\??\s*:/g)].map((x) => x[1])
@@ -8993,17 +9000,110 @@ export function syncComponentCallSiteProps(destPath) {
   return changed;
 }
 
+function collectUseStateVars(content) {
+  const states = [];
+  const re = /\[(\w+),\s*set\w+\]\s*=\s*useState(?:<([^>]*)>)?\(([^)]*)\)/g;
+  for (const m of String(content || '').matchAll(re)) {
+    const name = m[1];
+    const generic = String(m[2] || '').trim();
+    const init = String(m[3] || '').trim();
+    const isBoolean =
+      /^boolean$/.test(generic) ||
+      /^(?:true|false)$/.test(init) ||
+      /^!!/.test(init) ||
+      /^Boolean\(/.test(init);
+    const isString =
+      /^string$/.test(generic) ||
+      /^['"`]/.test(init) ||
+      /TaskStatus\s*\|\s*'all'/.test(generic);
+    const isArray = /\[\]/.test(generic) || /^\s*\[/.test(init);
+    states.push({ name, generic, init, isBoolean, isString, isArray });
+  }
+  return states;
+}
+
+function pickBooleanOpenExpr(content) {
+  const states = collectUseStateVars(content);
+  const named = states.find(
+    (s) => s.isBoolean && /open|show|visible|drawer|sidebar|dialog|modal/i.test(s.name)
+  );
+  if (named) return named.name;
+  const anyBool = states.find((s) => s.isBoolean);
+  if (anyBool) return anyBool.name;
+  const parentOpen = String(content || '').match(
+    /<(?:Drawer|Dialog|Modal)\b[^>]*\bopen=\{([^}]+)\}/
+  );
+  if (parentOpen?.[1] && !/['"`]/.test(parentOpen[1])) return parentOpen[1].trim();
+  return null;
+}
+
+function isBooleanJsxExpr(expr, content) {
+  const e = String(expr || '').trim();
+  if (!e) return false;
+  if (/^(?:true|false)$/.test(e)) return true;
+  if (/^!!/.test(e) || /^Boolean\(/.test(e)) return true;
+  const hit = collectUseStateVars(content).find((s) => s.name === e);
+  if (hit?.isBoolean) return true;
+  if (hit?.isString || hit?.isArray) return false;
+  return /open|show|visible|drawer|sidebar|dialog|modal|checked|disabled|active/i.test(e);
+}
+
+/**
+ * Angular→React often binds `open={search}` because the first useState() is a
+ * string. Rewrite boolean JSX props to a real boolean open-state.
+ */
+export function repairMismatchedBooleanJsxProps(content) {
+  let c = String(content || '');
+  const openExpr = pickBooleanOpenExpr(c);
+  const stringVars = new Set(
+    collectUseStateVars(c)
+      .filter((s) => s.isString)
+      .map((s) => s.name)
+  );
+  c = c.replace(
+    /\b(open|checked|disabled|required|hidden|selected|readOnly|fullWidth|multiline|error|autoFocus)=\{(\w+)\}/g,
+    (full, prop, ident) => {
+      if (isBooleanJsxExpr(ident, c)) return full;
+      if (prop === 'open' && openExpr && openExpr !== ident) {
+        return `${prop}={${openExpr}}`;
+      }
+      if (stringVars.has(ident) && openExpr && prop === 'open') {
+        return `open={${openExpr}}`;
+      }
+      return full;
+    }
+  );
+  return c;
+}
+
+function repairBooleanJsxPropsInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx'))) {
+    const original = fs.readFileSync(file, 'utf-8');
+    const next = repairMismatchedBooleanJsxProps(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Rewrote string→boolean JSX props in ${changed} file(s)`);
+  }
+  return changed;
+}
+
 /** Inject required props only when the component interface declares them. */
 export function injectMissingComponentProps(content, componentProps = null) {
-  let c = String(content || '');
+  let c = repairMismatchedBooleanJsxProps(String(content || ''));
   if (!componentProps || typeof componentProps.entries !== 'function') return c;
+  const openExpr = pickBooleanOpenExpr(c);
   for (const [compName, props] of componentProps.entries()) {
     if (!props || typeof props.has !== 'function' || !props.has('open')) continue;
     const tag = String(compName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (!new RegExp(`<${tag}\\b`).test(c) || new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
-    const openVar = c.match(/\[(\w+),\s*set\w+\]\s*=\s*useState\([^)]*\)/)?.[1];
-    if (!openVar) continue;
-    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openVar}}$1`);
+    if (!new RegExp(`<${tag}\\b`).test(c)) continue;
+    if (new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
+    if (!openExpr) continue;
+    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openExpr}}$1`);
   }
   return c;
 }
@@ -9040,6 +9140,7 @@ function repairReactSourceFiles(destPath) {
   for (const file of files) {
     const original = fs.readFileSync(file, 'utf-8');
     let content = rewriteReactAngularLeftovers(original);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
     content = pruneUnusedNamedImports(content);
     content = removeUnusedArrowHandlers(content);

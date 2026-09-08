@@ -242,6 +242,17 @@ function setSession(id, patch) {
   return next;
 }
 
+function applyLiveProgress(id, progress, fallbackMessage, fallbackPhase) {
+  const prev = sessionStatus.get(id) || {};
+  return setSession(id, {
+    status: 'running',
+    message: progress.message || fallbackMessage,
+    phase: progress.phase || fallbackPhase,
+    unitIndex: progress.unitIndex ?? prev.unitIndex,
+    unitTotal: progress.unitTotal ?? prev.unitTotal,
+  });
+}
+
 function scheduleSessionExpiry(id) {
   setTimeout(() => {
     sessionDownloads.delete(id);
@@ -890,13 +901,7 @@ router.post('/migrate', upload.fields([{ name: 'zipFile', maxCount: 1 }, { name:
           enableVisualQa,
           visualQaRoutes,
           onProgress: (progress) => {
-            setSession(id, {
-              status: 'running',
-              message: progress.message || 'Migrating...',
-              phase: progress.phase || 'running',
-              unitIndex: progress.unitIndex,
-              unitTotal: progress.unitTotal,
-            });
+            applyLiveProgress(id, progress, 'Migrating...', 'running');
           },
         }
       );
@@ -1133,13 +1138,7 @@ router.post('/project/:sessionId/resume', (req, res) => {
         priorityRulesMode,
         resume: true,
         onProgress: (progress) => {
-          setSession(sessionId, {
-            status: 'running',
-            message: progress.message || 'Migrating...',
-            phase: progress.phase || 'running',
-            unitIndex: progress.unitIndex,
-            unitTotal: progress.unitTotal,
-          });
+          applyLiveProgress(sessionId, progress, 'Migrating...', 'running');
         },
       });
 
@@ -1271,13 +1270,7 @@ router.post('/project/:sessionId/rework', (req, res) => {
         aiModel,
         referencePath: meta.referencePath || null,
         onProgress: (progress) => {
-          setSession(sessionId, {
-            status: 'running',
-            message: progress.message || 'Applying changes...',
-            phase: progress.phase || 'rework',
-            zipFile: null,
-            extractPath: null,
-          });
+          applyLiveProgress(sessionId, progress, 'Applying changes...', 'rework');
         },
       });
 

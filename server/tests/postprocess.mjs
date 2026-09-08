@@ -27,6 +27,7 @@ import {
   fixZustandSelectorFields,
   fixZustandHookUsage,
   injectMissingComponentProps,
+  repairMismatchedBooleanJsxProps,
   syncComponentCallSiteProps,
   fixTaskModelFieldMismatches,
   alignTaskStatusLiterals,
@@ -1071,6 +1072,52 @@ export function Template() {
   );
   assert(!/open=\{/.test(withOpenInterface) || /sidebarOpen/.test(withOpenInterface), 'open injected only when interface requires it');
 
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- Angular→React: do not bind open={search} (string) onto boolean props ---
+{
+  const src = `import { useState } from 'react';
+export function TaskList() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [search, setSearch] = useState('');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  return (
+    <Drawer open={sidebarOpen}>
+      <TaskFormSidebar task={null} onSave={() => {}} onCancel={() => {}} />
+    </Drawer>
+  );
+}
+`;
+  const injected = injectMissingComponentProps(
+    src,
+    new Map([['TaskFormSidebar', new Set(['open', 'task', 'onSave', 'onCancel'])]])
+  );
+  assert(
+    /<TaskFormSidebar open=\{sidebarOpen\}/.test(injected),
+    'injects boolean sidebarOpen for TaskFormSidebar.open'
+  );
+  assert(!/open=\{search\}/.test(injected), 'does not bind open to search string');
+
+  const alreadyWrong = src.replace(
+    '<TaskFormSidebar ',
+    '<TaskFormSidebar open={search} '
+  );
+  const rewritten = repairMismatchedBooleanJsxProps(alreadyWrong);
+  assert(/open=\{sidebarOpen\}/.test(rewritten), 'rewrites open={search} to sidebarOpen');
+  assert(!/open=\{search\}/.test(rewritten), 'removes string open={search} binding');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-open-bool-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'pages', 'task-list'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'), alreadyWrong);
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/pages/task-list/TaskList.tsx(176,26): error TS2322: Type 'string' is not assignable to type 'boolean'.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors rewrites string→boolean open prop');
+  const afterTsc = fs.readFileSync(path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'), 'utf-8');
+  assert(/open=\{sidebarOpen\}/.test(afterTsc), 'tsc-driven fix uses sidebarOpen');
+  assert(!/open=\{search\}/.test(afterTsc), 'tsc-driven fix drops search string');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

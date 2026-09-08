@@ -39,7 +39,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,
@@ -1334,11 +1334,10 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null, options 
       importHelpers: true,
       target: 'ES2022',
       module: 'preserve',
-      baseUrl: './',
       paths: {
-        '@/*': ['src/*'],
-        '@app/*': ['src/app/*'],
-        '@env/*': ['src/environments/*']
+        '@/*': ['./src/*'],
+        '@app/*': ['./src/app/*'],
+        '@env/*': ['./src/environments/*']
       }
     },
     angularCompilerOptions: {
@@ -1812,14 +1811,14 @@ function injectReactWorkspaceTemplates(destPath, versionStack = null, options = 
       noUnusedLocals: true,
       noUnusedParameters: true,
       noFallthroughCasesInSwitch: true,
-      baseUrl: '.',
       paths: {
-        '@/*': ['src/*']
+        '@/*': ['./src/*']
       }
     },
     include: ['src']
   };
   fs.writeFileSync(path.join(destPath, 'tsconfig.json'), JSON.stringify(tsConfig, null, 2));
+  repairTsconfigForModernTypeScript(destPath);
 
   // 3. vite.config.ts
   const viteConfig = `import { defineConfig } from 'vite';
@@ -3227,6 +3226,12 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
   const isReact = String(targetTech).toLowerCase().includes('react');
   const isAngular = String(targetTech).toLowerCase().includes('angular');
   let skipNpmInstall = false;
+
+  // TypeScript 5.9+ rejects baseUrl and non-relative path targets in tsconfig*.json.
+  const tsconfigRepairs = repairTsconfigForModernTypeScript(workspacePath);
+  if (tsconfigRepairs > 0) {
+    console.log(`[${sessionId}] Normalized ${tsconfigRepairs} tsconfig file(s) for TypeScript 5.9+`);
+  }
 
   for (let attempt = 1; attempt <= MAX_BUILD_FIX_ATTEMPTS; attempt++) {
     if (isReact) {

@@ -20,6 +20,7 @@ import {
   dedupeStoreModelTypes,
   removeUnusedStoreShards,
   fixReactTypeErrors,
+  repairTsconfigForModernTypeScript,
   consolidateDuplicateZustandStores,
   fixZustandSelectorFields,
   fixZustandHookUsage,
@@ -341,6 +342,8 @@ export function cn(...inputs: ClassValue[]) {
 
   const tsconfig = JSON.parse(fs.readFileSync(path.join(tmp, 'tsconfig.json'), 'utf-8'));
   assert(tsconfig.compilerOptions.paths?.['@/*'], '@/* path alias added');
+  assert(tsconfig.compilerOptions.baseUrl == null, 'baseUrl removed for TS 5.9+');
+  assert(tsconfig.compilerOptions.paths['@/*'][0].startsWith('./'), 'path targets are relative');
 
   const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
   assert(pkg.dependencies.clsx, 'clsx merged into package.json');
@@ -549,6 +552,53 @@ src/app.routes.ts(4,26): error TS2304: Cannot find name 'TaskListComponent'.`
   );
   assert(n >= 1, 'fixReactTypeErrors removes Angular app.routes leftover');
   assert(!fs.existsSync(path.join(tmp, 'src', 'app.routes.ts')), 'build-fix deletes app.routes.ts');
+
+  // TS 5.9 tsconfig baseUrl removal
+  fs.writeFileSync(
+    path.join(tmp, 'tsconfig.json'),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          jsx: 'react-jsx',
+          baseUrl: '.',
+          paths: { '@/*': ['src/*'] }
+        }
+      },
+      null,
+      2
+    )
+  );
+  const tsFix = fixReactTypeErrors(
+    tmp,
+    `tsconfig.json(22,5): error TS5102: Option 'baseUrl' has been removed.
+tsconfig.json(25,9): error TS5090: Non-relative paths are not allowed.`
+  );
+  const tsconfig59 = JSON.parse(fs.readFileSync(path.join(tmp, 'tsconfig.json'), 'utf-8'));
+  assert(tsFix >= 1, 'fixReactTypeErrors repairs TS5102/TS5090 tsconfig');
+  assert(tsconfig59.compilerOptions.baseUrl == null, 'baseUrl removed');
+  assert(tsconfig59.compilerOptions.paths['@/*'][0] === './src/*', 'paths use ./ prefix');
+
+  // Non-root baseUrl must be folded into path targets before removal.
+  fs.writeFileSync(
+    path.join(tmp, 'tsconfig.json'),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          baseUrl: './src',
+          paths: { '@app/*': ['app/*'] }
+        }
+      },
+      null,
+      2
+    )
+  );
+  repairTsconfigForModernTypeScript(tmp);
+  const nestedBase = JSON.parse(fs.readFileSync(path.join(tmp, 'tsconfig.json'), 'utf-8'));
+  assert(nestedBase.compilerOptions.baseUrl == null, 'nested baseUrl removed');
+  assert(
+    nestedBase.compilerOptions.paths['@app/*'][0] === './src/app/*',
+    'nested baseUrl folded into paths'
+  );
 
   // React-shaped app.routes.tsx with bogus *Component import (App.tsx already routes)
   fs.writeFileSync(

@@ -1,6 +1,6 @@
 import express from 'express';
-import cors from 'cors';
 import multer from 'multer';
+import { createCorsMiddleware } from './cors.js';
 import healthRouter from './routes/health.js';
 import uploadRouter from './routes/upload.js';
 import modelsRouter from './routes/models.js';
@@ -10,7 +10,7 @@ const app = express();
 // ---------------------------------------------------------------------------
 // Global middleware
 // ---------------------------------------------------------------------------
-app.use(cors());
+app.use(createCorsMiddleware());
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,10 @@ app.use((err, req, res, next) => {
 
   if (err.message === 'Only ZIP files are allowed!') {
     return res.status(400).json({ error: err.message });
+  }
+
+  if (String(err.message || '').startsWith('CORS blocked')) {
+    return res.status(403).json({ error: err.message });
   }
 
   res.status(500).json({

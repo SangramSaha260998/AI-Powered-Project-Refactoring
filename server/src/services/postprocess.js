@@ -4048,12 +4048,8 @@ function repairAngularRoutes(destPath) {
 function addAngularPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfigAppPath = path.join(destPath, 'tsconfig.app.json');
-  // web_angular template aliases (plus @/ as a convenience for cn() helpers)
-  const pathAliases = { ...WEB_ANGULAR_PATH_ALIASES };
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
-  tsconfig.compilerOptions.baseUrl = './';
-  // Classic "node" resolution cannot read Angular package "exports" (e.g. @angular/common/http)
   if (tsconfig.compilerOptions.moduleResolution === 'node') {
     tsconfig.compilerOptions.moduleResolution = 'bundler';
   }
@@ -4061,14 +4057,19 @@ function addAngularPathAliases(destPath) {
   if (!libs.includes('dom.iterable')) {
     tsconfig.compilerOptions.lib = [...new Set([...libs, 'ES2022', 'dom', 'dom.iterable'])];
   }
-  // Normalize existing path targets now that baseUrl is './' (e.g. "app/*" → "src/app/*")
   const existingPaths = tsconfig.compilerOptions.paths || {};
   const normalizedPaths = {};
   for (const [key, targets] of Object.entries(existingPaths)) {
     normalizedPaths[key] = (targets || []).map((t) =>
-      /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+      normalizeTsconfigPathTarget(/^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`)
     );
   }
+  const pathAliases = Object.fromEntries(
+    Object.entries({ ...WEB_ANGULAR_PATH_ALIASES }).map(([key, targets]) => [
+      key,
+      (targets || []).map(normalizeTsconfigPathTarget)
+    ])
+  );
   tsconfig.compilerOptions.paths = { ...normalizedPaths, ...pathAliases };
   const coreVer = String(readJsonSafe(path.join(destPath, 'package.json'))?.dependencies?.['@angular/core'] || '');
   const angularMajor = Number.parseInt(coreVer.replace(/^[^\d]*/, ''), 10);
@@ -4078,20 +4079,21 @@ function addAngularPathAliases(destPath) {
     tsconfig.compilerOptions.ignoreDeprecations = '6.0';
   }
   writeJson(tsconfigPath, tsconfig);
+  repairTsconfigForModernTypeScript(destPath);
 
   if (fs.existsSync(tsconfigAppPath)) {
     const appCfg = readJsonSafe(tsconfigAppPath) || {};
     appCfg.compilerOptions = appCfg.compilerOptions || {};
-    appCfg.compilerOptions.baseUrl = './';
     const appPaths = appCfg.compilerOptions.paths || {};
     const appNormalized = {};
     for (const [key, targets] of Object.entries(appPaths)) {
       appNormalized[key] = (targets || []).map((t) =>
-        /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+        normalizeTsconfigPathTarget(/^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`)
       );
     }
     appCfg.compilerOptions.paths = { ...appNormalized, ...pathAliases };
     writeJson(tsconfigAppPath, appCfg);
+    repairTsconfigForModernTypeScript(destPath);
   }
 }
 
@@ -5293,6 +5295,8 @@ export function repairAngularWorkspace(destPath, options = {}) {
     }
   }
 
+  repairTsconfigForModernTypeScript(destPath);
+
   // Strip Node-only imports from any remaining src files (browser build)
   for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts'))) {
     try {
@@ -5500,6 +5504,14 @@ function repairAngularComponentDecoratorIssues(destPath, buildErrors) {
  */
 export function fixAngularCompileErrors(destPath, buildErrors) {
   const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  if (
+    /TS5102/.test(text) ||
+    /TS5090/.test(text) ||
+    /Option 'baseUrl' has been removed/.test(text) ||
+    /Non-relative paths are not allowed/.test(text)
+  ) {
+    return repairTsconfigForModernTypeScript(destPath);
+  }
   const eventIssues =
     /TS2345/.test(text) ||
     /Argument of type 'Event'/.test(text) ||
@@ -6008,16 +6020,153 @@ export function cn(...inputs: ClassValue[]) {
 // React repair
 // ---------------------------------------------------------------------------
 
+export const REACT_VITE_ENV_DTS = `/// <reference types="vite/client" />
+
+// Side-effect style imports (required when noUncheckedSideEffectImports is enabled).
+declare module '*.css';
+declare module '*.scss';
+declare module '*.sass';
+`;
+
+/**
+ * Ensure vite-env.d.ts declares CSS/SCSS modules for tsc (TS2882).
+ */
+export function ensureReactViteEnvDts(destPath) {
+  const filePath = path.join(destPath, 'src', 'vite-env.d.ts');
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+  if (
+    /declare module ['"]\*\.scss['"]/.test(existing) &&
+    /declare module ['"]\*\.css['"]/.test(existing)
+  ) {
+    return 0;
+  }
+  const next = existing.trim()
+    ? `${existing.trimEnd()}\n\ndeclare module '*.css';\ndeclare module '*.scss';\ndeclare module '*.sass';\n`
+    : REACT_VITE_ENV_DTS;
+  ensureDirectoryExists(path.dirname(filePath));
+  fs.writeFileSync(filePath, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+  return 1;
+}
+
+/**
+ * React builds need @types/* and sass in devDependencies. Render sets NODE_ENV=production
+ * which skips devDependencies unless npm install forces development mode.
+ */
+export function ensureReactTypeDevDependencies(destPath, options = {}) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+  pkg.devDependencies = pkg.devDependencies || {};
+  let changed = 0;
+  const reactVer = pkg.dependencies.react || pkg.devDependencies.react || '^19.2.8';
+  const major = Number.parseInt(String(reactVer).replace(/^[^\d]*/, ''), 10) || 19;
+  const typeDefaults =
+    major >= 19
+      ? { '@types/react': '^19.2.17', '@types/react-dom': '^19.2.3' }
+      : { '@types/react': '^18.3.18', '@types/react-dom': '^18.3.5' };
+  const required = {
+    ...typeDefaults,
+    typescript: options.typescript || '~5.9.2',
+    sass: '^1.83.0'
+  };
+  for (const [name, version] of Object.entries(required)) {
+    if (!pkg.devDependencies[name] && !pkg.dependencies[name]) {
+      pkg.devDependencies[name] = version;
+      changed += 1;
+    }
+  }
+  if (changed) writeJson(pkgPath, pkg);
+  return changed;
+}
+
+function normalizeTsconfigPathTarget(target) {
+  const t = String(target || '').trim();
+  if (!t) return t;
+  if (/^(\.\/|\.\.\/)/.test(t)) return t;
+  return `./${t}`;
+}
+
+function isRootTsconfigBaseUrl(baseUrl) {
+  const base = String(baseUrl || '.').replace(/\\/g, '/').replace(/\/$/, '');
+  return base === '' || base === '.' || base === './';
+}
+
+function joinTsconfigPathSegments(...segments) {
+  const joined = segments
+    .filter(Boolean)
+    .map((s) => String(s).replace(/\\/g, '/'))
+    .join('/')
+    .replace(/\/+/g, '/');
+  return normalizeTsconfigPathTarget(joined);
+}
+
+function rewriteTsconfigPathsForModernTypeScript(paths, baseUrl) {
+  const next = {};
+  const rootBase = isRootTsconfigBaseUrl(baseUrl);
+  const base = String(baseUrl || '.').replace(/\\/g, '/').replace(/\/$/, '') || '.';
+
+  for (const [key, targets] of Object.entries(paths || {})) {
+    const list = Array.isArray(targets) ? targets : [targets];
+    next[key] = list.map((target) => {
+      const raw = String(target || '').replace(/\\/g, '/');
+      if (rootBase) {
+        return normalizeTsconfigPathTarget(raw);
+      }
+      if (/^(\.\/|\.\.\/)/.test(raw)) {
+        return joinTsconfigPathSegments(base, raw);
+      }
+      return joinTsconfigPathSegments(base, raw);
+    });
+  }
+  return next;
+}
+
+/**
+ * TypeScript 5.9+ (tsc -b): baseUrl is removed; path targets must be relative (./…).
+ */
+export function repairTsconfigForModernTypeScript(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(destPath, (n) => /^tsconfig.*\.json$/i.test(path.basename(n)))) {
+    const cfg = readJsonSafe(file);
+    if (!cfg?.compilerOptions) continue;
+    const co = cfg.compilerOptions;
+    let touched = false;
+    const baseUrl = co.baseUrl;
+
+    if ('baseUrl' in co) {
+      delete co.baseUrl;
+      touched = true;
+    }
+
+    if (co.paths && typeof co.paths === 'object') {
+      const next = rewriteTsconfigPathsForModernTypeScript(co.paths, baseUrl);
+      const prev = JSON.stringify(co.paths);
+      const normalized = JSON.stringify(next);
+      if (prev !== normalized) {
+        co.paths = next;
+        touched = true;
+      }
+    }
+
+    if (touched) {
+      writeJson(file, cfg);
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 function addReactPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
-  tsconfig.compilerOptions.baseUrl = '.';
   tsconfig.compilerOptions.paths = {
     ...(tsconfig.compilerOptions.paths || {}),
-    '@/*': ['src/*']
+    '@/*': ['./src/*']
   };
   writeJson(tsconfigPath, tsconfig);
+  repairTsconfigForModernTypeScript(destPath);
 
   const vitePath = path.join(destPath, 'vite.config.ts');
   const viteConfig = `import { defineConfig } from 'vite';
@@ -7934,6 +8083,29 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   const errorText = String(buildErrors || '');
   let changedFiles = 0;
   if (
+    /TS5102/.test(errorText) ||
+    /TS5090/.test(errorText) ||
+    /Option 'baseUrl' has been removed/.test(errorText) ||
+    /Non-relative paths are not allowed/.test(errorText)
+  ) {
+    changedFiles += repairTsconfigForModernTypeScript(destPath);
+  }
+  if (
+    /TS2882/.test(errorText) ||
+    /side-effect import of .*\.(?:scss|css|sass)/i.test(errorText)
+  ) {
+    changedFiles += ensureReactViteEnvDts(destPath);
+  }
+  if (
+    /TS7016/.test(errorText) &&
+    (/react-dom\/client/.test(errorText) ||
+      /react\/jsx-runtime/.test(errorText) ||
+      /@types\/react-dom/.test(errorText) ||
+      /@types\/react/.test(errorText))
+  ) {
+    changedFiles += ensureReactTypeDevDependencies(destPath);
+  }
+  if (
     /app\.routes\.(ts|tsx)/.test(errorText) ||
     (/Cannot find name 'Routes'/.test(errorText) && /routes/.test(errorText)) ||
     (/Cannot find name '\w+Component'/.test(errorText) && /app\.routes/.test(errorText)) ||
@@ -8916,6 +9088,9 @@ export function repairReactWorkspace(destPath, options = {}) {
   removeUnusedStoreShards(destPath);
   removeAngularLeftoverReactFiles(destPath);
   stripAngularTestDepsFromReactPackage(destPath);
+  ensureReactViteEnvDts(destPath);
+  ensureReactTypeDevDependencies(destPath);
+  repairTsconfigForModernTypeScript(destPath);
   const renamedJsx = renameJsxTsFilesToTsx(destPath);
   if (renamedJsx > 0) {
     console.log(`[postprocess] Renamed ${renamedJsx} JSX .ts file(s) to .tsx`);

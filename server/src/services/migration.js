@@ -39,7 +39,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,
@@ -1334,11 +1334,10 @@ function injectAngularWorkspaceTemplates(destPath, versionStack = null, options 
       importHelpers: true,
       target: 'ES2022',
       module: 'preserve',
-      baseUrl: './',
       paths: {
-        '@/*': ['src/*'],
-        '@app/*': ['src/app/*'],
-        '@env/*': ['src/environments/*']
+        '@/*': ['./src/*'],
+        '@app/*': ['./src/app/*'],
+        '@env/*': ['./src/environments/*']
       }
     },
     angularCompilerOptions: {
@@ -1812,14 +1811,14 @@ function injectReactWorkspaceTemplates(destPath, versionStack = null, options = 
       noUnusedLocals: true,
       noUnusedParameters: true,
       noFallthroughCasesInSwitch: true,
-      baseUrl: '.',
       paths: {
-        '@/*': ['src/*']
+        '@/*': ['./src/*']
       }
     },
     include: ['src']
   };
   fs.writeFileSync(path.join(destPath, 'tsconfig.json'), JSON.stringify(tsConfig, null, 2));
+  repairTsconfigForModernTypeScript(destPath);
 
   // 3. vite.config.ts
   const viteConfig = `import { defineConfig } from 'vite';
@@ -1928,10 +1927,8 @@ export default {
     try { fs.unlinkSync(legacyIndexCss); } catch { /* ignore */ }
   }
 
-  // 7. src/vite-env.d.ts
-  const viteEnvDts = `/// <reference types="vite/client" />
-`;
-  fs.writeFileSync(path.join(destPath, 'src', 'vite-env.d.ts'), viteEnvDts);
+  // 7. src/vite-env.d.ts — explicit asset modules for TS 5.6+ noUncheckedSideEffectImports
+  fs.writeFileSync(path.join(destPath, 'src', 'vite-env.d.ts'), REACT_VITE_ENV_DTS);
 
   // 8. .gitignore
   const gitignore = `# Logs
@@ -2933,7 +2930,7 @@ export {
 const NPM_QUIET_FLAGS = ['--no-fund', '--no-audit', '--no-update-notifier'];
 const NPM_INSTALL_TIMEOUT_MS = 600000;
 
-function runCommand(cmd, args, cwd, timeoutMs = 300000) {
+function runCommand(cmd, args, cwd, timeoutMs = 300000, options = {}) {
   return new Promise((resolve) => {
     execFile(
       cmd,
@@ -2946,6 +2943,7 @@ function runCommand(cmd, args, cwd, timeoutMs = 300000) {
         maxBuffer: 32 * 1024 * 1024,
         env: {
           ...process.env,
+          ...(options.env || {}),
           npm_config_fund: 'false',
           npm_config_audit: 'false',
           npm_config_update_notifier: 'false'
@@ -2998,11 +2996,23 @@ function summarizeNpmFailure(result) {
 }
 
 function runNpmInstall(cwd, extraArgs = []) {
-  return runCommand('npm', ['install', ...NPM_QUIET_FLAGS, ...extraArgs], cwd, NPM_INSTALL_TIMEOUT_MS);
+  return runCommand(
+    'npm',
+    ['install', ...NPM_QUIET_FLAGS, ...extraArgs],
+    cwd,
+    NPM_INSTALL_TIMEOUT_MS,
+    { env: { NODE_ENV: 'development' } }
+  );
 }
 
 function runNpmCi(cwd) {
-  return runCommand('npm', ['ci', ...NPM_QUIET_FLAGS], cwd, NPM_INSTALL_TIMEOUT_MS);
+  return runCommand(
+    'npm',
+    ['ci', ...NPM_QUIET_FLAGS],
+    cwd,
+    NPM_INSTALL_TIMEOUT_MS,
+    { env: { NODE_ENV: 'development' } }
+  );
 }
 
 /**
@@ -3228,6 +3238,16 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
   const isAngular = String(targetTech).toLowerCase().includes('angular');
   let skipNpmInstall = false;
 
+  // TypeScript 5.9+ rejects baseUrl and non-relative path targets in tsconfig*.json.
+  const tsconfigRepairs = repairTsconfigForModernTypeScript(workspacePath);
+  if (tsconfigRepairs > 0) {
+    console.log(`[${sessionId}] Normalized ${tsconfigRepairs} tsconfig file(s) for TypeScript 5.9+`);
+  }
+  if (isReact) {
+    ensureReactViteEnvDts(workspacePath);
+    ensureReactTypeDevDependencies(workspacePath);
+  }
+
   for (let attempt = 1; attempt <= MAX_BUILD_FIX_ATTEMPTS; attempt++) {
     if (isReact) {
       const renamed = renameJsxTsFilesToTsx(workspacePath);
@@ -3247,16 +3267,18 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
       if (isReact) {
         const repairedPkgs = repairReactWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson }) || 0;
         const addedPkgs = addPackagesFromBuildErrors(workspacePath, result.errors);
+        const typeDeps = ensureReactTypeDevDependencies(workspacePath);
+        const viteDts = ensureReactViteEnvDts(workspacePath);
         const typeFixed = fixReactTypeErrors(workspacePath, result.errors);
         const missingModule = /Cannot find module/.test(result.errors || '');
-        if (repairedPkgs > 0 || addedPkgs > 0 || (missingModule && typeFixed === 0)) {
+        if (repairedPkgs > 0 || addedPkgs > 0 || typeDeps > 0 || (missingModule && typeFixed === 0)) {
           console.log(`[${sessionId}] Installing dependencies after postprocess/package fixes...`);
           await runNpmInstall(workspacePath);
           skipNpmInstall = true;
           continue;
         }
-        if (typeFixed > 0) {
-          console.log(`[${sessionId}] Mechanically fixed type errors in ${typeFixed} file(s). Retrying build...`);
+        if (typeFixed > 0 || viteDts > 0) {
+          console.log(`[${sessionId}] Mechanically fixed type errors in ${typeFixed + viteDts} file(s). Retrying build...`);
           continue;
         }
       }

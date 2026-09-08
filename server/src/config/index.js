@@ -19,10 +19,41 @@ export const FRAMEWORK_SIGNATURES = {
 export const PORT = process.env.PORT || 5000;
 
 /**
+ * Writable data root for uploads and extracted workspaces.
+ * On Render, mount a persistent disk at /var/data and set DATA_DIR=/var/data.
+ */
+const DATA_ROOT = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.resolve(__dirname, '..', '..');
+
+/**
  * Directories for uploads and extracted projects.
  */
-export const UPLOAD_DIR = path.resolve(__dirname, '..', '..', 'uploads');
-export const EXTRACT_DIR = path.resolve(__dirname, '..', '..', 'extracted');
+export const UPLOAD_DIR = path.join(DATA_ROOT, 'uploads');
+export const EXTRACT_DIR = path.join(DATA_ROOT, 'extracted');
+
+/**
+ * Primary frontend origin(s) for CORS and OpenRouter HTTP-Referer.
+ * Comma-separated list, e.g. https://my-app.vercel.app,https://www.example.com
+ */
+export function getFrontendOrigins() {
+  const raw = process.env.FRONTEND_URL || process.env.CORS_ORIGINS || '';
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function getFrontendUrl() {
+  return getFrontendOrigins()[0] || 'http://localhost:4400';
+}
+
+export function getOpenRouterDefaultHeaders() {
+  return {
+    'HTTP-Referer': getFrontendUrl(),
+    'X-Title': 'AI Framework Migration Studio',
+  };
+}
 
 /**
  * Maximum allowed upload file size (50 MB).
@@ -62,10 +93,7 @@ export const PROVIDERS = {
     defaultBaseURL: 'https://openrouter.ai/api/v1',
     // Prefer a known free chat model over auto-router (auto can route to paid models).
     defaultModel: 'nvidia/nemotron-3-super-120b-a12b:free',
-    defaultHeaders: {
-      'HTTP-Referer': 'http://localhost:4200',
-      'X-Title': 'AI Framework Migration Studio',
-    },
+    defaultHeaders: getOpenRouterDefaultHeaders(),
     // Only models that currently succeed on the free key. Dead/429-first slugs
     // waste minutes before fallback. Override with OPENROUTER_MODELS=...
     models: [
@@ -255,7 +283,8 @@ export function getProviderConfigs(provider = 'openrouter', overrideModel) {
   const apiKey = process.env[`${prov.envPrefix}_API_KEY`] || '';
   const baseURL = process.env[`${prov.envPrefix}_BASE_URL`] || prov.defaultBaseURL;
   const model = overrideModel || process.env[`${prov.envPrefix}_MODEL`] || prov.defaultModel;
-  const defaultHeaders = prov.defaultHeaders || undefined;
+  const defaultHeaders =
+    provider === 'openrouter' ? getOpenRouterDefaultHeaders() : prov.defaultHeaders || undefined;
 
   const keys = apiKey
     .split(',')

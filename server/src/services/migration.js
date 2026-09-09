@@ -41,7 +41,7 @@ import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } fro
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
 import { stripUnitWriterMarkers } from '../utils/llmOutput.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, stripAiBundleMarkers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,

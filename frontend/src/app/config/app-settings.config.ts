@@ -6,10 +6,15 @@ export const appSettings = {
   /** Must match server MAX_FILE_SIZE (50 MB). */
   maxUploadBytes: 50 * 1024 * 1024,
   pollIntervalMs: 2000,
-  uploadTimeoutMs: 120_000, // 2 minutes
-  downloadTimeoutMs: 300_000, // 5 minutes
-  statusTimeoutMs: 30_000, // 30 seconds
+  /** Upload + cold-start on Render can exceed 2 minutes. */
+  uploadTimeoutMs: 300_000,
+  downloadTimeoutMs: 300_000,
+  /** Status poll must survive Render free-tier wake-up. */
+  statusTimeoutMs: 120_000,
   messageClearDelayMs: 4000,
-  deleteTimeoutMs: 30_000, // 30 seconds
-  projectCheckTimeoutMs: 15_000, // 15 seconds
+  deleteTimeoutMs: 60_000,
+  projectCheckTimeoutMs: 90_000,
+  /** Wake sleeping Render instance before first migration request. */
+  backendWarmupRetries: 4,
+  backendWarmupDelayMs: 8000,
 };

@@ -12,11 +12,41 @@ import {
 import { WEB_ANGULAR_PATH_ALIASES, webAngularNpmDeps } from '../config/webAngular.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import { enforceAngularFolderStructure } from './angularStructureEnforce.js';
+import { hasUnitWriterMarkers, stripUnitWriterMarkers } from '../utils/llmOutput.js';
 
 /**
  * Post-generation repair for migrated Angular / React workspaces.
  * Fixes the systemic issues AI conversions commonly introduce.
  */
+
+// ---------------------------------------------------------------------------
+// Unit-writer marker cleanup (===== FILE: ... ===== leaks)
+// ---------------------------------------------------------------------------
+
+/** Strip leaked multi-file markers from every source file under src/. */
+export function repairUnitWriterMarkerPollution(destPath) {
+  const srcDir = path.join(destPath, 'src');
+  if (!fs.existsSync(srcDir)) return 0;
+
+  let fixed = 0;
+  const files = walkFiles(
+    srcDir,
+    (name) => /\.(tsx?|jsx?|html|scss|css)$/i.test(name)
+  );
+  for (const file of files) {
+    const original = fs.readFileSync(file, 'utf-8');
+    if (!hasUnitWriterMarkers(original)) continue;
+    const cleaned = stripUnitWriterMarkers(original);
+    if (cleaned !== original) {
+      fs.writeFileSync(file, cleaned.endsWith('\n') ? cleaned : `${cleaned}\n`, 'utf-8');
+      fixed += 1;
+    }
+  }
+  if (fixed > 0) {
+    console.log(`[postprocess] Removed unit-writer FILE markers from ${fixed} file(s)`);
+  }
+  return fixed;
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -4048,12 +4078,8 @@ function repairAngularRoutes(destPath) {
 function addAngularPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfigAppPath = path.join(destPath, 'tsconfig.app.json');
-  // web_angular template aliases (plus @/ as a convenience for cn() helpers)
-  const pathAliases = { ...WEB_ANGULAR_PATH_ALIASES };
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
-  tsconfig.compilerOptions.baseUrl = './';
-  // Classic "node" resolution cannot read Angular package "exports" (e.g. @angular/common/http)
   if (tsconfig.compilerOptions.moduleResolution === 'node') {
     tsconfig.compilerOptions.moduleResolution = 'bundler';
   }
@@ -4061,14 +4087,19 @@ function addAngularPathAliases(destPath) {
   if (!libs.includes('dom.iterable')) {
     tsconfig.compilerOptions.lib = [...new Set([...libs, 'ES2022', 'dom', 'dom.iterable'])];
   }
-  // Normalize existing path targets now that baseUrl is './' (e.g. "app/*" → "src/app/*")
   const existingPaths = tsconfig.compilerOptions.paths || {};
   const normalizedPaths = {};
   for (const [key, targets] of Object.entries(existingPaths)) {
     normalizedPaths[key] = (targets || []).map((t) =>
-      /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+      normalizeTsconfigPathTarget(/^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`)
     );
   }
+  const pathAliases = Object.fromEntries(
+    Object.entries({ ...WEB_ANGULAR_PATH_ALIASES }).map(([key, targets]) => [
+      key,
+      (targets || []).map(normalizeTsconfigPathTarget)
+    ])
+  );
   tsconfig.compilerOptions.paths = { ...normalizedPaths, ...pathAliases };
   const coreVer = String(readJsonSafe(path.join(destPath, 'package.json'))?.dependencies?.['@angular/core'] || '');
   const angularMajor = Number.parseInt(coreVer.replace(/^[^\d]*/, ''), 10);
@@ -4078,20 +4109,21 @@ function addAngularPathAliases(destPath) {
     tsconfig.compilerOptions.ignoreDeprecations = '6.0';
   }
   writeJson(tsconfigPath, tsconfig);
+  repairTsconfigForModernTypeScript(destPath);
 
   if (fs.existsSync(tsconfigAppPath)) {
     const appCfg = readJsonSafe(tsconfigAppPath) || {};
     appCfg.compilerOptions = appCfg.compilerOptions || {};
-    appCfg.compilerOptions.baseUrl = './';
     const appPaths = appCfg.compilerOptions.paths || {};
     const appNormalized = {};
     for (const [key, targets] of Object.entries(appPaths)) {
       appNormalized[key] = (targets || []).map((t) =>
-        /^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`
+        normalizeTsconfigPathTarget(/^(src\/|\.\/|\.\.\/|\/)/.test(t) ? t : `src/${t}`)
       );
     }
     appCfg.compilerOptions.paths = { ...appNormalized, ...pathAliases };
     writeJson(tsconfigAppPath, appCfg);
+    repairTsconfigForModernTypeScript(destPath);
   }
 }
 
@@ -5236,6 +5268,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
   ensureCnUtil(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'angular');
   ensureAngularMaterialPackages(destPath, sourcePackageJson, sourceFilesMap);
+  repairUnitWriterMarkerPollution(destPath);
 
   const structureMoves = enforceAngularFolderStructure(destPath);
   if (structureMoves > 0) {
@@ -5292,6 +5325,8 @@ export function repairAngularWorkspace(destPath, options = {}) {
       console.warn(`[postprocess] Failed repairing ${file}: ${err.message}`);
     }
   }
+
+  repairTsconfigForModernTypeScript(destPath);
 
   // Strip Node-only imports from any remaining src files (browser build)
   for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts'))) {
@@ -5500,6 +5535,14 @@ function repairAngularComponentDecoratorIssues(destPath, buildErrors) {
  */
 export function fixAngularCompileErrors(destPath, buildErrors) {
   const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  if (
+    /TS5102/.test(text) ||
+    /TS5090/.test(text) ||
+    /Option 'baseUrl' has been removed/.test(text) ||
+    /Non-relative paths are not allowed/.test(text)
+  ) {
+    return repairTsconfigForModernTypeScript(destPath);
+  }
   const eventIssues =
     /TS2345/.test(text) ||
     /Argument of type 'Event'/.test(text) ||
@@ -6008,16 +6051,153 @@ export function cn(...inputs: ClassValue[]) {
 // React repair
 // ---------------------------------------------------------------------------
 
+export const REACT_VITE_ENV_DTS = `/// <reference types="vite/client" />
+
+// Side-effect style imports (required when noUncheckedSideEffectImports is enabled).
+declare module '*.css';
+declare module '*.scss';
+declare module '*.sass';
+`;
+
+/**
+ * Ensure vite-env.d.ts declares CSS/SCSS modules for tsc (TS2882).
+ */
+export function ensureReactViteEnvDts(destPath) {
+  const filePath = path.join(destPath, 'src', 'vite-env.d.ts');
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+  if (
+    /declare module ['"]\*\.scss['"]/.test(existing) &&
+    /declare module ['"]\*\.css['"]/.test(existing)
+  ) {
+    return 0;
+  }
+  const next = existing.trim()
+    ? `${existing.trimEnd()}\n\ndeclare module '*.css';\ndeclare module '*.scss';\ndeclare module '*.sass';\n`
+    : REACT_VITE_ENV_DTS;
+  ensureDirectoryExists(path.dirname(filePath));
+  fs.writeFileSync(filePath, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+  return 1;
+}
+
+/**
+ * React builds need @types/* and sass in devDependencies. Render sets NODE_ENV=production
+ * which skips devDependencies unless npm install forces development mode.
+ */
+export function ensureReactTypeDevDependencies(destPath, options = {}) {
+  const pkgPath = path.join(destPath, 'package.json');
+  const pkg = readJsonSafe(pkgPath);
+  if (!pkg) return 0;
+  pkg.dependencies = pkg.dependencies || {};
+  pkg.devDependencies = pkg.devDependencies || {};
+  let changed = 0;
+  const reactVer = pkg.dependencies.react || pkg.devDependencies.react || '^19.2.8';
+  const major = Number.parseInt(String(reactVer).replace(/^[^\d]*/, ''), 10) || 19;
+  const typeDefaults =
+    major >= 19
+      ? { '@types/react': '^19.2.17', '@types/react-dom': '^19.2.3' }
+      : { '@types/react': '^18.3.18', '@types/react-dom': '^18.3.5' };
+  const required = {
+    ...typeDefaults,
+    typescript: options.typescript || '~5.9.2',
+    sass: '^1.83.0'
+  };
+  for (const [name, version] of Object.entries(required)) {
+    if (!pkg.devDependencies[name] && !pkg.dependencies[name]) {
+      pkg.devDependencies[name] = version;
+      changed += 1;
+    }
+  }
+  if (changed) writeJson(pkgPath, pkg);
+  return changed;
+}
+
+function normalizeTsconfigPathTarget(target) {
+  const t = String(target || '').trim();
+  if (!t) return t;
+  if (/^(\.\/|\.\.\/)/.test(t)) return t;
+  return `./${t}`;
+}
+
+function isRootTsconfigBaseUrl(baseUrl) {
+  const base = String(baseUrl || '.').replace(/\\/g, '/').replace(/\/$/, '');
+  return base === '' || base === '.' || base === './';
+}
+
+function joinTsconfigPathSegments(...segments) {
+  const joined = segments
+    .filter(Boolean)
+    .map((s) => String(s).replace(/\\/g, '/'))
+    .join('/')
+    .replace(/\/+/g, '/');
+  return normalizeTsconfigPathTarget(joined);
+}
+
+function rewriteTsconfigPathsForModernTypeScript(paths, baseUrl) {
+  const next = {};
+  const rootBase = isRootTsconfigBaseUrl(baseUrl);
+  const base = String(baseUrl || '.').replace(/\\/g, '/').replace(/\/$/, '') || '.';
+
+  for (const [key, targets] of Object.entries(paths || {})) {
+    const list = Array.isArray(targets) ? targets : [targets];
+    next[key] = list.map((target) => {
+      const raw = String(target || '').replace(/\\/g, '/');
+      if (rootBase) {
+        return normalizeTsconfigPathTarget(raw);
+      }
+      if (/^(\.\/|\.\.\/)/.test(raw)) {
+        return joinTsconfigPathSegments(base, raw);
+      }
+      return joinTsconfigPathSegments(base, raw);
+    });
+  }
+  return next;
+}
+
+/**
+ * TypeScript 5.9+ (tsc -b): baseUrl is removed; path targets must be relative (./…).
+ */
+export function repairTsconfigForModernTypeScript(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(destPath, (n) => /^tsconfig.*\.json$/i.test(path.basename(n)))) {
+    const cfg = readJsonSafe(file);
+    if (!cfg?.compilerOptions) continue;
+    const co = cfg.compilerOptions;
+    let touched = false;
+    const baseUrl = co.baseUrl;
+
+    if ('baseUrl' in co) {
+      delete co.baseUrl;
+      touched = true;
+    }
+
+    if (co.paths && typeof co.paths === 'object') {
+      const next = rewriteTsconfigPathsForModernTypeScript(co.paths, baseUrl);
+      const prev = JSON.stringify(co.paths);
+      const normalized = JSON.stringify(next);
+      if (prev !== normalized) {
+        co.paths = next;
+        touched = true;
+      }
+    }
+
+    if (touched) {
+      writeJson(file, cfg);
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 function addReactPathAliases(destPath) {
   const tsconfigPath = path.join(destPath, 'tsconfig.json');
   const tsconfig = readJsonSafe(tsconfigPath) || {};
   tsconfig.compilerOptions = tsconfig.compilerOptions || {};
-  tsconfig.compilerOptions.baseUrl = '.';
   tsconfig.compilerOptions.paths = {
     ...(tsconfig.compilerOptions.paths || {}),
-    '@/*': ['src/*']
+    '@/*': ['./src/*']
   };
   writeJson(tsconfigPath, tsconfig);
+  repairTsconfigForModernTypeScript(destPath);
 
   const vitePath = path.join(destPath, 'vite.config.ts');
   const viteConfig = `import { defineConfig } from 'vite';
@@ -7260,24 +7440,67 @@ function stripExportedTypeBlock(content, typeName) {
 }
 
 /**
- * Store files must not re-declare model types — import from src/models instead.
+ * Strip a local (exported or private) interface/type that duplicates a shared model type.
+ */
+function stripLocalTypeBlock(content, typeName) {
+  let c = stripExportedTypeBlock(content, typeName);
+  // Non-exported duplicates: `interface Task { ... }` / `type Task = ...`
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)interface\\s+${typeName}\\s*(?:extends\\s+[^{]+)?\\{[\\s\\S]*?\\}\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)type\\s+${typeName}\\s*=\\s*[^;]+;\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  return c;
+}
+
+function isModelSourceFile(fullPath) {
+  const norm = String(fullPath || '').replace(/\\/g, '/');
+  const base = path.basename(norm);
+  return /(^|\/)models?\//.test(norm) || /\.model\.(ts|tsx)$/i.test(base);
+}
+
+/**
+ * Non-model source files must not re-declare shared model types — import from
+ * src/models instead. Covers store/, components/, pages/ (Angular→React often
+ * invents a local `Task` with `id: string | number` that conflicts with
+ * `task.model` `id: string`, which fails TS2322 across props).
  */
 export function dedupeStoreModelTypes(destPath) {
   const modelTypes = collectModelTypeExports(destPath);
   if (modelTypes.size === 0) return 0;
   let changed = 0;
   for (const file of walkFiles(path.join(destPath, 'src'), (name, full) =>
-    /(^|\/)store\//.test(full.replace(/\\/g, '/')) && /\.(ts|tsx)$/.test(name)
+    /\.(ts|tsx)$/.test(name) && !isModelSourceFile(full)
   )) {
     let content = fs.readFileSync(file, 'utf-8');
     const original = content;
     const toImport = new Set();
     for (const [typeName, modelFile] of modelTypes) {
-      if (!new RegExp(`export\\s+(?:interface|type)\\s+${typeName}\\b`).test(content)) continue;
-      content = stripExportedTypeBlock(content, typeName);
+      // Only strip type/interface aliases — leave const/enum value exports alone
+      // unless they are clearly type aliases (handled above).
+      const hasLocal =
+        new RegExp(`(?:export\\s+)?(?:interface|type)\\s+${typeName}\\b`).test(content);
+      if (!hasLocal) continue;
+      // Never rewrite the canonical model file itself (already filtered) or
+      // files that only re-export the model type via `export type { Task }`.
+      if (path.resolve(file) === path.resolve(modelFile)) continue;
+      content = stripLocalTypeBlock(content, typeName);
       toImport.add(typeName);
       const draftName = `${typeName}Draft`;
       if (modelTypes.has(draftName)) toImport.add(draftName);
+      const statusName = `${typeName}Status`;
+      if (modelTypes.has(statusName) && new RegExp(`\\b${statusName}\\b`).test(content)) {
+        toImport.add(statusName);
+      }
     }
     if (toImport.size > 0) {
       for (const sym of [...toImport]) {
@@ -7296,7 +7519,7 @@ export function dedupeStoreModelTypes(destPath) {
     }
   }
   if (changed > 0) {
-    console.log(`[postprocess] Deduped model types in ${changed} store file(s)`);
+    console.log(`[postprocess] Deduped model types in ${changed} file(s)`);
   }
   return changed;
 }
@@ -7933,6 +8156,32 @@ function stripAngularTestDepsFromReactPackage(destPath) {
 export function fixReactTypeErrors(destPath, buildErrors) {
   const errorText = String(buildErrors || '');
   let changedFiles = 0;
+  if (/TS1109|TS1005|TS1003|Expression expected/.test(errorText)) {
+    changedFiles += repairUnitWriterMarkerPollution(destPath);
+  }
+  if (
+    /TS5102/.test(errorText) ||
+    /TS5090/.test(errorText) ||
+    /Option 'baseUrl' has been removed/.test(errorText) ||
+    /Non-relative paths are not allowed/.test(errorText)
+  ) {
+    changedFiles += repairTsconfigForModernTypeScript(destPath);
+  }
+  if (
+    /TS2882/.test(errorText) ||
+    /side-effect import of .*\.(?:scss|css|sass)/i.test(errorText)
+  ) {
+    changedFiles += ensureReactViteEnvDts(destPath);
+  }
+  if (
+    /TS7016/.test(errorText) &&
+    (/react-dom\/client/.test(errorText) ||
+      /react\/jsx-runtime/.test(errorText) ||
+      /@types\/react-dom/.test(errorText) ||
+      /@types\/react/.test(errorText))
+  ) {
+    changedFiles += ensureReactTypeDevDependencies(destPath);
+  }
   if (
     /app\.routes\.(ts|tsx)/.test(errorText) ||
     (/Cannot find name 'Routes'/.test(errorText) && /routes/.test(errorText)) ||
@@ -7942,7 +8191,14 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   ) {
     changedFiles += removeAngularLeftoverReactFiles(destPath);
   }
-  if (/Types of property/.test(errorText) && /\/models\//.test(errorText) && /\/store\//.test(errorText)) {
+  if (
+    (/Types of property/.test(errorText) && /\/models\//.test(errorText)) ||
+    (/TS2322/.test(errorText) &&
+      /is not assignable to type/.test(errorText) &&
+      /\/models\//.test(errorText)) ||
+    (/Types of property 'id' are incompatible/.test(errorText) &&
+      /string \| number/.test(errorText))
+  ) {
     changedFiles += dedupeStoreModelTypes(destPath);
   }
   if (/Cannot find module/.test(errorText) || /Did you mean to use 'import/.test(errorText)) {
@@ -7950,6 +8206,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   }
   if (/Individual declarations in merged declaration 'use\w+Store'/.test(errorText)) {
     changedFiles += consolidateDuplicateZustandStores(destPath);
+  }
+  if (
+    /Type 'string' is not assignable to type 'boolean'/.test(errorText) ||
+    (/TS2322/.test(errorText) && /TaskList|Sidebar|Dialog|open=/.test(errorText))
+  ) {
+    changedFiles += repairBooleanJsxPropsInWorkspace(destPath);
   }
   if (
     /Property 'open' is missing/.test(errorText) ||
@@ -7992,6 +8254,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     changedFiles += ensureZustandStoreScaffold(destPath);
     changedFiles += fixReactModuleImports(destPath);
     changedFiles += fixZustandHookUsage(destPath);
+  }
+  if (
+    /TS1131|TS1109|TS1128|TS1005|TS1003/.test(errorText) ||
+    /Property or signature expected|Identifier expected|Expression expected/.test(errorText)
+  ) {
+    changedFiles += stripAiBundleMarkersInWorkspace(destPath);
   }
   if (
     /App\.tsx/.test(errorText) &&
@@ -8099,6 +8367,7 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     }
     content = content.replace(/: Observable<([^>]+)>/g, ': $1');
     content = rewriteReactAngularLeftovers(content);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
 
     if (content !== original) {
@@ -8131,10 +8400,44 @@ function ensureMuiNamedImports(content) {
 }
 
 /**
+ * Models sometimes emit `===== FILE: path =====` / `===== END =====` inside
+ * the file body (especially when the FILE header omits the closing =====).
+ * Those tokens are not TypeScript (TS1109 at column 1).
+ */
+export function stripAiBundleMarkers(content) {
+  let c = String(content || '');
+  if (!/=====/.test(c)) return c;
+  c = c.replace(/^\uFEFF?\s*===== FILE:\s*[^\r\n]*\r?\n?/i, '');
+  c = c.replace(/\r?\n?[ \t]*===== END =====[ \t]*\r?\n?$/i, '');
+  c = c.replace(/^[ \t]*===== FILE:\s*[^\r\n]*\r?\n?/gmi, '');
+  c = c.replace(/^[ \t]*===== END =====[ \t]*\r?\n?/gmi, '');
+  return c.replace(/^\s+/, '');
+}
+
+function stripAiBundleMarkersInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.tsx') || n.endsWith('.ts') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    const original = fs.readFileSync(file, 'utf-8');
+    if (!/=====/.test(original)) continue;
+    const next = stripAiBundleMarkers(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Stripped leftover AI FILE markers in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
  * Rewrite leftover Angular / NGXS / Material APIs in a React source file.
  */
 export function rewriteReactAngularLeftovers(content) {
-  let c = String(content || '');
+  let c = stripAiBundleMarkers(String(content || ''));
   c = c.replace(/from\s+['"]lucide-angular['"]/g, "from 'lucide-react'");
   c = c.replace(/from\s+['"]@lucide\/angular['"]/g, "from 'lucide-react'");
   c = rewriteNgxsStateToZustand(c);
@@ -8716,7 +9019,7 @@ function indexComponentPropInterfaces(destPath) {
   if (!fs.existsSync(componentsRoot)) return map;
   for (const file of walkFiles(componentsRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
     const content = fs.readFileSync(file, 'utf-8');
-    for (const m of content.matchAll(/export interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
+    for (const m of content.matchAll(/(?:export\s+)?interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
       const name = m[1].replace(/Props$/, '');
       const props = new Set(
         [...m[2].matchAll(/(\w+)\??\s*:/g)].map((x) => x[1])
@@ -8821,17 +9124,110 @@ export function syncComponentCallSiteProps(destPath) {
   return changed;
 }
 
+function collectUseStateVars(content) {
+  const states = [];
+  const re = /\[(\w+),\s*set\w+\]\s*=\s*useState(?:<([^>]*)>)?\(([^)]*)\)/g;
+  for (const m of String(content || '').matchAll(re)) {
+    const name = m[1];
+    const generic = String(m[2] || '').trim();
+    const init = String(m[3] || '').trim();
+    const isBoolean =
+      /^boolean$/.test(generic) ||
+      /^(?:true|false)$/.test(init) ||
+      /^!!/.test(init) ||
+      /^Boolean\(/.test(init);
+    const isString =
+      /^string$/.test(generic) ||
+      /^['"`]/.test(init) ||
+      /TaskStatus\s*\|\s*'all'/.test(generic);
+    const isArray = /\[\]/.test(generic) || /^\s*\[/.test(init);
+    states.push({ name, generic, init, isBoolean, isString, isArray });
+  }
+  return states;
+}
+
+function pickBooleanOpenExpr(content) {
+  const states = collectUseStateVars(content);
+  const named = states.find(
+    (s) => s.isBoolean && /open|show|visible|drawer|sidebar|dialog|modal/i.test(s.name)
+  );
+  if (named) return named.name;
+  const anyBool = states.find((s) => s.isBoolean);
+  if (anyBool) return anyBool.name;
+  const parentOpen = String(content || '').match(
+    /<(?:Drawer|Dialog|Modal)\b[^>]*\bopen=\{([^}]+)\}/
+  );
+  if (parentOpen?.[1] && !/['"`]/.test(parentOpen[1])) return parentOpen[1].trim();
+  return null;
+}
+
+function isBooleanJsxExpr(expr, content) {
+  const e = String(expr || '').trim();
+  if (!e) return false;
+  if (/^(?:true|false)$/.test(e)) return true;
+  if (/^!!/.test(e) || /^Boolean\(/.test(e)) return true;
+  const hit = collectUseStateVars(content).find((s) => s.name === e);
+  if (hit?.isBoolean) return true;
+  if (hit?.isString || hit?.isArray) return false;
+  return /open|show|visible|drawer|sidebar|dialog|modal|checked|disabled|active/i.test(e);
+}
+
+/**
+ * Angular→React often binds `open={search}` because the first useState() is a
+ * string. Rewrite boolean JSX props to a real boolean open-state.
+ */
+export function repairMismatchedBooleanJsxProps(content) {
+  let c = String(content || '');
+  const openExpr = pickBooleanOpenExpr(c);
+  const stringVars = new Set(
+    collectUseStateVars(c)
+      .filter((s) => s.isString)
+      .map((s) => s.name)
+  );
+  c = c.replace(
+    /\b(open|checked|disabled|required|hidden|selected|readOnly|fullWidth|multiline|error|autoFocus)=\{(\w+)\}/g,
+    (full, prop, ident) => {
+      if (isBooleanJsxExpr(ident, c)) return full;
+      if (prop === 'open' && openExpr && openExpr !== ident) {
+        return `${prop}={${openExpr}}`;
+      }
+      if (stringVars.has(ident) && openExpr && prop === 'open') {
+        return `open={${openExpr}}`;
+      }
+      return full;
+    }
+  );
+  return c;
+}
+
+function repairBooleanJsxPropsInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx'))) {
+    const original = fs.readFileSync(file, 'utf-8');
+    const next = repairMismatchedBooleanJsxProps(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Rewrote string→boolean JSX props in ${changed} file(s)`);
+  }
+  return changed;
+}
+
 /** Inject required props only when the component interface declares them. */
 export function injectMissingComponentProps(content, componentProps = null) {
-  let c = String(content || '');
+  let c = repairMismatchedBooleanJsxProps(String(content || ''));
   if (!componentProps || typeof componentProps.entries !== 'function') return c;
+  const openExpr = pickBooleanOpenExpr(c);
   for (const [compName, props] of componentProps.entries()) {
     if (!props || typeof props.has !== 'function' || !props.has('open')) continue;
     const tag = String(compName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (!new RegExp(`<${tag}\\b`).test(c) || new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
-    const openVar = c.match(/\[(\w+),\s*set\w+\]\s*=\s*useState\([^)]*\)/)?.[1];
-    if (!openVar) continue;
-    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openVar}}$1`);
+    if (!new RegExp(`<${tag}\\b`).test(c)) continue;
+    if (new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
+    if (!openExpr) continue;
+    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openExpr}}$1`);
   }
   return c;
 }
@@ -8868,6 +9264,8 @@ function repairReactSourceFiles(destPath) {
   for (const file of files) {
     const original = fs.readFileSync(file, 'utf-8');
     let content = rewriteReactAngularLeftovers(original);
+    content = stripUnitWriterMarkers(content);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
     content = pruneUnusedNamedImports(content);
     content = removeUnusedArrowHandlers(content);
@@ -8899,6 +9297,7 @@ export function repairReactWorkspace(destPath, options = {}) {
   hoistReactSrcApp(destPath);
   addReactPathAliases(destPath);
   mergePackageDependencies(destPath, sourcePackageJson, 'react');
+  repairUnitWriterMarkerPollution(destPath);
   repairReactSourceFiles(destPath);
   pinSourceDomainArtifacts(destPath, sourceFilesMap);
   consolidateDuplicateZustandStores(destPath);
@@ -8916,6 +9315,9 @@ export function repairReactWorkspace(destPath, options = {}) {
   removeUnusedStoreShards(destPath);
   removeAngularLeftoverReactFiles(destPath);
   stripAngularTestDepsFromReactPackage(destPath);
+  ensureReactViteEnvDts(destPath);
+  ensureReactTypeDevDependencies(destPath);
+  repairTsconfigForModernTypeScript(destPath);
   const renamedJsx = renameJsxTsFilesToTsx(destPath);
   if (renamedJsx > 0) {
     console.log(`[postprocess] Renamed ${renamedJsx} JSX .ts file(s) to .tsx`);

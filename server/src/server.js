@@ -8,7 +8,7 @@ dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 
 import { execSync } from 'child_process';
 import app from './app.js';
-import { PORT, getProviderConfigs, getProviderIds, getProviderFallbackChain, getProviderFallbackModels, isProviderConfigured, isOllamaCloudMode, PROVIDERS } from './config/index.js';
+import { PORT, EXTRACT_DIR, UPLOAD_DIR, getFrontendOrigins, getProviderConfigs, getProviderIds, getProviderFallbackChain, getProviderFallbackModels, isProviderConfigured, isOllamaCloudMode, PROVIDERS } from './config/index.js';
 
 // ---------------------------------------------------------------------------
 // Validate all configured AI providers on startup
@@ -84,13 +84,25 @@ console.log(
   '  (Selected provider is tried first; then the rest of the chain. Override with AI_FALLBACK_CHAIN.)'
 );
 console.log(
-  'Automatic fallback per call: model → key → provider (override model lists with OPENROUTER_MODELS, GENAI_MODELS, GROQ_MODELS, OLLAMA_MODELS).'
+  'Automatic fallback per call: key → provider (on 429) → model → provider (when fully exhausted).'
+);
+console.log(
+  '  Override chain with AI_FALLBACK_CHAIN=genai,groq,ollama,openrouter,tokenrouter'
 );
 
 if (!anyCloudKeyConfigured && !isProviderConfigured('ollama')) {
   console.warn('WARNING: No API keys configured for any cloud AI provider.');
   console.warn('Set OPENROUTER_API_KEY, GENAI_API_KEY, GROQ_API_KEY, and/or OLLAMA_API_KEY in server/.env.');
 }
+
+console.log(`Uploads: ${UPLOAD_DIR}`);
+console.log(`Extracted: ${EXTRACT_DIR}`);
+const corsOrigins = getFrontendOrigins();
+console.log(
+  corsOrigins.length > 0
+    ? `CORS allowed origins: ${corsOrigins.join(', ')}`
+    : 'CORS: all origins (set FRONTEND_URL in production)'
+);
 
 // ---------------------------------------------------------------------------
 // Start the migration engine — auto-resolve port conflicts

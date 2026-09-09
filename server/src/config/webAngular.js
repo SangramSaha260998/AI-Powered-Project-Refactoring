@@ -72,14 +72,14 @@ export function webAngularNpmDeps(angularCoreVersion = '22.0.8') {
  * expressed with a ./ baseUrl so postprocess can merge them safely).
  */
 export const WEB_ANGULAR_PATH_ALIASES = {
-  '@app/*': ['src/app/*'],
-  '@core/*': ['src/app/core/*'],
-  '@pages/*': ['src/app/pages/*'],
-  '@store/*': ['src/app/store/*'],
-  '@env/*': ['src/environments/*'],
-  '@shared/*': ['src/app/shared/*'],
-  '@configs/*': ['src/app/config/*'],
-  '@/*': ['src/*']
+  '@app/*': ['./src/app/*'],
+  '@core/*': ['./src/app/core/*'],
+  '@pages/*': ['./src/app/pages/*'],
+  '@store/*': ['./src/app/store/*'],
+  '@env/*': ['./src/environments/*'],
+  '@shared/*': ['./src/app/shared/*'],
+  '@configs/*': ['./src/app/config/*'],
+  '@/*': ['./src/*']
 };
 
 /**

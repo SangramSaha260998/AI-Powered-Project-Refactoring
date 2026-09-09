@@ -1,3 +1,35 @@
+@if (isLoading()) {
+  <div class="migration-overlay" role="status" aria-live="polite" aria-busy="true">
+    <div class="migration-overlay-card">
+      <div class="overlay-spinner" aria-hidden="true"></div>
+      <div class="overlay-percent" [class.is-indeterminate]="migrationProgress() < 0">
+        <span class="percent-value">{{ percentLabel() }}</span>
+        @if (migrationProgress() >= 0) {
+          <span class="percent-suffix">%</span>
+        }
+      </div>
+      <div class="overlay-bar" [class.is-indeterminate]="migrationProgress() < 0">
+        <div class="overlay-bar-fill" [style.width.%]="barWidth()"></div>
+      </div>
+      <p class="overlay-step">{{ currentStep() || 'Working...' }}</p>
+      @if (unitLabel()) {
+        <p class="overlay-units">{{ unitLabel() }}</p>
+      }
+      <p class="overlay-message">{{ progressText() }}</p>
+      @if (elapsedLabel()) {
+        <p class="overlay-elapsed">Elapsed {{ elapsedLabel() }}</p>
+      }
+      @if (progressLogs().length) {
+        <ul class="overlay-log">
+          @for (line of progressLogs(); track $index) {
+            <li>{{ line }}</li>
+          }
+        </ul>
+      }
+    </div>
+  </div>
+}
+
 @if (checkingProject()) {
   <section class="config-card checking-card">
     <span class="checking-spinner"></span>
@@ -137,9 +169,16 @@
 
       <div class="control-field">
         <label for="toTech">Target Framework (To):</label>
-        <select id="toTech" [value]="toTech()" (change)="onToChange($event)">
-          <option value="" disabled>-- Select Target Framework --</option>
-          @for (tech of technologies; track tech.id) {
+        <select
+          id="toTech"
+          [value]="toTech()"
+          (change)="onToChange($event)"
+          [disabled]="!fromTech()"
+        >
+          <option value="" disabled>
+            {{ fromTech() ? '-- Select Target Framework --' : '-- Select a source first --' }}
+          </option>
+          @for (tech of targetTechnologies; track tech.id) {
             <option [value]="tech.technology">{{ tech.technology }}</option>
           }
         </select>

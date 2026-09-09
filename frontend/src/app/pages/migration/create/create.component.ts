@@ -1,4 +1,12 @@
-import { Component, ElementRef, OnDestroy, inject, signal, viewChild } from '@angular/core';
+import {
+  Component,
+  ElementRef,
+  OnDestroy,
+  computed,
+  inject,
+  signal,
+  viewChild,
+} from '@angular/core';
 import { DecimalPipe } from '@angular/common';
 import { ActivatedRoute } from '@angular/router';
 import { Subscription } from 'rxjs';
@@ -93,6 +101,33 @@ export class CreateMigrationComponent implements OnDestroy {
   currentStep = signal<string>('');
   totalSteps = signal<number>(0);
   currentStepIndex = signal<number>(0);
+  progressLogs = signal<string[]>([]);
+  elapsedMs = signal<number>(0);
+  barWidth = computed(() => {
+    const pct = this.migrationProgress();
+    return pct >= 0 ? pct : 12;
+  });
+  percentLabel = computed(() => {
+    const pct = this.migrationProgress();
+    return pct >= 0 ? `${pct}` : '—';
+  });
+  unitLabel = computed(() => {
+    const total = this.totalSteps();
+    const current = this.currentStepIndex();
+    if (total > 0 && current > 0) {
+      return `${current} / ${total} units`;
+    }
+    return '';
+  });
+  elapsedLabel = computed(() => {
+    const ms = this.elapsedMs();
+    if (!ms || ms < 0) return '';
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    if (min <= 0) return `${sec}s`;
+    return `${min}m ${sec.toString().padStart(2, '0')}s`;
+  });
   readySessionId = signal<string | null>(null);
   activeProject = signal<ProjectSession | null>(null);
   checkingProject = signal<boolean>(true);
@@ -104,6 +139,7 @@ export class CreateMigrationComponent implements OnDestroy {
   private startSub: Subscription | null = null;
   private settlingDownload = false;
   private lastMode: 'create' | 'rework' = 'create';
+  private lastProgressFloor = 0;
 
   private readonly defaultStripDownPrompt = `Convert the uploaded project completely.
 
@@ -124,6 +160,12 @@ Output must compile and run after npm install.`;
       return `e.g., Convert your source framework components to ${to}...`;
     }
     return `e.g., Convert ${from} components to ${to} functional components with hooks, ensuring all lifecycle methods are replaced appropriately...`;
+  }
+
+  get targetTechnologies(): TechnologyOption[] {
+    const from = this.fromTech();
+    if (!from) return [];
+    return this.technologies.filter((tech) => tech.technology !== from);
   }
 
   get currentVersions(): VersionOption[] {
@@ -148,23 +190,13 @@ Output must compile and run after npm install.`;
   onFromChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.fromTech.set(value);
-    const opposite = this.oppositeFramework(value);
-    if (opposite) {
-      this.toTech.set(opposite);
-      this.targetVersion.set('');
-    }
-    this.autoFillPromptIfSameFramework();
+    this.applyPairedTarget(value);
   }
 
   onToChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.toTech.set(value);
-    const opposite = this.oppositeFramework(value);
-    if (opposite) {
-      this.fromTech.set(opposite);
-    }
-    this.targetVersion.set('');
-    this.autoFillPromptIfSameFramework();
+    this.applyPairedSource(value);
   }
 
   onVersionChange(event: Event): void {
@@ -244,12 +276,7 @@ Output must compile and run after npm install.`;
     this.isLoading.set(true);
     this.isSuccess.set(false);
     this.readySessionId.set(null);
-    this.progressText.set('Submitting changes...');
-    this.statusMessage.set('⏳ Submitting changes to AI...');
-    this.migrationProgress.set(-1);
-    this.currentStep.set('Processing...');
-    this.totalSteps.set(0);
-    this.currentStepIndex.set(0);
+    this.resetProgressUi('Submitting changes...', 'Processing...');
 
     this.lastSessionId = project.sessionId;
     this.lastMode = 'rework';
@@ -267,6 +294,7 @@ Output must compile and run after npm install.`;
           this.lastSessionId = sessionId;
           this.progressText.set(res.message || 'Applying changes...');
           this.statusMessage.set(`⏳ ${res.message || 'Applying changes...'}`);
+          this.pushProgressLog(res.message || 'Applying changes...');
           this.startStatusPolling(sessionId, 'rework');
         },
         error: (err: any) => {
@@ -326,12 +354,7 @@ Output must compile and run after npm install.`;
     this.isLoading.set(true);
     this.isSuccess.set(false);
     this.readySessionId.set(null);
-    this.progressText.set('Uploading project and starting migration...');
-    this.statusMessage.set('⏳ Uploading project and starting migration...');
-    this.migrationProgress.set(-1);
-    this.currentStep.set('Uploading files...');
-    this.totalSteps.set(0);
-    this.currentStepIndex.set(0);
+    this.resetProgressUi('Uploading project and starting migration...', 'Uploading files...');
 
     this.lastSessionId =
       'mig-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
@@ -358,6 +381,7 @@ Output must compile and run after npm install.`;
         this.lastSessionId = sessionId;
         this.progressText.set(res.message || 'Migration started...');
         this.statusMessage.set(`⏳ ${res.message || 'Migration started...'}`);
+        this.pushProgressLog(res.message || 'Migration started...');
         this.startStatusPolling(sessionId, 'create');
       },
       error: async (err: any) => {
@@ -396,7 +420,7 @@ Output must compile and run after npm install.`;
 
     this.isLoading.set(true);
     this.isSuccess.set(false);
-    this.statusMessage.set('⏳ Clearing extracted project...');
+    this.resetProgressUi('Clearing extracted project...', 'Clearing project...');
 
     this.migrationService.deleteProject(project.sessionId).subscribe({
       next: () => {
@@ -439,12 +463,20 @@ Output must compile and run after npm install.`;
     this.isLoading.set(true);
     this.isSuccess.set(false);
     this.readySessionId.set(null);
-    this.progressText.set('Resuming conversion...');
-    this.statusMessage.set('⏳ Resuming conversion from the last saved unit...');
-    this.migrationProgress.set(-1);
-    this.currentStep.set('Resuming...');
+    this.resetProgressUi('Resuming conversion...', 'Resuming...');
     this.totalSteps.set(project.unitTotal || 0);
     this.currentStepIndex.set(Math.max(0, (project.completedUnitIndex ?? -1) + 1));
+    if (project.unitTotal) {
+      this.migrationProgress.set(
+        this.computeProgressPercent({
+          sessionId: project.sessionId,
+          status: 'running',
+          phase: 'resume',
+          unitIndex: (project.completedUnitIndex ?? -1) + 1,
+          unitTotal: project.unitTotal,
+        }),
+      );
+    }
 
     this.lastSessionId = project.sessionId;
     this.lastMode = 'create';
@@ -457,6 +489,7 @@ Output must compile and run after npm install.`;
           this.lastSessionId = sessionId;
           this.progressText.set(res.message || 'Resuming conversion...');
           this.statusMessage.set(`⏳ ${res.message || 'Resuming conversion...'}`);
+          this.pushProgressLog(res.message || 'Resuming conversion...');
           this.startStatusPolling(sessionId, 'create');
         },
         error: (err: any) => {
@@ -482,8 +515,8 @@ Output must compile and run after npm install.`;
     this.isLoading.set(true);
     this.isSuccess.set(false);
     this.readySessionId.set(null);
-    this.progressText.set('Preparing your project ZIP...');
-    this.statusMessage.set('⏳ Preparing your project ZIP...');
+    this.resetProgressUi('Preparing your project ZIP...', 'Packaging project...');
+    this.migrationProgress.set(Math.max(this.lastProgressFloor, 96));
 
     firstValueFrom(this.migrationService.downloadProject(project.sessionId))
       .then((blob) => {
@@ -567,6 +600,30 @@ Output must compile and run after npm install.`;
     });
   }
 
+  private counterpartFramework(tech: string): string {
+    if (tech === 'Angular') return 'React';
+    if (tech === 'React') return 'Angular';
+    return '';
+  }
+
+  private applyPairedTarget(from: string): void {
+    const next = this.counterpartFramework(from);
+    if (this.toTech() !== next) {
+      this.toTech.set(next);
+      this.targetVersion.set('');
+    }
+    this.autoFillPromptIfSameFramework();
+  }
+
+  private applyPairedSource(to: string): void {
+    const next = this.counterpartFramework(to);
+    if (next && this.fromTech() !== next) {
+      this.fromTech.set(next);
+    }
+    this.targetVersion.set('');
+    this.autoFillPromptIfSameFramework();
+  }
+
   private autoFillPromptIfSameFramework(): void {
     const from = this.fromTech();
     const to = this.toTech();
@@ -598,28 +655,16 @@ Output must compile and run after npm install.`;
     const fromRaw = (q.get('fromTech') || '').trim();
     const toRaw = (q.get('toTech') || '').trim();
     const matchTech = (value: string) =>
-      this.technologies.find((t) => t.technology.toLowerCase() === value.toLowerCase())
-        ?.technology;
+      this.technologies.find((t) => t.technology.toLowerCase() === value.toLowerCase())?.technology;
     const from = fromRaw ? matchTech(fromRaw) : '';
     const to = toRaw ? matchTech(toRaw) : '';
-    if (from) this.fromTech.set(from);
-    if (to) this.toTech.set(to);
-    if (from && !to) {
-      const opposite = this.oppositeFramework(from);
-      if (opposite) this.toTech.set(opposite);
-    } else if (to && !from) {
-      const opposite = this.oppositeFramework(to);
-      if (opposite) this.fromTech.set(opposite);
+    if (from) {
+      this.fromTech.set(from);
+      this.applyPairedTarget(from);
+    } else if (to) {
+      this.toTech.set(to);
+      this.applyPairedSource(to);
     }
-    if (this.fromTech() && this.toTech()) this.autoFillPromptIfSameFramework();
-  }
-
-  /** React ↔ Angular cross-migration default. */
-  private oppositeFramework(tech: string): string {
-    const normalized = (tech || '').toLowerCase();
-    if (normalized === 'react') return 'Angular';
-    if (normalized === 'angular') return 'React';
-    return '';
   }
 
   private validateAndSetFile(file: File): void {
@@ -650,26 +695,103 @@ Output must compile and run after npm install.`;
     }
   }
 
+  private resetProgressUi(message: string, step: string): void {
+    this.lastProgressFloor = 0;
+    this.progressLogs.set([message]);
+    this.elapsedMs.set(0);
+    this.progressText.set(message);
+    this.statusMessage.set(`⏳ ${message}`);
+    this.migrationProgress.set(1);
+    this.currentStep.set(step);
+    this.totalSteps.set(0);
+    this.currentStepIndex.set(0);
+  }
+
+  private pushProgressLog(line: string): void {
+    const text = (line || '').trim();
+    if (!text) return;
+    const logs = this.progressLogs();
+    if (logs[logs.length - 1] === text) return;
+    this.progressLogs.set([...logs, text].slice(-10));
+  }
+
+  /**
+   * Weighted percentage from pipeline phase + unit counts.
+   * Conversion units fill 18–80%; install/build/fix/package fill the rest.
+   */
+  private computeProgressPercent(status: MigrateStatusResponse): number {
+    const phase = String(status.phase || '').toLowerCase();
+    const unitIndex = Number(status.unitIndex) || 0;
+    const unitTotal = Number(status.unitTotal) || 0;
+    const unitShare =
+      unitTotal > 0 && unitIndex > 0
+        ? 18 + Math.round((Math.min(unitIndex, unitTotal) / unitTotal) * 62)
+        : 0;
+
+    const phaseFloor: Record<string, number> = {
+      queued: 2,
+      starting: 3,
+      extract: 5,
+      extracting: 5,
+      reading: 8,
+      analyze: 11,
+      blueprint: 15,
+      planning: 15,
+      resume: 16,
+      unit: 18,
+      converting: 18,
+      generating: 18,
+      installing: 80,
+      building: 84,
+      fixing: 90,
+      'visual-qa': 94,
+      package: 97,
+      packaging: 97,
+      rework: 25,
+      'rework-start': 12,
+      completed: 100,
+    };
+
+    let pct = phaseFloor[phase] ?? (unitShare || this.lastProgressFloor || 3);
+    if (phase === 'unit' || phase === 'converting' || phase === 'generating') {
+      pct = unitShare || 18;
+    } else if (unitShare > 0 && phase !== 'completed') {
+      pct = Math.max(pct, unitShare);
+    }
+
+    if (status.status === 'completed' || phase === 'completed') {
+      pct = 100;
+    } else {
+      pct = Math.min(99, pct);
+    }
+
+    pct = Math.max(this.lastProgressFloor, pct);
+    this.lastProgressFloor = pct;
+    return pct;
+  }
+
   private applyProgress(status: MigrateStatusResponse): void {
     const base = status.message || 'Migrating...';
-    let progress = -1;
+    const progress = this.computeProgressPercent(status);
+    this.migrationProgress.set(progress);
+    this.elapsedMs.set(status.elapsedMs || 0);
+
     if (status.unitIndex && status.unitTotal && status.unitTotal > 0) {
-      progress = Math.round((status.unitIndex / status.unitTotal) * 100);
-      this.migrationProgress.set(progress);
       this.currentStepIndex.set(status.unitIndex);
       this.totalSteps.set(status.unitTotal);
-    } else {
-      this.migrationProgress.set(-1);
     }
+
     if (status.phase) {
       this.currentStep.set(this.getPhaseDescription(status.phase));
     }
-    const progressBit = progress >= 0 ? ` [${progress}%]` : '';
+
+    const progressBit = ` [${progress}%]`;
     const unitBit =
       status.unitIndex && status.unitTotal ? ` (${status.unitIndex}/${status.unitTotal})` : '';
     const text = `${base}${unitBit}${progressBit}`;
     this.progressText.set(text);
     this.statusMessage.set(`⏳ ${text}`);
+    this.pushProgressLog(base);
   }
 
   private getPhaseDescription(phase: string): string {
@@ -685,6 +807,7 @@ Output must compile and run after npm install.`;
       unit: 'Converting components...',
       converting: 'Converting components...',
       generating: 'Generating Angular code...',
+      installing: 'Installing npm dependencies...',
       building: 'Building project...',
       fixing: 'Fixing build errors...',
       resume: 'Resuming conversion...',
@@ -703,6 +826,11 @@ Output must compile and run after npm install.`;
     mode: 'create' | 'rework' = 'create',
   ): Promise<void> {
     this.progressText.set(
+      mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...',
+    );
+    this.currentStep.set('Packaging project...');
+    this.migrationProgress.set(100);
+    this.pushProgressLog(
       mode === 'rework' ? 'Downloading updated project...' : 'Downloading migrated project...',
     );
     this.statusMessage.set(
@@ -826,7 +954,10 @@ Output must compile and run after npm install.`;
           );
           const session: ProjectSession = {
             sessionId,
-            projectName: this.selectedFile()?.name?.replace(/\.zip$/i, '') || this.activeProject()?.projectName || 'Migrated Project',
+            projectName:
+              this.selectedFile()?.name?.replace(/\.zip$/i, '') ||
+              this.activeProject()?.projectName ||
+              'Migrated Project',
             fromTech: this.fromTech() || this.activeProject()?.fromTech,
             toTech: this.toTech() || this.activeProject()?.toTech,
             aiProvider: this.aiProvider() || this.activeProject()?.aiProvider,
@@ -846,6 +977,13 @@ Output must compile and run after npm install.`;
           if (this.settlingDownload) return;
           this.settlingDownload = true;
           this.progressText.set(
+            mode === 'rework'
+              ? 'Changes applied. Preparing download...'
+              : 'Migration complete. Preparing download...',
+          );
+          this.currentStep.set('Migration complete!');
+          this.migrationProgress.set(100);
+          this.pushProgressLog(
             mode === 'rework'
               ? 'Changes applied. Preparing download...'
               : 'Migration complete. Preparing download...',

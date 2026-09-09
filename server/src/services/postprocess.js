@@ -7440,24 +7440,67 @@ function stripExportedTypeBlock(content, typeName) {
 }
 
 /**
- * Store files must not re-declare model types — import from src/models instead.
+ * Strip a local (exported or private) interface/type that duplicates a shared model type.
+ */
+function stripLocalTypeBlock(content, typeName) {
+  let c = stripExportedTypeBlock(content, typeName);
+  // Non-exported duplicates: `interface Task { ... }` / `type Task = ...`
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)interface\\s+${typeName}\\s*(?:extends\\s+[^{]+)?\\{[\\s\\S]*?\\}\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)type\\s+${typeName}\\s*=\\s*[^;]+;\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  return c;
+}
+
+function isModelSourceFile(fullPath) {
+  const norm = String(fullPath || '').replace(/\\/g, '/');
+  const base = path.basename(norm);
+  return /(^|\/)models?\//.test(norm) || /\.model\.(ts|tsx)$/i.test(base);
+}
+
+/**
+ * Non-model source files must not re-declare shared model types — import from
+ * src/models instead. Covers store/, components/, pages/ (Angular→React often
+ * invents a local `Task` with `id: string | number` that conflicts with
+ * `task.model` `id: string`, which fails TS2322 across props).
  */
 export function dedupeStoreModelTypes(destPath) {
   const modelTypes = collectModelTypeExports(destPath);
   if (modelTypes.size === 0) return 0;
   let changed = 0;
   for (const file of walkFiles(path.join(destPath, 'src'), (name, full) =>
-    /(^|\/)store\//.test(full.replace(/\\/g, '/')) && /\.(ts|tsx)$/.test(name)
+    /\.(ts|tsx)$/.test(name) && !isModelSourceFile(full)
   )) {
     let content = fs.readFileSync(file, 'utf-8');
     const original = content;
     const toImport = new Set();
     for (const [typeName, modelFile] of modelTypes) {
-      if (!new RegExp(`export\\s+(?:interface|type)\\s+${typeName}\\b`).test(content)) continue;
-      content = stripExportedTypeBlock(content, typeName);
+      // Only strip type/interface aliases — leave const/enum value exports alone
+      // unless they are clearly type aliases (handled above).
+      const hasLocal =
+        new RegExp(`(?:export\\s+)?(?:interface|type)\\s+${typeName}\\b`).test(content);
+      if (!hasLocal) continue;
+      // Never rewrite the canonical model file itself (already filtered) or
+      // files that only re-export the model type via `export type { Task }`.
+      if (path.resolve(file) === path.resolve(modelFile)) continue;
+      content = stripLocalTypeBlock(content, typeName);
       toImport.add(typeName);
       const draftName = `${typeName}Draft`;
       if (modelTypes.has(draftName)) toImport.add(draftName);
+      const statusName = `${typeName}Status`;
+      if (modelTypes.has(statusName) && new RegExp(`\\b${statusName}\\b`).test(content)) {
+        toImport.add(statusName);
+      }
     }
     if (toImport.size > 0) {
       for (const sym of [...toImport]) {
@@ -7476,7 +7519,7 @@ export function dedupeStoreModelTypes(destPath) {
     }
   }
   if (changed > 0) {
-    console.log(`[postprocess] Deduped model types in ${changed} store file(s)`);
+    console.log(`[postprocess] Deduped model types in ${changed} file(s)`);
   }
   return changed;
 }
@@ -8148,7 +8191,14 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   ) {
     changedFiles += removeAngularLeftoverReactFiles(destPath);
   }
-  if (/Types of property/.test(errorText) && /\/models\//.test(errorText) && /\/store\//.test(errorText)) {
+  if (
+    (/Types of property/.test(errorText) && /\/models\//.test(errorText)) ||
+    (/TS2322/.test(errorText) &&
+      /is not assignable to type/.test(errorText) &&
+      /\/models\//.test(errorText)) ||
+    (/Types of property 'id' are incompatible/.test(errorText) &&
+      /string \| number/.test(errorText))
+  ) {
     changedFiles += dedupeStoreModelTypes(destPath);
   }
   if (/Cannot find module/.test(errorText) || /Did you mean to use 'import/.test(errorText)) {
@@ -8156,6 +8206,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   }
   if (/Individual declarations in merged declaration 'use\w+Store'/.test(errorText)) {
     changedFiles += consolidateDuplicateZustandStores(destPath);
+  }
+  if (
+    /Type 'string' is not assignable to type 'boolean'/.test(errorText) ||
+    (/TS2322/.test(errorText) && /TaskList|Sidebar|Dialog|open=/.test(errorText))
+  ) {
+    changedFiles += repairBooleanJsxPropsInWorkspace(destPath);
   }
   if (
     /Property 'open' is missing/.test(errorText) ||
@@ -8198,6 +8254,12 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     changedFiles += ensureZustandStoreScaffold(destPath);
     changedFiles += fixReactModuleImports(destPath);
     changedFiles += fixZustandHookUsage(destPath);
+  }
+  if (
+    /TS1131|TS1109|TS1128|TS1005|TS1003/.test(errorText) ||
+    /Property or signature expected|Identifier expected|Expression expected/.test(errorText)
+  ) {
+    changedFiles += stripAiBundleMarkersInWorkspace(destPath);
   }
   if (
     /App\.tsx/.test(errorText) &&
@@ -8305,6 +8367,7 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     }
     content = content.replace(/: Observable<([^>]+)>/g, ': $1');
     content = rewriteReactAngularLeftovers(content);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
 
     if (content !== original) {
@@ -8337,10 +8400,44 @@ function ensureMuiNamedImports(content) {
 }
 
 /**
+ * Models sometimes emit `===== FILE: path =====` / `===== END =====` inside
+ * the file body (especially when the FILE header omits the closing =====).
+ * Those tokens are not TypeScript (TS1109 at column 1).
+ */
+export function stripAiBundleMarkers(content) {
+  let c = String(content || '');
+  if (!/=====/.test(c)) return c;
+  c = c.replace(/^\uFEFF?\s*===== FILE:\s*[^\r\n]*\r?\n?/i, '');
+  c = c.replace(/\r?\n?[ \t]*===== END =====[ \t]*\r?\n?$/i, '');
+  c = c.replace(/^[ \t]*===== FILE:\s*[^\r\n]*\r?\n?/gmi, '');
+  c = c.replace(/^[ \t]*===== END =====[ \t]*\r?\n?/gmi, '');
+  return c.replace(/^\s+/, '');
+}
+
+function stripAiBundleMarkersInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.tsx') || n.endsWith('.ts') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    const original = fs.readFileSync(file, 'utf-8');
+    if (!/=====/.test(original)) continue;
+    const next = stripAiBundleMarkers(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Stripped leftover AI FILE markers in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
  * Rewrite leftover Angular / NGXS / Material APIs in a React source file.
  */
 export function rewriteReactAngularLeftovers(content) {
-  let c = String(content || '');
+  let c = stripAiBundleMarkers(String(content || ''));
   c = c.replace(/from\s+['"]lucide-angular['"]/g, "from 'lucide-react'");
   c = c.replace(/from\s+['"]@lucide\/angular['"]/g, "from 'lucide-react'");
   c = rewriteNgxsStateToZustand(c);
@@ -8922,7 +9019,7 @@ function indexComponentPropInterfaces(destPath) {
   if (!fs.existsSync(componentsRoot)) return map;
   for (const file of walkFiles(componentsRoot, (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
     const content = fs.readFileSync(file, 'utf-8');
-    for (const m of content.matchAll(/export interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
+    for (const m of content.matchAll(/(?:export\s+)?interface (\w+Props)\s*\{([\s\S]*?)\}/g)) {
       const name = m[1].replace(/Props$/, '');
       const props = new Set(
         [...m[2].matchAll(/(\w+)\??\s*:/g)].map((x) => x[1])
@@ -9027,17 +9124,110 @@ export function syncComponentCallSiteProps(destPath) {
   return changed;
 }
 
+function collectUseStateVars(content) {
+  const states = [];
+  const re = /\[(\w+),\s*set\w+\]\s*=\s*useState(?:<([^>]*)>)?\(([^)]*)\)/g;
+  for (const m of String(content || '').matchAll(re)) {
+    const name = m[1];
+    const generic = String(m[2] || '').trim();
+    const init = String(m[3] || '').trim();
+    const isBoolean =
+      /^boolean$/.test(generic) ||
+      /^(?:true|false)$/.test(init) ||
+      /^!!/.test(init) ||
+      /^Boolean\(/.test(init);
+    const isString =
+      /^string$/.test(generic) ||
+      /^['"`]/.test(init) ||
+      /TaskStatus\s*\|\s*'all'/.test(generic);
+    const isArray = /\[\]/.test(generic) || /^\s*\[/.test(init);
+    states.push({ name, generic, init, isBoolean, isString, isArray });
+  }
+  return states;
+}
+
+function pickBooleanOpenExpr(content) {
+  const states = collectUseStateVars(content);
+  const named = states.find(
+    (s) => s.isBoolean && /open|show|visible|drawer|sidebar|dialog|modal/i.test(s.name)
+  );
+  if (named) return named.name;
+  const anyBool = states.find((s) => s.isBoolean);
+  if (anyBool) return anyBool.name;
+  const parentOpen = String(content || '').match(
+    /<(?:Drawer|Dialog|Modal)\b[^>]*\bopen=\{([^}]+)\}/
+  );
+  if (parentOpen?.[1] && !/['"`]/.test(parentOpen[1])) return parentOpen[1].trim();
+  return null;
+}
+
+function isBooleanJsxExpr(expr, content) {
+  const e = String(expr || '').trim();
+  if (!e) return false;
+  if (/^(?:true|false)$/.test(e)) return true;
+  if (/^!!/.test(e) || /^Boolean\(/.test(e)) return true;
+  const hit = collectUseStateVars(content).find((s) => s.name === e);
+  if (hit?.isBoolean) return true;
+  if (hit?.isString || hit?.isArray) return false;
+  return /open|show|visible|drawer|sidebar|dialog|modal|checked|disabled|active/i.test(e);
+}
+
+/**
+ * Angular→React often binds `open={search}` because the first useState() is a
+ * string. Rewrite boolean JSX props to a real boolean open-state.
+ */
+export function repairMismatchedBooleanJsxProps(content) {
+  let c = String(content || '');
+  const openExpr = pickBooleanOpenExpr(c);
+  const stringVars = new Set(
+    collectUseStateVars(c)
+      .filter((s) => s.isString)
+      .map((s) => s.name)
+  );
+  c = c.replace(
+    /\b(open|checked|disabled|required|hidden|selected|readOnly|fullWidth|multiline|error|autoFocus)=\{(\w+)\}/g,
+    (full, prop, ident) => {
+      if (isBooleanJsxExpr(ident, c)) return full;
+      if (prop === 'open' && openExpr && openExpr !== ident) {
+        return `${prop}={${openExpr}}`;
+      }
+      if (stringVars.has(ident) && openExpr && prop === 'open') {
+        return `open={${openExpr}}`;
+      }
+      return full;
+    }
+  );
+  return c;
+}
+
+function repairBooleanJsxPropsInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx'))) {
+    const original = fs.readFileSync(file, 'utf-8');
+    const next = repairMismatchedBooleanJsxProps(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`);
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Rewrote string→boolean JSX props in ${changed} file(s)`);
+  }
+  return changed;
+}
+
 /** Inject required props only when the component interface declares them. */
 export function injectMissingComponentProps(content, componentProps = null) {
-  let c = String(content || '');
+  let c = repairMismatchedBooleanJsxProps(String(content || ''));
   if (!componentProps || typeof componentProps.entries !== 'function') return c;
+  const openExpr = pickBooleanOpenExpr(c);
   for (const [compName, props] of componentProps.entries()) {
     if (!props || typeof props.has !== 'function' || !props.has('open')) continue;
     const tag = String(compName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (!new RegExp(`<${tag}\\b`).test(c) || new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
-    const openVar = c.match(/\[(\w+),\s*set\w+\]\s*=\s*useState\([^)]*\)/)?.[1];
-    if (!openVar) continue;
-    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openVar}}$1`);
+    if (!new RegExp(`<${tag}\\b`).test(c)) continue;
+    if (new RegExp(`<${tag}[^>]*\\bopen=`).test(c)) continue;
+    if (!openExpr) continue;
+    c = c.replace(new RegExp(`<${tag}(\\s*)`), `<${compName} open={${openExpr}}$1`);
   }
   return c;
 }
@@ -9075,6 +9265,7 @@ function repairReactSourceFiles(destPath) {
     const original = fs.readFileSync(file, 'utf-8');
     let content = rewriteReactAngularLeftovers(original);
     content = stripUnitWriterMarkers(content);
+    content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
     content = pruneUnusedNamedImports(content);
     content = removeUnusedArrowHandlers(content);

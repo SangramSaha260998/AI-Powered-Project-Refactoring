@@ -410,6 +410,29 @@ export function cn(...inputs: ClassValue[]) {
 {
   assert(isPlaceholderTemplate('home.component.html', '<p>HomeComponent placeholder</p>'), 'detects placeholder HTML');
   assert(!isPlaceholderTemplate('home.component.html', '<div class="flex gap-2"><h1>Admin Users</h1></div>'), 'real HTML is not a placeholder');
+  assert(
+    !isPlaceholderTemplate(
+      'task-form-sidebar.component.html',
+      `<div class="sidebar">
+  <h2>{{ heading }}</h2>
+  <form (ngSubmit)="onSubmit()">
+    <mat-form-field>
+      <mat-label>Title</mat-label>
+      <input matInput [(ngModel)]="title" name="title" placeholder="Title" required />
+    </mat-form-field>
+    <button type="submit">Save</button>
+  </form>
+</div>`
+    ),
+    'form HTML with placeholder= attribute is not a stub'
+  );
+  assert(
+    isPlaceholderTemplate(
+      'task-form-sidebar.component.html',
+      '<p>TaskFormSidebarComponent placeholder</p>'
+    ),
+    'still detects Component placeholder stubs'
+  );
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-quality-'));
   const srcApp = path.join(tmp, 'src', 'app');
@@ -3563,6 +3586,269 @@ export class ItemEditorComponent {
     'existing resetForm is not duplicated'
   );
   assert(/\[formGroup\]="taskForm"/.test(html), 'template keeps taskForm binding');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // TS2345: (close)="$event" is typed as DOM Event, not boolean
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-close-event-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const dialogDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-delete-dialog');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(dialogDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { TaskDeleteDialogComponent } from '../../components/task-delete-dialog/task-delete-dialog.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskDeleteDialogComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  deletingTask: { title: string } | null = null;
+  onDeleteClose(_confirmed: boolean): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-delete-dialog [task]="deletingTask" (close)="onDeleteClose($event)"></app-task-delete-dialog>\n`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component, EventEmitter, Input, Output } from '@angular/core';
+@Component({
+  selector: 'app-task-delete-dialog',
+  standalone: true,
+  templateUrl: './task-delete-dialog.component.html'
+})
+export class TaskDeleteDialogComponent {
+  @Input() task: { title: string } | null = null;
+  @Output() close = new EventEmitter<boolean>();
+}
+`
+  );
+  fs.writeFileSync(path.join(dialogDir, 'task-delete-dialog.component.html'), `<p>Delete?</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2345: Argument of type 'Event' is not assignable to parameter of type 'boolean'.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:213:106:
+  213 │ ...gTask" (close)="onDeleteClose($event)" ></app-task-delete-dialog>
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:47:15: templateUrl: './task-list.component.html'
+`
+  );
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs close/$event TS2345');
+  assert(
+    /\(close\)="onDeleteClose\(\$any\(\$event\)\)"/.test(listHtml) ||
+      /\(onClose\)="onDeleteClose\(/.test(listHtml),
+    'close binding uses $any($event) or onClose'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // TS2307: invented SearchIconComponent path
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-search-icon-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { SearchIconComponent } from '../../../../../components/search-icon/search-icon.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [SearchIconComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-search-icon class="toolbar__search-icon"></app-search-icon>\n`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2307: Cannot find module '../../../../../components/search-icon/search-icon.component' or its corresponding type declarations.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.ts:4:36:
+  4 │ ...ent } from '../../../../../components/search-icon/search-icon.component'
+`
+  );
+  const listTs = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs missing search-icon module');
+  assert(!/SearchIconComponent/.test(listTs), 'SearchIconComponent import removed');
+  assert(/MatIconModule/.test(listTs), 'MatIconModule added for icon replacement');
+  assert(/<mat-icon>search<\/mat-icon>/.test(listHtml), 'app-search-icon replaced with mat-icon');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // TS2305/TS2459: Component + OnInit wrongly imported from @angular/common
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-core-from-common-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component, OnInit, CommonModule } from '@angular/common';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [CommonModule],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent implements OnInit {
+  ngOnInit(): void {}
+}
+`
+  );
+  fs.writeFileSync(path.join(listDir, 'task-list.component.html'), `<p>ok</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2305: Module '"@angular/common"' has no exported member 'Component'.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.ts:1:9:
+  1 │ import { Component, OnInit, CommonModule } from '@angular/common';
+TS2459: Module '"@angular/common"' declares 'OnInit' locally, but it is not exported.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:1:20:
+  1 │ import { Component, OnInit, CommonModule } from '@angular/common';
+`
+  );
+  const ts = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs core symbols from @angular/common');
+  assert(/from '@angular\/core'/.test(ts), 'adds @angular/core import');
+  assert(/import\s*\{[^}]*\bComponent\b[^}]*\}\s*from\s*'@angular\/core'/.test(ts), 'Component from @angular/core');
+  assert(/import\s*\{[^}]*\bOnInit\b[^}]*\}\s*from\s*'@angular\/core'/.test(ts), 'OnInit from @angular/core');
+  assert(/import\s*\{[^}]*\bCommonModule\b[^}]*\}\s*from\s*'@angular\/common'/.test(ts), 'CommonModule stays on @angular/common');
+  assert(!/import\s*\{[^}]*\bComponent\b[^}]*\}\s*from\s*'@angular\/common'/.test(ts), 'Component no longer from common');
+  assert(!/import\s*\{[^}]*\bOnInit\b[^}]*\}\s*from\s*'@angular\/common'/.test(ts), 'OnInit no longer from common');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // taskStatusLabels invent + closeDialog Event→boolean
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-labels-closedialog-'));
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const dialogDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-delete-dialog');
+  const modelsDir = path.join(tmp, 'src', 'app', 'models');
+  for (const d of [tableDir, listDir, dialogDir, modelsDir]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelsDir, 'task.model.ts'),
+    `export type TaskStatus = 'todo' | 'done';\nexport const TASK_STATUS_LABELS: Record<TaskStatus, string> = { todo: 'To do', done: 'Done' };\nexport const TASK_STATUS_OPTIONS: TaskStatus[] = ['todo', 'done'];\n`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+@Component({ selector: 'app-task-table', standalone: true, templateUrl: './task-table.component.html' })
+export class TaskTableComponent {
+  @Input() tasks: { status: string }[] = [];
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.html'),
+    `@for (task of tasks; track task) { <span>{{ taskStatusLabels[task.status] || task.status }}</span> }\n`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { TaskDeleteDialogComponent } from '../../components/task-delete-dialog/task-delete-dialog.component';
+@Component({ selector: 'app-task-list', standalone: true, imports: [TaskDeleteDialogComponent], templateUrl: './task-list.component.html' })
+export class TaskListComponent { onDeleteClose(_c: boolean): void {} }
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-delete-dialog (closeDialog)="onDeleteClose($event)"></app-task-delete-dialog>\n`
+  );
+  fs.writeFileSync(
+    path.join(dialogDir, 'task-delete-dialog.component.ts'),
+    `import { Component, EventEmitter, Output } from '@angular/core';
+@Component({ selector: 'app-task-delete-dialog', standalone: true, templateUrl: './task-delete-dialog.component.html' })
+export class TaskDeleteDialogComponent { @Output() closeDialog = new EventEmitter<boolean>(); }
+`
+  );
+  fs.writeFileSync(path.join(dialogDir, 'task-delete-dialog.component.html'), `<p>x</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2339: Property 'taskStatusLabels' does not exist on type 'TaskTableComponent'.
+src/app/pages/app/tasks/components/task-table/task-table.component.html:33:15:
+  33 │ {{ taskStatusLabels[task.status] || task.status }}
+Error occurs in the template of component TaskTableComponent.
+src/app/pages/app/tasks/components/task-table/task-table.component.ts:12:15: templateUrl: './task-table.component.html'
+TS2345: Argument of type 'Event' is not assignable to parameter of type 'boolean'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.html:96:35:
+  96 │ (closeDialog)="onDeleteClose($event)"
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:41:15: templateUrl: './task-list.component.html'
+`
+  );
+  const tableHtml = fs.readFileSync(path.join(tableDir, 'task-table.component.html'), 'utf-8');
+  const tableTs = fs.readFileSync(path.join(tableDir, 'task-table.component.ts'), 'utf-8');
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  assert(n >= 1, 'repairs taskStatusLabels + closeDialog');
+  assert(/statusLabels\[task\.status\]/.test(tableHtml), 'taskStatusLabels renamed to statusLabels');
+  assert(!/taskStatusLabels/.test(tableHtml), 'invented taskStatusLabels gone from html');
+  assert(/\bstatusLabels\s*=\s*TASK_STATUS_LABELS/.test(tableTs), 'statusLabels field wired');
+  assert(/\$any\(\$event\)/.test(listHtml), 'closeDialog uses $any($event)');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  // TS2304: Task / TaskDraft used without model import
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-missing-task-types-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const modelsDir = path.join(tmp, 'src', 'app', 'models');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(modelsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelsDir, 'task.model.ts'),
+    `export interface Task { id: string; title: string; status: string; }\nexport type TaskDraft = Omit<Task, 'id'>;\n`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  public openEdit(task: Task): void {}
+  public onSave(draft: TaskDraft): void {}
+  public onRemove(task: Task): void {}
+}
+`
+  );
+  fs.writeFileSync(path.join(listDir, 'task-list.component.html'), `<p>ok</p>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2304: Cannot find name 'Task'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:92:24:
+  92 │ public openEdit(task: Task): void {
+TS2304: Cannot find name 'TaskDraft'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:102:23:
+  102 │ public onSave(draft: TaskDraft): void {
+TS2304: Cannot find name 'Task'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:119:24:
+  119 │ public onRemove(task: Task): void {
+`
+  );
+  const ts = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs missing Task/TaskDraft imports');
+  assert(/from ['"].*models\/task\.model['"]/.test(ts), 'imports from task.model');
+  assert(/import\s*\{[^}]*\bTask\b[^}]*\}\s*from/.test(ts), 'imports Task');
+  assert(/import\s*\{[^}]*\bTaskDraft\b[^}]*\}\s*from/.test(ts), 'imports TaskDraft');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

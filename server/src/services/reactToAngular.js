@@ -197,9 +197,12 @@ function convertEventsAndBindings(html) {
   h = h.replace(/\bonSave=\{(\w+)\}/g, '(save)="$1($event)"');
   h = h.replace(/\bonEdit=\{(\w+)\}/g, '(edit)="$1($event)"');
   h = h.replace(/\bonRemove=\{(\w+)\}/g, '(remove)="$1($event)"');
-  h = h.replace(/\bonClose=\{(\w+)\}/g, '(close)="$1($event)"');
+  // Keep onClose — bare (close) collides with the native DOM close event (TS2345 Event vs boolean)
+  h = h.replace(/\bonClose=\{(\w+)\}/g, '(onClose)="$1($event)"');
   h = h.replace(/<mat-sidenav([^>]*?)\sonClose=\{\(\)\s*=>\s*[^}]+\}/g, '<mat-sidenav$1 (openedChange)="onSidebarChange($event)"');
-  h = h.replace(/\bonClose=\{\(\)\s*=>\s*([^}]+)\}/g, '(close)="$1"');
+  h = h.replace(/\bonClose=\{\(\)\s*=>\s*([^}]+)\}/g, '(onClose)="$1"');
+  h = h.replace(/\bonConfirm=\{(\w+)\}/g, '(onConfirm)="$1($event)"');
+  h = h.replace(/\bonCancel=\{(\w+)\}/g, '(onCancel)="$1()"');
   return h;
 }
 
@@ -791,16 +794,45 @@ export function reactTsxToAngularTriad({ sourceRel, tsx, scss = '', dest }) {
   const inputDecls = [];
   const outputDecls = [];
   const emitWrappers = [];
+  // Bare names that collide with native DOM events — keep the on* Output name.
+  const DOM_COLLIDING_OUTPUTS = new Set([
+    'close',
+    'open',
+    'error',
+    'load',
+    'focus',
+    'blur',
+    'change',
+    'submit',
+    'reset',
+    'select',
+    'scroll',
+    'toggle',
+    'cancel'
+  ]);
   for (const f of props.fields) {
     if (/^on[A-Z]/.test(f.name) || f.type.includes('=>')) {
       const evt = f.name.replace(/^on/, '');
-      const evtName = evt.charAt(0).toLowerCase() + evt.slice(1);
+      let evtName = evt.charAt(0).toLowerCase() + evt.slice(1);
+      if (DOM_COLLIDING_OUTPUTS.has(evtName) && /^on[A-Z]/.test(f.name)) {
+        evtName = f.name; // onClose, not close (avoids DOM Event collision / TS2345)
+      }
       const gen = (f.type.match(/\(([^)]*)\)/)?.[1] || 'unknown')
         .replace(/^\w+\s*:\s*/, '')
         .trim() || 'unknown';
       const payload = gen === '' ? 'void' : gen;
       outputDecls.push(`  @Output() ${evtName} = new EventEmitter<${payload}>();`);
-      if (!methods.some((m) => m.name === f.name)) {
+      // Same-named method + @Output is TS2300 — call .emit() from the template instead.
+      if (evtName === f.name) {
+        html = html.replace(
+          new RegExp(`(?<=(?:\\(click\\)|\\(keydown\\)|\\(keyup\\))=")(${f.name})\\(`, 'g'),
+          '$1.emit('
+        );
+        html = html.replace(
+          new RegExp(`(>(?:\\s*))${f.name}\\(([^)]*)\\)`, 'g'),
+          `$1${f.name}.emit($2)`
+        );
+      } else if (!methods.some((m) => m.name === f.name)) {
         if (payload === 'void' || payload === 'unknown') {
           emitWrappers.push(
             `  ${f.name}(): void {\n    this.${evtName}.emit();\n  }`
@@ -1116,9 +1148,11 @@ function isThinTemplate(html) {
   const t = String(html || '')
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/\b\[?placeholder\]?\s*=\s*(["'][^"']*["']|\{[^}]*\}|[^\s>]+)/gi, '')
     .trim();
   if (t.length < 40) return true;
-  return /placeholder|coming soon|not implemented|todo component/i.test(t);
+  if (/Component\s+placeholder/i.test(t)) return true;
+  return /\b(coming soon|not implemented|todo component)\b/i.test(t);
 }
 
 function sourceHandlerNames(tsx) {

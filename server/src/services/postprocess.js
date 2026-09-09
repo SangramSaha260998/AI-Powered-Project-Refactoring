@@ -112,14 +112,36 @@ function kebabStemFromPath(filePath) {
 
 /**
  * True when an HTML file is a postprocess/AI stub, not a real UI.
+ * Do NOT treat legitimate HTML `placeholder="..."` attributes as stubs —
+ * form sidebars often use them and are under 400 chars.
  */
 export function isPlaceholderTemplate(filePath, content) {
   if (!/\.html$/i.test(String(filePath || ''))) return false;
   const text = String(content || '').trim();
   if (!text) return true;
-  if (text.length < 400 && /placeholder/i.test(text)) return true;
   if (/^<p>\s*\w*Component\s*(placeholder)?\s*<\/p>$/i.test(text)) return true;
   if (/^<div class="[^"]*"><\/div>$/i.test(text) && text.length < 80) return true;
+
+  // Ignore attribute placeholders: placeholder="Title" / [placeholder]="..."
+  const withoutAttrs = text
+    .replace(/\b\[?placeholder\]?\s*=\s*(["'][^"']*["']|\{[^}]*\}|[^\s>]+)/gi, '')
+    .replace(/\bplaceholder\s*=\s*(["'][^"']*["']|[^\s>]+)/gi, '');
+
+  if (/Component\s+placeholder/i.test(withoutAttrs)) return true;
+  if (
+    withoutAttrs.length < 400 &&
+    /\b(coming soon|not implemented|todo component|TODO:\s*implement)\b/i.test(withoutAttrs)
+  ) {
+    return true;
+  }
+  // Bare "placeholder" text only counts as a stub when there is no real UI chrome
+  if (
+    withoutAttrs.length < 400 &&
+    /\bplaceholder\b/i.test(withoutAttrs) &&
+    !/<(form|mat-[\w-]+|input|textarea|select|button|table|h[1-6]|app-[\w-]+)\b/i.test(text)
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -496,7 +518,10 @@ function taskModelImportPath(source, tsPath, destPath) {
  */
 function repairTaskStatusOptionAccess(html) {
   let h = String(html || '');
-  if (!/statusOptions|status\.(?:id|label|value|name)/.test(h)) return h;
+  // AI invents taskStatusLabels / itemStatusLabels — normalize to statusLabels
+  h = h.replace(/\b([A-Za-z]\w*)StatusLabels\b/g, 'statusLabels');
+  h = h.replace(/\bTASK_STATUS_LABELS\b/g, 'statusLabels');
+  if (!/statusOptions|statusLabels|status\.(?:id|label|value|name)/.test(h)) return h;
 
   h = h.replace(
     /@for\s*\(\s*(\w+)\s+of\s+statusOptions;\s*track\s+\1\.(?:id|value)\s*\)/g,
@@ -525,8 +550,17 @@ function repairTaskStatusOptionAccess(html) {
 function ensureTaskStatusOptionFields(source, html, tsPath, destPath) {
   let updated = String(source || '');
   const h = String(html || '');
+  // Drop invented *StatusLabels fields so we can rewire statusLabels
+  updated = updated.replace(
+    /^[ \t]*(?:readonly\s+)?(?:public\s+|protected\s+|private\s+)*[A-Za-z]\w*StatusLabels\s*[:=][^;\n]*;\s*\n?/gm,
+    ''
+  );
   const needsOptions = /statusOptions/.test(h) || /statusOptions/.test(updated);
-  const needsLabels = /statusLabels\[/.test(h) || /status\.(?:label|name)/.test(h);
+  const needsLabels =
+    /statusLabels\[/.test(h) ||
+    /statusLabels\b/.test(h) ||
+    /StatusLabels\b/.test(h) ||
+    /status\.(?:label|name)/.test(h);
   if (!needsOptions && !needsLabels) return updated;
 
   const modelRel = taskModelImportPath(updated, tsPath, destPath);
@@ -581,7 +615,12 @@ export function repairTaskStatusOptionTemplates(destPath, buildErrors = '') {
   if (htmlCandidates.size === 0) {
     for (const f of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.html'))) {
       const content = fs.readFileSync(f, 'utf-8');
-      if (/status\.(?:id|label|value)/.test(content) || /statusOptions/.test(content)) {
+      if (
+        /status\.(?:id|label|value)/.test(content) ||
+        /statusOptions/.test(content) ||
+        /StatusLabels\b/.test(content) ||
+        /statusLabels\[/.test(content)
+      ) {
         htmlCandidates.add(f);
       }
     }
@@ -2651,10 +2690,10 @@ function stripInvalidDecoratorImports(source, tsPath) {
 function symbolUsedOutsideComponentImports(source, symbol) {
   const esc = String(symbol || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!esc) return false;
-  const check = String(source || '').replace(
-    /(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/,
-    '$1$3'
-  );
+  const check = String(source || '')
+    .replace(/(@Component\s*\(\s*\{[\s\S]*?\bimports\s*:\s*\[)([^\]]*)(\])/, '$1$3')
+    // Import lines are not "usage" — otherwise missing IconComponents can never be dropped
+    .replace(/^import\s.+from\s*['"][^'"]+['"]\s*;?\s*$/gm, '');
   return new RegExp(`\\b${esc}\\b`).test(check);
 }
 
@@ -3219,6 +3258,81 @@ function repairBogusAngularFormsImports(source) {
 }
 
 /**
+ * Move @angular/core APIs that the AI wrongly imported from '@angular/common'.
+ * Example: `import { Component, OnInit, CommonModule } from '@angular/common'`
+ * → Component/OnInit from '@angular/core', CommonModule stays on common.
+ */
+const ANGULAR_CORE_ONLY_SYMBOLS = new Set([
+  'Component',
+  'Directive',
+  'Pipe',
+  'Injectable',
+  'NgModule',
+  'Input',
+  'Output',
+  'EventEmitter',
+  'HostListener',
+  'HostBinding',
+  'ViewChild',
+  'ViewChildren',
+  'ContentChild',
+  'ContentChildren',
+  'OnInit',
+  'OnDestroy',
+  'OnChanges',
+  'AfterViewInit',
+  'AfterContentInit',
+  'DoCheck',
+  'AfterViewChecked',
+  'AfterContentChecked',
+  'SimpleChanges',
+  'inject',
+  'Inject',
+  'Optional',
+  'Self',
+  'SkipSelf',
+  'DestroyRef',
+  'ChangeDetectorRef',
+  'ElementRef',
+  'Renderer2',
+  'NgZone',
+  'signal',
+  'computed',
+  'effect',
+  'input',
+  'output',
+  'model',
+  'linkedSignal',
+  'resource',
+  'ApplicationConfig',
+  'provideZoneChangeDetection',
+  'APP_INITIALIZER',
+  'forwardRef',
+  'NgModuleRef',
+  'createComponent',
+  'ViewEncapsulation',
+  'ChangeDetectionStrategy'
+]);
+
+function repairCoreSymbolsImportedFromCommon(source) {
+  let updated = String(source || '');
+  if (!/from\s*['"]@angular\/common['"]/.test(updated)) return updated;
+  const moved = [];
+  for (const sym of ANGULAR_CORE_ONLY_SYMBOLS) {
+    const fromCommon = new RegExp(
+      `import\\s*\\{[^}]*\\b${sym}\\b[^}]*\\}\\s*from\\s*['"]@angular\\/common['"]`
+    );
+    if (!fromCommon.test(updated)) continue;
+    updated = removeNamedImport(updated, sym, '@angular/common');
+    moved.push(sym);
+  }
+  for (const sym of moved) {
+    updated = ensureImport(updated, sym, '@angular/core');
+  }
+  return updated;
+}
+
+/**
  * Strip hallucinated React→Angular leftovers that break the compiler.
  */
 function repairHallucinatedAngularApis(source) {
@@ -3560,6 +3674,9 @@ function repairAngularComponentFile(tsPath, options = {}) {
       return `import { ${unique.join(', ')} } from '@angular/common';`;
     }
   );
+
+  // Reverse: AI often imports Component / OnInit from @angular/common (TS2305 / TS2459)
+  source = repairCoreSymbolsImportedFromCommon(source);
 
   // RxJS symbols wrongly imported from @angular/core
   const rxjsWrong = ['Subject', 'BehaviorSubject', 'ReplaySubject', 'Observable', 'of', 'from', 'map', 'filter', 'takeUntil', 'take', 'tap', 'switchMap', 'catchError', 'debounceTime', 'distinctUntilChanged', 'combineLatest', 'forkJoin', 'firstValueFrom', 'lastValueFrom'];
@@ -4410,7 +4527,8 @@ function rewriteAtAliasImportsInTree(destPath) {
 /** Event-style outputs only — not callback Inputs like onClick used as `[onClick]="fn"`. */
 const PROMOTE_TO_OUTPUT = new Set([
   'onSave', 'onCancel', 'onSubmit', 'onClose', 'onConfirm', 'onSelect',
-  'onChange', 'onDelete', 'onEdit', 'onCreate', 'onUpdate', 'onRemove'
+  'onChange', 'onDelete', 'onEdit', 'onCreate', 'onUpdate', 'onRemove',
+  'closeDialog', 'dialogClose', 'closed', 'dismiss', 'onDismiss'
 ]);
 
 const SKIP_AUTO_INPUT = new Set([
@@ -4961,6 +5079,14 @@ function wrapDomEventPayloads(destPath, buildErrors) {
   for (const m of text.matchAll(/([\w./\\-]+\.component\.html)/g)) {
     mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
   }
+  // Dom event names that Angular's template checker often types as Event even with @Output()
+  const DOM_COLLIDING = new Set([
+    'close', 'open', 'error', 'load', 'focus', 'blur', 'change', 'submit', 'reset', 'select', 'scroll', 'toggle', 'cancel'
+  ]);
+  // AI invents closeDialog / dialogClose / etc. instead of close/onClose
+  const CLOSE_ALIASES = new Set([
+    'close', 'onClose', 'closeDialog', 'dialogClose', 'closed', 'dismiss', 'onDismiss'
+  ]);
   let changed = 0;
   const srcRoot = path.join(destPath, 'src');
   const { bySelector, byClass } = indexAngularComponents(srcRoot);
@@ -4974,30 +5100,77 @@ function wrapDomEventPayloads(destPath, buildErrors) {
     } catch {
       continue;
     }
-    const next = html.replace(
+    let next = html.replace(
       /\((\w+)\)="(\w+)\(\$event\)"/g,
       (full, ev, handler, offset) => {
         if (/\$any\(\s*\$event\s*\)/.test(full)) return full;
         const tag = nearestOpenTagName(html, offset);
         const childFile = resolveChildComponentFile(tag, bySelector, byClass);
+        let childSrc = '';
         if (childFile) {
           try {
-            const childSrc = fs.readFileSync(childFile, 'utf-8');
-            if (
-              classHasOutput(childSrc, ev) ||
-              classHasOutput(childSrc, outputNameWithoutOnPrefix(ev)) ||
-              classHasOutput(childSrc, outputNameWithOnPrefix(ev))
-            ) {
-              return full;
-            }
+            childSrc = fs.readFileSync(childFile, 'utf-8');
           } catch {
-            /* fall through */
+            /* ignore */
           }
         }
-        if (!/^on[A-Z]\w+$/.test(ev) && !BARE_OUTPUT_ALIASES.has(ev)) return full;
+        const hasOut =
+          childSrc &&
+          (classHasOutput(childSrc, ev) ||
+            classHasOutput(childSrc, outputNameWithoutOnPrefix(ev)) ||
+            classHasOutput(childSrc, outputNameWithOnPrefix(ev)));
+
+        // Remap invented close* bindings onto the child's real @Output()
+        if (CLOSE_ALIASES.has(ev) && childSrc) {
+          for (const candidate of ['onClose', 'close', 'closed', 'dismiss', 'closeDialog']) {
+            if (candidate !== ev && classHasOutput(childSrc, candidate)) {
+              return `(${candidate})="${handler}($any($event))"`;
+            }
+          }
+        }
+
+        // Prefer remapping bare (close) → (onClose) when the child declares onClose
+        if (DOM_COLLIDING.has(ev) && childSrc) {
+          const onName = outputNameWithOnPrefix(ev);
+          if (onName && classHasOutput(childSrc, onName) && !classHasOutput(childSrc, ev)) {
+            return `(${onName})="${handler}($any($event))"`;
+          }
+          // Native DOM collision: force $any so boolean handlers typecheck
+          if (hasOut || classHasOutput(childSrc, ev)) {
+            return `(${ev})="${handler}($any($event))"`;
+          }
+        }
+
+        if (hasOut) {
+          // Even with a matching @Output, Angular may still type $event as Event
+          // for close-like names — wrap when the build error is Event→boolean.
+          if (
+            CLOSE_ALIASES.has(ev) ||
+            DOM_COLLIDING.has(ev) ||
+            /not assignable to parameter of type 'boolean'/.test(text)
+          ) {
+            return `(${ev})="${handler}($any($event))"`;
+          }
+          return full;
+        }
+        if (
+          !/^on[A-Z]\w+$/.test(ev) &&
+          !BARE_OUTPUT_ALIASES.has(ev) &&
+          !CLOSE_ALIASES.has(ev) &&
+          !/not assignable to parameter of type 'boolean'/.test(text)
+        ) {
+          return full;
+        }
         return `(${ev})="${handler}($any($event))"`;
       }
     );
+    // Broad catch: any Event→boolean binding in mentioned templates
+    if (/not assignable to parameter of type 'boolean'/.test(text)) {
+      next = next.replace(/\((\w+)\)="(\w+)\(\$event\)"/g, (full, ev, handler) => {
+        if (/\$any\(/.test(full)) return full;
+        return `(${ev})="${handler}($any($event))"`;
+      });
+    }
     if (next !== html) {
       fs.writeFileSync(htmlFile, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
       changed += 1;
@@ -5299,6 +5472,12 @@ export function repairAngularWorkspace(destPath, options = {}) {
   }
 
   try {
+    repairMissingModelTypeImports(destPath, '');
+  } catch (err) {
+    console.warn(`[postprocess] Missing model type import repair failed: ${err.message}`);
+  }
+
+  try {
     ensureInputsFromParentPropertyBindings(destPath);
     ensureOutputsFromParentEventBindings(destPath);
     repairCallbackEmitInTemplates(destPath);
@@ -5570,6 +5749,7 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /Expected 0 arguments, but got 1/.test(text);
   const moduleIssues =
     /TS2307/.test(text) ||
+    /Cannot find module/.test(text) ||
     /Could not resolve ['"].*models\//.test(text) ||
     /Cannot find module ['"].*models\//.test(text) ||
     /Could not resolve ["']@angular\/material\/(?:cell-def|header-cell-def|footer-cell-def|header-row-def|row-def|footer-row-def|column-def|def)["']/.test(
@@ -5594,16 +5774,22 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     (/TS2717/.test(text) && /dataSource/.test(text)) ||
     (/TS2339/.test(text) && /dialogRef/.test(text) && /close/.test(text));
   const statusOptionIssues =
-    (/TS2339/.test(text) && /Property '(?:id|label|value)' does not exist/.test(text)) ||
-    (/Property 'label' does not exist on type/.test(text) && /\bstatus\b/i.test(text));
+    (/TS2339/.test(text) && /Property '(?:id|label|value|taskStatusLabels|statusLabels|\w+StatusLabels)' does not exist/.test(text)) ||
+    (/Property 'label' does not exist on type/.test(text) && /\bstatus\b/i.test(text)) ||
+    (/StatusLabels/.test(text) && /does not exist|TS2\d{3}|NG\d+/.test(text)) ||
+    (/taskStatusLabels/.test(text)) ||
+    (/statusLabels\[/.test(text) && /TS2\d{3}|does not exist/.test(text));
   const skeletonIssues =
     (/NG8002/.test(text) && /ngx-skeleton-loader/i.test(text)) ||
     /isn't a known property of 'ngx-skeleton-loader'/i.test(text) ||
     /is not a known property of 'ngx-skeleton-loader'/i.test(text);
+  const modelTypeIssues =
+    /TS2304/.test(text) && /Cannot find name '/.test(text);
   const needs =
     /NG1010/.test(text) ||
     /NG5002/.test(text) ||
     /TS2305/.test(text) ||
+    /TS2459/.test(text) ||
     /Void elements do not have end tags/.test(text) ||
     /Unexpected closing tag/.test(text) ||
     /Unknown reference/.test(text) ||
@@ -5612,7 +5798,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /Can't bind to/.test(text) ||
     /NG8002/.test(text) ||
     /Cannot find name 'Mat/.test(text) ||
-    /has no exported member/.test(text);
+    /has no exported member/.test(text) ||
+    /declares '?\w+'? locally, but it is not exported/.test(text);
   if (
     !needs &&
     !eventIssues &&
@@ -5625,7 +5812,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     !decoratorIssues &&
     !materialValueIssues &&
     !statusOptionIssues &&
-    !skeletonIssues
+    !skeletonIssues &&
+    !modelTypeIssues
   ) {
     return 0;
   }
@@ -5657,6 +5845,15 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       repairTaskStatusOptionTemplates(destPath, text);
     } catch (err) {
       console.warn(`[postprocess] Task status option repair failed: ${err.message}`);
+    }
+  }
+
+  if (modelTypeIssues || /Cannot find name '/.test(text)) {
+    try {
+      ensureAngularAppModels(destPath);
+      repairMissingModelTypeImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Missing model type import repair failed: ${err.message}`);
     }
   }
 
@@ -5696,6 +5893,11 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       }
     } catch (err) {
       console.warn(`[postprocess] Material table import repair failed: ${err.message}`);
+    }
+    try {
+      repairMissingRelativeComponentImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Missing relative component repair failed: ${err.message}`);
     }
   }
 
@@ -5980,6 +6182,124 @@ function removeHallucinatedNgModules(destPath) {
 /**
  * Rewrite relative imports that point at missing paths by resolving the symbol to a real component file.
  */
+/**
+ * TS2307 for invented relative components (e.g. SearchIconComponent from MUI SearchIcon).
+ * Drop the broken import + decorator entry and replace <app-*-icon> with <mat-icon>.
+ */
+function repairMissingRelativeComponentImports(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const missingFrom = new Set();
+  for (const m of text.matchAll(/Cannot find module ['"]([^'"]+)['"]/g)) {
+    const spec = m[1];
+    if (spec.startsWith('.') || /\/components\/[\w-]+-icon\//.test(spec) || /Icon\.component/i.test(spec)) {
+      missingFrom.add(spec.replace(/\\/g, '/'));
+    }
+  }
+  // Also catch absolute-looking render paths in the error that still point at relative invents
+  for (const m of text.matchAll(/from ['"](\.\.?\/[^'"]*icon[^'"]*)['"]/gi)) {
+    missingFrom.add(m[1].replace(/\\/g, '/'));
+  }
+
+  const mentionedTs = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentionedTs.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+  const files =
+    mentionedTs.size > 0
+      ? [...mentionedTs].filter((f) => fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const original = source;
+    const htmlPath = tsFile.replace(/\.ts$/, '.html');
+    let html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
+    const originalHtml = html;
+
+    // Collect relative imports whose files do not exist
+    const dropSyms = new Set();
+    for (const m of source.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"](\.[^'"]+)['"]/g)) {
+      const fromPath = m[2];
+      const resolved = path.resolve(path.dirname(tsFile), fromPath);
+      const candidates = [`${resolved}.ts`, `${resolved}.tsx`, path.join(resolved, 'index.ts'), resolved];
+      const exists = candidates.some((c) => fs.existsSync(c));
+      const looksMissing =
+        !exists &&
+        (missingFrom.has(fromPath) ||
+          /icon/i.test(fromPath) ||
+          /IconComponent/.test(m[1]) ||
+          text.includes(fromPath));
+      if (!looksMissing && exists) continue;
+      if (!exists) {
+        for (const sym of m[1].split(',').map((s) => s.trim()).filter(Boolean)) {
+          const bare = sym.replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim();
+          dropSyms.add(bare);
+          source = removeNamedImport(source, bare, fromPath);
+          source = removeDecoratorImport(source, bare);
+        }
+      }
+    }
+
+    // Lucide/MUI invents: SearchIconComponent etc.
+    for (const sym of [...collectImportedValueNames(source)]) {
+      if (!isLucideIconComponentSymbol(sym) && !/IconComponent$/.test(sym)) continue;
+      const from = findImportPathForSymbol(source, sym);
+      if (!from?.startsWith('.')) continue;
+      const resolved = path.resolve(path.dirname(tsFile), from);
+      if ([`${resolved}.ts`, `${resolved}.tsx`].some((c) => fs.existsSync(c))) continue;
+      dropSyms.add(sym);
+      source = removeNamedImport(source, sym, from);
+      source = removeDecoratorImport(source, sym);
+    }
+
+    source = stripInvalidDecoratorImports(source, tsFile);
+
+    for (const sym of dropSyms) {
+      const m = String(sym).match(/^(.+?)(?:Icon)?Component$/);
+      const base = m?.[1] || '';
+      const kebab = base
+        .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+        .replace(/_/g, '-')
+        .toLowerCase();
+      const iconName = kebab.replace(/-icon$/, '') || 'search';
+      if (kebab) {
+        const tag = `app-${kebab.replace(/-icon$/, '')}-icon`;
+        const tagAlt = `app-${kebab}`;
+        for (const t of new Set([tag, tagAlt, `app-${kebab}-icon`])) {
+          html = html.replace(
+            new RegExp(`<${t}\\b[^>]*\\/?>`, 'gi'),
+            `<mat-icon>${iconName}</mat-icon>`
+          );
+          html = html.replace(
+            new RegExp(`<${t}\\b[^>]*>[\\s\\S]*?<\\/${t}>`, 'gi'),
+            `<mat-icon>${iconName}</mat-icon>`
+          );
+          html = html.replace(new RegExp(`<\\/${t}>`, 'gi'), '');
+        }
+      }
+    }
+
+    if (/<mat-icon\b/.test(html) && dropSyms.size > 0) {
+      source = ensureImport(source, 'MatIconModule', '@angular/material/icon');
+      source = ensureDecoratorImport(source, 'MatIconModule');
+    }
+
+    if (source !== original) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+    if (html !== originalHtml) {
+      fs.writeFileSync(htmlPath, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Removed ${changed} missing relative icon/component reference(s)`);
+  }
+  return changed;
+}
+
 function fixBrokenRelativeComponentImports(destPath) {
   const srcRoot = path.join(destPath, 'src');
   const byClass = new Map();
@@ -7427,6 +7747,87 @@ function collectModelTypeExports(destPath) {
     }
   }
   return modelTypes;
+}
+
+/**
+ * TS2304: Cannot find name 'Task' / 'TaskDraft' — AI used model types without importing them.
+ * Pull missing symbols from src/app/models (or *.model.ts).
+ */
+export function repairMissingModelTypeImports(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const modelTypes = collectModelTypeExports(destPath);
+  if (modelTypes.size === 0) return 0;
+
+  const missingNames = new Set();
+  for (const m of text.matchAll(/Cannot find name '(\w+)'/g)) {
+    if (modelTypes.has(m[1])) missingNames.add(m[1]);
+  }
+  // Also catch truncated "Cannot find name 'Task'." style in ANSI-stripped logs
+  for (const [name] of modelTypes) {
+    if (new RegExp(`Cannot find name ['"]${name}['"]`).test(text)) missingNames.add(name);
+  }
+
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.ts)/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+
+  const files =
+    mentioned.size > 0
+      ? [...mentioned].filter((f) => fs.existsSync(f))
+      : walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts') || n.endsWith('.ts'));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    if (isModelSourceFile(tsFile)) continue;
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const original = source;
+    const toImport = new Set(missingNames);
+
+    // Proactive: any model symbol used in the file but not imported
+    for (const [name, modelFile] of modelTypes) {
+      if (!new RegExp(`\\b${name}\\b`).test(source)) continue;
+      if (findImportPathForSymbol(source, name)) continue;
+      // Skip if it's declared locally in this file
+      if (
+        new RegExp(`(?:export\\s+)?(?:interface|type|class|const|enum)\\s+${name}\\b`).test(source)
+      ) {
+        continue;
+      }
+      toImport.add(name);
+    }
+
+    if (toImport.size === 0) continue;
+
+    // Group by model file
+    /** @type {Map<string, Set<string>>} */
+    const byFile = new Map();
+    for (const name of toImport) {
+      const modelFile = modelTypes.get(name);
+      if (!modelFile) continue;
+      if (!new RegExp(`\\b${name}\\b`).test(source)) continue;
+      if (findImportPathForSymbol(source, name)) continue;
+      if (!byFile.has(modelFile)) byFile.set(modelFile, new Set());
+      byFile.get(modelFile).add(name);
+    }
+
+    for (const [modelFile, names] of byFile) {
+      const rel = relativeModulePath(tsFile, modelFile);
+      for (const name of names) {
+        source = ensureImport(source, name, rel);
+      }
+    }
+
+    if (source !== original) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Added missing model type imports in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 function stripExportedTypeBlock(content, typeName) {

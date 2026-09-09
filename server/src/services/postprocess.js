@@ -6262,20 +6262,30 @@ export function detectSourceStack(filesMap = {}, sourcePackageJson = null) {
 }
 
 /**
- * True when generated source looks truncated (unbalanced braces / trailing ellipsis).
+ * Scan braces/parens/brackets, ignoring strings and comments.
+ * `stack` holds the closers still needed (`}` `]` `)`), last-opened last.
  */
-export function isTruncatedSource(content) {
-  const text = String(content || '');
-  if (!text.trim()) return true;
-  if (/\n\s*\.\.\.\s*$/.test(text) && text.length < 400) return true;
-  if (/\/\/\s*(TODO|rest of|implement later)\b/i.test(text) && text.length < 600) return true;
-  let curly = 0;
-  let paren = 0;
-  let square = 0;
+function scanSourceDelimiters(text) {
+  const src = String(text || '');
+  const stack = [];
   let inStr = null;
   let escape = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    const next = i + 1 < src.length ? src[i + 1] : '';
+    if (lineComment) {
+      if (ch === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === '*' && next === '/') {
+        blockComment = false;
+        i += 1;
+      }
+      continue;
+    }
     if (inStr) {
       if (escape) {
         escape = false;
@@ -6288,20 +6298,78 @@ export function isTruncatedSource(content) {
       if (ch === inStr) inStr = null;
       continue;
     }
+    if (ch === '/' && next === '/') {
+      lineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blockComment = true;
+      i += 1;
+      continue;
+    }
     if (ch === '"' || ch === "'" || ch === '`') {
       inStr = ch;
       continue;
     }
-    if (ch === '{') curly += 1;
-    else if (ch === '}') curly -= 1;
-    else if (ch === '(') paren += 1;
-    else if (ch === ')') paren -= 1;
-    else if (ch === '[') square += 1;
-    else if (ch === ']') square -= 1;
-    if (curly < 0 || paren < 0 || square < 0) return true;
+    if (ch === '{') stack.push('}');
+    else if (ch === '(') stack.push(')');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ')' || ch === ']') {
+      if (stack.length === 0 || stack[stack.length - 1] !== ch) {
+        return { stack, ok: false, inStr: null, blockComment: false };
+      }
+      stack.pop();
+    }
   }
-  if (inStr) return true;
-  return curly !== 0 || paren !== 0 || square !== 0;
+  return { stack, ok: true, inStr, blockComment };
+}
+
+/**
+ * True when generated source looks truncated (unbalanced braces / trailing ellipsis).
+ * Closers inside `//` comments do not count — models often write `etc};` on a comment line.
+ */
+export function isTruncatedSource(content) {
+  const text = String(content || '');
+  if (!text.trim()) return true;
+  if (/\n\s*\.\.\.\s*$/.test(text) && text.length < 400) return true;
+  if (/\/\/\s*(TODO|rest of|implement later)\b/i.test(text) && text.length < 600) return true;
+  const scan = scanSourceDelimiters(text);
+  if (!scan.ok || scan.inStr || scan.blockComment) return true;
+  return scan.stack.length > 0;
+}
+
+/**
+ * Append missing `}` `]` `)` (and `;` for `export const`) when AI left them in a
+ * comment or truncated the file. No-op when delimiters already balance.
+ */
+export function repairTruncatedSourceDelimiters(content) {
+  const text = String(content || '');
+  const scan = scanSourceDelimiters(text);
+  if (!scan.ok || scan.inStr || scan.blockComment || scan.stack.length === 0) return text;
+  let suffix = scan.stack.slice().reverse().join('');
+  if (/export\s+(?:default\s+)?(?:const|let|var)\b/.test(text) && suffix.includes('}')) {
+    suffix += ';';
+  }
+  return `${text.replace(/\s*$/, '')}\n${suffix}\n`;
+}
+
+function repairTruncatedSourceDelimitersInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) =>
+    n.endsWith('.tsx') || n.endsWith('.ts') || n.endsWith('.jsx') || n.endsWith('.js')
+  )) {
+    const original = fs.readFileSync(file, 'utf-8');
+    const next = repairTruncatedSourceDelimiters(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    console.log(`[postprocess] Closed truncated delimiters in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 function packageNameFromSpecifier(spec) {
@@ -7713,16 +7781,37 @@ export default function App() {
   return 1;
 }
 
+/**
+ * Quote object-literal / type-literal keys that contain hyphens.
+ * `in-progress: 'In Progress'` is a TS1005 parse error; `'in-progress':` is valid.
+ */
+function quoteHyphenatedObjectKeys(content) {
+  return String(content || '').replace(
+    /(^|[{,;])(\s*)([A-Za-z_][\w]*-[A-Za-z0-9_-]*)(\s*:)/gm,
+    (full, prefix, ws, key, colon) => `${prefix}${ws}'${key}'${colon}`
+  );
+}
+
+function replaceUnderscoreStatusLiteral(content, underscored, lit) {
+  const escU = underscored.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const quotedLit = /[^A-Za-z0-9_$]/.test(lit) ? `'${lit}'` : lit;
+  return String(content || '').replace(
+    new RegExp(`(['"\`])${escU}\\1|\\b${escU}\\b`, 'g'),
+    (match, quote) => (quote ? `${quote}${lit}${quote}` : quotedLit)
+  );
+}
+
 function alignTaskStatusLiteralsInFile(content, shape) {
   const lits = [...String(shape?.statusType || '').matchAll(/'([^']+)'/g)].map((m) => m[1]);
-  if (lits.length === 0) return content;
+  if (lits.length === 0) return quoteHyphenatedObjectKeys(content);
   let c = String(content || '');
   for (const lit of lits) {
     const underscored = lit.replace(/-/g, '_');
     if (underscored !== lit) {
-      c = c.replace(new RegExp(underscored.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), lit);
+      c = replaceUnderscoreStatusLiteral(c, underscored, lit);
     }
   }
+  c = quoteHyphenatedObjectKeys(c);
   const statusName = shape.statusTypeName;
   const modelHint = String(shape.modelImportHint || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const mentionsStatus = statusName && new RegExp(`\\b${statusName}\\b`).test(c);
@@ -8037,7 +8126,10 @@ function pruneUnusedNamedImports(content) {
     /import\s+\{([^}]+)\}\s+from\s+(['"][^'"]+['"])\s*;?/g,
     (full, names, fromPart) => {
       const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
-      const without = content.replace(full, '');
+      const without = String(content)
+        .replace(full, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '');
       const kept = parts.filter((part) => {
         const name = part.split(/\s+as\s+/).pop()?.trim();
         if (!name || name === 'type') return true;
@@ -8048,6 +8140,33 @@ function pruneUnusedNamedImports(content) {
       return `import { ${kept.join(', ')} } from ${fromPart};`;
     }
   );
+}
+
+/**
+ * Angular @Input() entity props are `T | null`. AI often emits `task?: Task`
+ * (undefined-only), which fails when the parent passes `useState<Task | null>`.
+ */
+function widenOptionalObjectPropsToAcceptNull(content) {
+  return String(content || '').replace(
+    /^([ \t]*)(\w+)\?:(\s*)((?:readonly\s+)?[A-Z][\w.]*(?:\s*<[^>;\n]+>)?)(\s*;)/gm,
+    (full, indent, name, sp, type, semi) => {
+      if (/\|\s*null\b/.test(type)) return full;
+      return `${indent}${name}?:${sp}${type} | null${semi}`;
+    }
+  );
+}
+
+function widenOptionalObjectPropsInWorkspace(destPath) {
+  let changed = 0;
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.tsx') || n.endsWith('.ts'))) {
+    const original = fs.readFileSync(file, 'utf-8');
+    const next = widenOptionalObjectPropsToAcceptNull(original);
+    if (next !== original) {
+      fs.writeFileSync(file, next.endsWith('\n') ? next : `${next}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+  return changed;
 }
 
 function removeAngularLeftoverReactFiles(destPath) {
@@ -8158,6 +8277,7 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   let changedFiles = 0;
   if (/TS1109|TS1005|TS1003|Expression expected/.test(errorText)) {
     changedFiles += repairUnitWriterMarkerPollution(destPath);
+    changedFiles += repairTruncatedSourceDelimitersInWorkspace(destPath);
   }
   if (
     /TS5102/.test(errorText) ||
@@ -8222,6 +8342,9 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     /TS2322/.test(errorText)
   ) {
     changedFiles += syncComponentCallSiteProps(destPath);
+    if (/null is not assignable to type/.test(errorText) || /TS2322/.test(errorText)) {
+      changedFiles += widenOptionalObjectPropsInWorkspace(destPath);
+    }
   }
   if (
     /\bstate\.\w+\b/.test(errorText) ||
@@ -8306,6 +8429,8 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     );
     if (hasJsxParseError) {
       content = repairBrokenJsxObjectLiterals(content);
+      content = quoteHyphenatedObjectKeys(content);
+      content = repairTruncatedSourceDelimiters(content);
     }
 
     const missingHooks = [];
@@ -8367,8 +8492,10 @@ export function fixReactTypeErrors(destPath, buildErrors) {
     }
     content = content.replace(/: Observable<([^>]+)>/g, ': $1');
     content = rewriteReactAngularLeftovers(content);
+    content = widenOptionalObjectPropsToAcceptNull(content);
     content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);
+    content = pruneUnusedNamedImports(content);
 
     if (content !== original) {
       fs.writeFileSync(filePath, content.endsWith('\n') ? content : `${content}\n`, 'utf-8');
@@ -8458,6 +8585,8 @@ export function rewriteReactAngularLeftovers(content) {
   c = ensureReactHookImports(c);
   c = c.replace(/templateUrl\s*:\s*['"][^'"]+['"]\s*,?/g, '');
   c = c.replace(/styleUrl(?:s)?\s*:\s*(?:['"][^'"]+['"]|\[[^\]]+\])\s*,?/g, '');
+  c = quoteHyphenatedObjectKeys(c);
+  c = repairTruncatedSourceDelimiters(c);
   return c;
 }
 
@@ -9082,12 +9211,59 @@ function stripJsxProp(content, componentName, propName) {
   );
 }
 
+function eachJsxOpeningTag(content, componentName, rewrite) {
+  const src = String(content || '');
+  const startRe = new RegExp(`<${componentName}\\b`, 'g');
+  let out = '';
+  let last = 0;
+  for (const m of src.matchAll(startRe)) {
+    const tagStart = m.index;
+    out += src.slice(last, tagStart);
+    let i = tagStart + m[0].length;
+    let depth = 0;
+    let inStr = null;
+    let escape = false;
+    while (i < src.length) {
+      const ch = src[i];
+      if (inStr) {
+        if (escape) escape = false;
+        else if (ch === '\\') escape = true;
+        else if (ch === inStr) inStr = null;
+        i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inStr = ch;
+        i += 1;
+        continue;
+      }
+      if (ch === '{') {
+        depth += 1;
+        i += 1;
+        continue;
+      }
+      if (ch === '}') {
+        depth = Math.max(0, depth - 1);
+        i += 1;
+        continue;
+      }
+      if (depth === 0 && ch === '>') {
+        i += 1;
+        break;
+      }
+      i += 1;
+    }
+    out += rewrite(src.slice(tagStart, i));
+    last = i;
+  }
+  return out + src.slice(last);
+}
+
 function renameJsxPropInComponent(content, componentName, fromProp, toProp) {
-  const tagRe = new RegExp(`<${componentName}\\b[\\s\\S]*?(/?>)`, 'g');
-  return String(content || '').replace(tagRe, (tag) => {
+  return eachJsxOpeningTag(content, componentName, (tag) => {
     if (!new RegExp(`\\b${fromProp}=`).test(tag)) return tag;
     if (new RegExp(`\\b${toProp}=`).test(tag)) {
-      return tag.replace(new RegExp(`\\s+${fromProp}=\\{[^}]+\\}`), '');
+      return tag.replace(new RegExp(`\\s+${fromProp}=\\{[\\s\\S]*?\\}`), '');
     }
     return tag.replace(new RegExp(`\\b${fromProp}=`), `${toProp}=`);
   });
@@ -9111,6 +9287,12 @@ export function syncComponentCallSiteProps(destPath) {
       }
       if (props.has('onClose') && !props.has('onCancel')) {
         content = renameJsxPropInComponent(content, compName, 'onCancel', 'onClose');
+      }
+      if (props.has('onRemove') && !props.has('onDelete')) {
+        content = renameJsxPropInComponent(content, compName, 'onDelete', 'onRemove');
+      }
+      if (props.has('onDelete') && !props.has('onRemove')) {
+        content = renameJsxPropInComponent(content, compName, 'onRemove', 'onDelete');
       }
       content = mergeDeleteDialogCallbacks(content, compName, props);
     }
@@ -9264,6 +9446,7 @@ function repairReactSourceFiles(destPath) {
   for (const file of files) {
     const original = fs.readFileSync(file, 'utf-8');
     let content = rewriteReactAngularLeftovers(original);
+    content = widenOptionalObjectPropsToAcceptNull(content);
     content = stripUnitWriterMarkers(content);
     content = repairMismatchedBooleanJsxProps(content);
     content = stripUnusedReactDefaultImport(content);

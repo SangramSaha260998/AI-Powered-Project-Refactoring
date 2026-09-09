@@ -16,6 +16,7 @@ import {
   rewriteNgxsStateToZustand,
   detectSourceStack,
   isTruncatedSource,
+  repairTruncatedSourceDelimiters,
   addPackagesFromBuildErrors,
   fixReactModuleImports,
   dedupeStoreModelTypes,
@@ -791,6 +792,29 @@ export function HostPage() {
 
   assert(isTruncatedSource('export function Foo() {\n  return (\n'), 'unbalanced braces count as truncated');
   assert(!isTruncatedSource('export function Foo() { return 1; }\n'), 'balanced file is not truncated');
+  const commentedCloser = `export const AppConfig = {
+  // Application-wide configuration settings.
+  // Add properties such as API endpoints, feature flags, etc};
+`;
+  assert(isTruncatedSource(commentedCloser), 'closer inside a line comment is truncated');
+  const closedConfig = repairTruncatedSourceDelimiters(commentedCloser);
+  assert(!isTruncatedSource(closedConfig), 'repairTruncatedSourceDelimiters balances AppConfig');
+  assert(/\n\};\s*$/.test(closedConfig.trimEnd() + '\n') || /;\s*$/.test(closedConfig.trim()), 'export const gets a closing };');
+  const viaRewrite = rewriteReactAngularLeftovers(commentedCloser);
+  assert(!isTruncatedSource(viaRewrite), 'rewriteReactAngularLeftovers closes commented };');
+
+  const tmpCfg = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-appconfig-ts1005-'));
+  fs.mkdirSync(path.join(tmpCfg, 'src', 'config'), { recursive: true });
+  fs.writeFileSync(path.join(tmpCfg, 'src', 'config', 'AppConfig.ts'), commentedCloser);
+  const nCfg = fixReactTypeErrors(
+    tmpCfg,
+    `src/config/AppConfig.ts(4,1): error TS1005: '}' expected.`
+  );
+  assert(nCfg >= 1, 'fixReactTypeErrors closes AppConfig on TS1005');
+  const cfgOut = fs.readFileSync(path.join(tmpCfg, 'src', 'config', 'AppConfig.ts'), 'utf-8');
+  assert(!isTruncatedSource(cfgOut), 'workspace TS1005 repair balances AppConfig.ts');
+  fs.rmSync(tmpCfg, { recursive: true, force: true });
+
   assert(detectSourceStack({}, { dependencies: { '@ngxs/store': '20', '@angular/material': '20' } }).ngxs, 'detects NGXS from package.json');
   assert(detectSourceStack({}, { dependencies: { '@angular/material': '20' } }).material, 'detects Material from package.json');
   assert(detectSourceStack({}, { dependencies: { '@mui/material': '6' } }).material, 'detects Material from MUI package.json');
@@ -1290,6 +1314,152 @@ export function TaskList() {
   const pageHook = fs.readFileSync(path.join(tmp, 'src', 'pages', 'HostPage.tsx'), 'utf-8');
   assert(/items:\s*tasks/.test(pageHook), 'tasks destructuring aliased from items');
 
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- in_progress object keys must become 'in-progress' (not unquoted in-progress) ---
+{
+  const quoted = rewriteReactAngularLeftovers(`const LABELS = {
+  todo: 'To-Do',
+  in-progress: 'In Progress',
+  done: 'Done'
+};
+`);
+  assert(
+    /'in-progress'\s*:\s*'In Progress'/.test(quoted),
+    'rewriteReactAngularLeftovers quotes hyphenated object keys'
+  );
+  assert(!/^\s*in-progress\s*:/m.test(quoted), 'unquoted in-progress key is gone');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-status-key-quote-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'models'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-form-sidebar'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'models', 'task.model.ts'),
+    `export type TaskStatus = 'todo' | 'in-progress' | 'done';
+export interface Task { id: string; title: string; description: string; status: TaskStatus; }
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    `import { useForm } from 'react-hook-form';
+import { Task } from '../../models/task.model';
+const TASK_STATUS_LABELS = {
+  todo: 'To-Do',
+  in_progress: 'In Progress',
+  done: 'Done'
+};
+export function TaskFormSidebar() {
+  useForm<Task>();
+  return <div>{TASK_STATUS_LABELS.todo}</div>;
+}
+`
+  );
+
+  alignTaskStatusLiterals(tmp);
+  const aligned = fs.readFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    'utf-8'
+  );
+  assert(!/\bin_progress\b/.test(aligned), 'underscore status key is rewritten');
+  assert(
+    /'in-progress'\s*:\s*'In Progress'/.test(aligned),
+    'alignTaskStatusLiterals quotes hyphenated status object keys'
+  );
+
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    `const TASK_STATUS_LABELS: Record<string, string> = {
+  todo: 'To-Do',
+  in-progress: 'In Progress',
+  done: 'Done'
+};
+export function TaskFormSidebar() { return null; }
+`
+  );
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/components/task-form-sidebar/TaskFormSidebar.tsx(19,5): error TS1005: ':' expected.
+src/components/task-form-sidebar/TaskFormSidebar.tsx(19,14): error TS1005: ',' expected.
+src/components/task-form-sidebar/TaskFormSidebar.tsx(19,29): error TS1005: ':' expected.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors quotes hyphenated keys on TS1005');
+  const repaired = fs.readFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    'utf-8'
+  );
+  assert(
+    /'in-progress'\s*:\s*'In Progress'/.test(repaired),
+    'TS1005 repair quotes in-progress object key'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- onDelete→onRemove, task?: T | null, unused Icon in comments ---
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-react-prop-align-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-table'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-form-sidebar'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'src', 'pages', 'task-list'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-table', 'TaskTable.tsx'),
+    `export interface TaskTableProps {
+  tasks: Task[];
+  onEdit: (task: Task) => void;
+  onRemove: (task: Task) => void;
+}
+export function TaskTable({ tasks, onEdit, onRemove }: TaskTableProps) { return null; }
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    `import { Button, TextField, Icon } from '@mui/material';
+interface Props {
+  task?: Task;
+  onSave: (task: Task) => void;
+  onCancel: () => void;
+}
+export default function TaskFormSidebar({ task, onSave, onCancel }: Props) {
+  return (
+    <div>
+      {/* replaces <Icon>close</Icon> */}
+      <Button>Save</Button>
+      <TextField />
+    </div>
+  );
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'),
+    `export default function TaskList() {
+  return (
+    <div>
+      <TaskTable tasks={[]} onEdit={() => {}} onDelete={() => {}} />
+      <TaskFormSidebar task={null} onSave={() => {}} onCancel={() => {}} />
+    </div>
+  );
+}
+`
+  );
+
+  syncComponentCallSiteProps(tmp);
+  const list = fs.readFileSync(path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'), 'utf-8');
+  assert(/onRemove=\{/.test(list), 'onDelete call site renamed to onRemove');
+  assert(!/<TaskTable[^>]*\bonDelete=/.test(list), 'onDelete prop is gone from TaskTable');
+
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/components/task-form-sidebar/TaskFormSidebar.tsx(1,35): error TS6133: 'Icon' is declared but its value is never read.
+src/pages/task-list/TaskList.tsx(5,11): error TS2322: Type 'null' is not assignable to type 'Task | undefined'.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors repairs unused Icon and null prop');
+  const sidebar = fs.readFileSync(
+    path.join(tmp, 'src', 'components', 'task-form-sidebar', 'TaskFormSidebar.tsx'),
+    'utf-8'
+  );
+  assert(!/\bIcon\b/.test(sidebar.replace(/\/\*[\s\S]*?\*\//g, '')), 'unused Icon import stripped despite JSX comment');
+  assert(/task\?:\s*Task \| null/.test(sidebar), 'optional Task prop accepts null');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

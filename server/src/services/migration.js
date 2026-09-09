@@ -692,7 +692,15 @@ function isReactScaffoldPath(plannedPath) {
     /^src\/main\.(tsx|ts|jsx|js)$/i.test(p) ||
     /^src\/styles\.(scss|css)$/i.test(p) ||
     /^src\/vite-env\.d\.ts$/i.test(p) ||
-    /^src\/app\.config\.(ts|tsx)$/i.test(p)
+    /(^|\/)app\.config(?:\.server)?\.(ts|tsx)$/i.test(p)
+  );
+}
+
+function isAngularBootstrapSourcePath(rel) {
+  const p = String(rel || '').replace(/\\/g, '/');
+  return (
+    /(^|\/)main\.ts$/i.test(p) ||
+    /(^|\/)app\.config(?:\.server)?\.ts$/i.test(p)
   );
 }
 
@@ -4194,6 +4202,20 @@ ${enhancedPrompt}`
     }
 
     if (targetLower.includes('react')) {
+      const sources = []
+        .concat(item.approximateSourceFilesToRead || [])
+        .map((s) => String(s || '').replace(/\\/g, '/'));
+      if (sources.length > 0 && sources.every(isAngularBootstrapSourcePath)) {
+        console.log(`[${sessionId}] Skipping Angular bootstrap source in React plan: ${planned}`);
+        return false;
+      }
+      if (
+        /(^|\/)config\/AppConfig\.(ts|tsx)$/i.test(planned) &&
+        sources.some(isAngularBootstrapSourcePath)
+      ) {
+        console.log(`[${sessionId}] Skipping Angular app.config mapped to ${planned}`);
+        return false;
+      }
       const remapped = normalizeReactPlanPath(planned);
       if (remapped == null) {
         console.log(`[${sessionId}] Skipping Angular HTML triad file in React plan: ${planned}`);

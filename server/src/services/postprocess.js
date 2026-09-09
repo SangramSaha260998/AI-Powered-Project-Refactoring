@@ -7409,24 +7409,67 @@ function stripExportedTypeBlock(content, typeName) {
 }
 
 /**
- * Store files must not re-declare model types — import from src/models instead.
+ * Strip a local (exported or private) interface/type that duplicates a shared model type.
+ */
+function stripLocalTypeBlock(content, typeName) {
+  let c = stripExportedTypeBlock(content, typeName);
+  // Non-exported duplicates: `interface Task { ... }` / `type Task = ...`
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)interface\\s+${typeName}\\s*(?:extends\\s+[^{]+)?\\{[\\s\\S]*?\\}\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  c = c.replace(
+    new RegExp(
+      `(^|\\n)(\\s*)(?!export\\b)type\\s+${typeName}\\s*=\\s*[^;]+;\\s*\\n?`,
+      'g'
+    ),
+    '$1'
+  );
+  return c;
+}
+
+function isModelSourceFile(fullPath) {
+  const norm = String(fullPath || '').replace(/\\/g, '/');
+  const base = path.basename(norm);
+  return /(^|\/)models?\//.test(norm) || /\.model\.(ts|tsx)$/i.test(base);
+}
+
+/**
+ * Non-model source files must not re-declare shared model types — import from
+ * src/models instead. Covers store/, components/, pages/ (Angular→React often
+ * invents a local `Task` with `id: string | number` that conflicts with
+ * `task.model` `id: string`, which fails TS2322 across props).
  */
 export function dedupeStoreModelTypes(destPath) {
   const modelTypes = collectModelTypeExports(destPath);
   if (modelTypes.size === 0) return 0;
   let changed = 0;
   for (const file of walkFiles(path.join(destPath, 'src'), (name, full) =>
-    /(^|\/)store\//.test(full.replace(/\\/g, '/')) && /\.(ts|tsx)$/.test(name)
+    /\.(ts|tsx)$/.test(name) && !isModelSourceFile(full)
   )) {
     let content = fs.readFileSync(file, 'utf-8');
     const original = content;
     const toImport = new Set();
     for (const [typeName, modelFile] of modelTypes) {
-      if (!new RegExp(`export\\s+(?:interface|type)\\s+${typeName}\\b`).test(content)) continue;
-      content = stripExportedTypeBlock(content, typeName);
+      // Only strip type/interface aliases — leave const/enum value exports alone
+      // unless they are clearly type aliases (handled above).
+      const hasLocal =
+        new RegExp(`(?:export\\s+)?(?:interface|type)\\s+${typeName}\\b`).test(content);
+      if (!hasLocal) continue;
+      // Never rewrite the canonical model file itself (already filtered) or
+      // files that only re-export the model type via `export type { Task }`.
+      if (path.resolve(file) === path.resolve(modelFile)) continue;
+      content = stripLocalTypeBlock(content, typeName);
       toImport.add(typeName);
       const draftName = `${typeName}Draft`;
       if (modelTypes.has(draftName)) toImport.add(draftName);
+      const statusName = `${typeName}Status`;
+      if (modelTypes.has(statusName) && new RegExp(`\\b${statusName}\\b`).test(content)) {
+        toImport.add(statusName);
+      }
     }
     if (toImport.size > 0) {
       for (const sym of [...toImport]) {
@@ -7445,7 +7488,7 @@ export function dedupeStoreModelTypes(destPath) {
     }
   }
   if (changed > 0) {
-    console.log(`[postprocess] Deduped model types in ${changed} store file(s)`);
+    console.log(`[postprocess] Deduped model types in ${changed} file(s)`);
   }
   return changed;
 }
@@ -8114,7 +8157,14 @@ export function fixReactTypeErrors(destPath, buildErrors) {
   ) {
     changedFiles += removeAngularLeftoverReactFiles(destPath);
   }
-  if (/Types of property/.test(errorText) && /\/models\//.test(errorText) && /\/store\//.test(errorText)) {
+  if (
+    (/Types of property/.test(errorText) && /\/models\//.test(errorText)) ||
+    (/TS2322/.test(errorText) &&
+      /is not assignable to type/.test(errorText) &&
+      /\/models\//.test(errorText)) ||
+    (/Types of property 'id' are incompatible/.test(errorText) &&
+      /string \| number/.test(errorText))
+  ) {
     changedFiles += dedupeStoreModelTypes(destPath);
   }
   if (/Cannot find module/.test(errorText) || /Did you mean to use 'import/.test(errorText)) {

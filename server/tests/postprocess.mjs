@@ -1048,6 +1048,30 @@ src/components/task-delete-dialog/TaskDeleteDialog.tsx(1,11): error TS1005: ';' 
 
   assert(removeUnusedStoreShards(tmp) >= 2, 'unused NGXS shard files removed');
 
+  // Component-local Task with id: string|number must not conflict with models/task.model
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-table'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'models', 'task.model.ts'),
+    `export type TaskStatus = 'todo' | 'in-progress' | 'done';\nexport interface Task { id: string; title: string; description: string; status: TaskStatus; }\n`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-table', 'TaskTable.tsx'),
+    `import React from 'react';\nexport interface Task {\n  id: string | number;\n  title: string;\n  description: string;\n  status: 'todo' | 'in-progress' | 'done';\n}\ninterface TaskTableProps { tasks: Task[]; onEdit: (task: Task) => void; }\nexport const TaskTable: React.FC<TaskTableProps> = ({ tasks, onEdit }) => (\n  <div>{tasks.map((t) => <button key={t.id} onClick={() => onEdit(t)}>{t.title}</button>)}</div>\n);\nexport default TaskTable;\n`
+  );
+  const dedupedComponents = dedupeStoreModelTypes(tmp);
+  assert(dedupedComponents >= 1, 'dedupeStoreModelTypes updates component duplicate Task');
+  const table = fs.readFileSync(path.join(tmp, 'src', 'components', 'task-table', 'TaskTable.tsx'), 'utf-8');
+  assert(/from ['"].*models\/task\.model['"]/.test(table), 'TaskTable imports Task from models');
+  assert(!/export interface Task/.test(table), 'local Task interface removed from TaskTable');
+  assert(!/id:\s*string\s*\|\s*number/.test(table), 'conflicting string|number id removed');
+
+  const typeFix = fixReactTypeErrors(
+    tmp,
+    `src/pages/task-list/TaskList.tsx(193,13): error TS2322: Type '(task: import("/opt/render/project/src/server/extracted/x-converted/src/models/task.model").Task) => void' is not assignable to type '(task: import("/opt/render/project/src/server/extracted/x-converted/src/components/task-table/TaskTable").Task) => void'. Types of property 'id' are incompatible. Type 'string | number' is not assignable to type 'string'. Type 'number' is not assignable to type 'string'.`
+  );
+  assert(typeFix >= 0, 'fixReactTypeErrors accepts component/model Task id conflict');
+
+
   repairReactWorkspace(tmp, {});
   const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
   assert(pkg.dependencies['react-hook-form'], 'react-hook-form added from imports');

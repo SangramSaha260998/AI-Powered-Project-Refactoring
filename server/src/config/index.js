@@ -212,6 +212,14 @@ export function getProviderFallbackChain(primaryProvider = 'openrouter') {
 }
 
 /**
+ * True when another configured provider remains after providerIndex in the chain.
+ */
+export function hasConfiguredFallbackProvider(chain, providerIndex) {
+  if (!Array.isArray(chain) || providerIndex < 0) return false;
+  return chain.slice(providerIndex + 1).some((id) => isProviderConfigured(id));
+}
+
+/**
  * Returns whether a provider can be used in the automatic fallback chain.
  * - Ollama Cloud: configured when OLLAMA_API_KEY is set
  * - Ollama Local: configured when OLLAMA_ENABLED=true

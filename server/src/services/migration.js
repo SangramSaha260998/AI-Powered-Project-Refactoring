@@ -14,6 +14,7 @@ import {
   getProviderConfigs,
   getProviderFallbackChain,
   getProviderFallbackModels,
+  hasConfiguredFallbackProvider,
   isProviderConfigured,
   isOllamaCloudMode,
   RATE_LIMIT_PAUSE_MS,
@@ -39,7 +40,8 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
-import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
+import { stripUnitWriterMarkers } from '../utils/llmOutput.js';
+import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, stripAiBundleMarkers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
   angularDestForReactSource,
@@ -248,11 +250,15 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Makes a chat completion call with the given messages and optional JSON mode.
  *
  * Fallback order (always on, innermost first):
- * 1. Model fallback — when a (key, model) pair crosses its limit, try the next
- *    free model on the SAME API key (e.g. Gemini 2.0 Flash → Flash-Lite).
- * 2. Key rotation — after all models on a key are exhausted, move to the next
- *    API key for the same provider (models restart from #1).
- * 3. Provider fallback — after all keys × models of a provider are exhausted,
+ * 1. Key rotation on 429 — rate limits are usually per API key, so switch to the
+ *    next key immediately instead of burning through every model on a hot key.
+ * 2. Provider fallback on 429 — when every key on the current provider is
+ *    rate-limited for the same model, try the next configured LLM (Groq, Ollama,
+ *    OpenRouter, …) before downgrading to a smaller model on the same provider.
+ * 3. Model fallback — for other transient errors, try the next free model on the
+ *    same API key (e.g. Gemini 3.6 Flash → 3.5 Flash-Lite).
+ * 4. Key rotation — after all models on a key are exhausted, move to the next key.
+ * 5. Provider fallback — after all keys × models of a provider are exhausted,
  *    try the next configured provider in the chain using its own keys/models.
  *
  * Auth/quota errors (401/402) are key-level and skip model rotation entirely.
@@ -284,7 +290,7 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     // Always attempt the user-selected provider; only auto-fallback entries need to be "configured".
     if (!isSelectedPrimary && !isProviderConfigured(providerId)) {
       console.warn(
-        `[Provider Fallback] Skipping "${providerId}" — not configured.`
+        `[Provider Fallback] Skipping "${providerId}" — not configured (no API key in server/.env).`
       );
       continue;
     }
@@ -306,8 +312,17 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     attemptedAnyProvider = true;
     providersTried += 1;
     let providerHitRateLimit = false;
+    let advanceProvider = false;
 
-    if (providerIndex > 0 || (isPrimary && providerId !== aiProvider)) {
+    if (providerIndex === 0) {
+      const configuredRest = chain.slice(1).filter((id) => isProviderConfigured(id));
+      if (configuredRest.length > 0) {
+        console.log(
+          `[Provider Fallback] Primary: ${PROVIDERS[providerId]?.name || providerId}. ` +
+          `If all keys are exhausted, will try: ${configuredRest.join(' → ')}`
+        );
+      }
+    } else {
       console.warn(
         `[Provider Fallback] Switching to ${PROVIDERS[providerId]?.name || providerId} ` +
         `(${providerId}) — models: [${models.join(', ')}]`
@@ -325,13 +340,13 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
       continue;
     }
 
-    for (let keyIndex = 0; keyIndex < totalKeys; keyIndex++) {
+    for (let keyIndex = 0; keyIndex < totalKeys && !advanceProvider; keyIndex++) {
       const { client, config } = entries[keyIndex];
       const maskedKey = config.apiKey.length > 8
         ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
         : '****';
 
-      for (let modelIndex = 0; modelIndex < totalModels; modelIndex++) {
+      for (let modelIndex = 0; modelIndex < totalModels && !advanceProvider; modelIndex++) {
         const model = models[modelIndex];
 
         const requestOptions = {
@@ -371,7 +386,10 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           return content;
         } catch (err) {
           lastError = err;
-          const { statusCode, reason } = isFallbackWorthyError(err);
+          const { worthy, statusCode, reason } = isFallbackWorthyError(err);
+          if (!worthy) {
+            throw err;
+          }
 
           // Key-level failures (bad/missing auth, exhausted billing quota) —
           // no model change can fix these, so skip straight to the next key.
@@ -385,6 +403,34 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           }
 
           if (statusCode === 429) providerHitRateLimit = true;
+
+          // Rate limits are usually per API key — rotate keys before exhausting every model on one key.
+          if (statusCode === 429 && keyIndex < totalKeys - 1) {
+            const waitMs = getRetryAfterMs(err, 3000);
+            console.warn(
+              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `rate-limited on model "${model}". Trying next key in ${Math.round(waitMs / 1000)}s...`
+            );
+            await pause(waitMs);
+            break; // next key (models restart from #1)
+          }
+
+          // Every key on this provider is rate-limited for this model — try another LLM first.
+          if (
+            statusCode === 429 &&
+            keyIndex === totalKeys - 1 &&
+            hasConfiguredFallbackProvider(chain, providerIndex)
+          ) {
+            const nextProvider = chain.slice(providerIndex + 1).find((id) => isProviderConfigured(id));
+            const waitMs = getRetryAfterMs(err, 2000);
+            console.warn(
+              `[Provider Fallback] All ${totalKeys} ${providerId} API key(s) rate-limited for "${model}". ` +
+              `Trying next LLM (${nextProvider}) in ${Math.round(waitMs / 1000)}s...`
+            );
+            await pause(waitMs);
+            advanceProvider = true;
+            break;
+          }
 
           // Limit crossed for THIS (key, model) pair → try the next free model
           // on the same API key before touching other keys/providers.
@@ -412,15 +458,17 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           // Every key × model for this provider is exhausted → next provider.
           console.warn(
             `[Provider Fallback] All ${totalKeys} key(s) × ${totalModels} model(s) for ` +
-            `"${providerId}" exhausted (${reason}: ${statusCode}).`
+            `"${providerId}" exhausted (${reason}: ${statusCode}). Trying next LLM provider...`
           );
           await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
-          break; // next provider
+          advanceProvider = true;
+          break;
         }
       }
     }
 
     if (providerHitRateLimit) rateLimitedProviders += 1;
+    if (advanceProvider) continue;
   }
 
   if (!attemptedAnyProvider) {
@@ -1692,14 +1740,20 @@ function ensurePlanCoversAllSourceFiles(plan, filesMap, toTech) {
  * lock file first when missing or out of sync, then runs `npm ci` + build.
  * Returns { ok: boolean, errors: string }.
  */
-async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
+async function verifyNpmCiBuild(workspacePath, targetTech, sessionId, onProgress = null) {
   const isAngular = String(targetTech).toLowerCase().includes('angular');
   const buildCmd = isAngular ? 'npx' : 'npm';
   const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
+  const say = (phase, message) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress(phase, message); } catch { /* ignore */ }
+    }
+  };
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const lockPath = path.join(workspacePath, 'package-lock.json');
     if (!fs.existsSync(lockPath)) {
+      say('installing', 'Generating package-lock.json via npm install...');
       console.log(`[${sessionId}] npm ci check: no package-lock.json — generating via npm install...`);
       // NOTE: no --prefer-offline — stale cached packuments cause ETARGET for
       // recently published versions (e.g. Angular 22 patch lines).
@@ -1712,6 +1766,7 @@ async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
       }
     }
 
+    say('installing', `Running npm ci (attempt ${attempt}/2)...`);
     console.log(`[${sessionId}] npm ci check (attempt ${attempt}/2): npm ci ...`);
     const ci = await runNpmCi(workspacePath);
     if (ci.exitCode !== 0 && !npmInstallLooksSuccessful(workspacePath, ci)) {
@@ -1731,9 +1786,11 @@ async function verifyNpmCiBuild(workspacePath, targetTech, sessionId) {
       return { ok: false, errors: `npm ci failed:\n${errOut}` };
     }
 
+    say('building', `npm ci succeeded. Running ${buildCmd} ${buildArgs.join(' ')}...`);
     console.log(`[${sessionId}] npm ci succeeded. Running ${buildCmd} ${buildArgs.join(' ')}...`);
     const build = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
     if (build.exitCode === 0) {
+      say('building', 'Clean npm ci + build passed.');
       console.log(`[${sessionId}] npm ci + build ✅ PASSED`);
       return { ok: true, errors: '' };
     }
@@ -2219,21 +2276,24 @@ function parseUnitFileBundle(raw, expectedPaths = []) {
   }
 
   if (files.length === 0) {
-    const re = /===== FILE:\s*(.+?)\s*=====\s*\r?\n([\s\S]*?)(?====== FILE:|===== END =====|$)/g;
+    const re =
+      /===== FILE:\s*([^\n=]+?)\s*(?:=====)?\s*\r?\n([\s\S]*?)(?=\r?\n===== FILE:|\r?\n===== END =====|$)/g;
     let m;
     while ((m = re.exec(cleaned)) !== null) {
       files.push({
         path: m[1].trim().replace(/\\/g, '/').replace(/^[`'"]+|[`'"]+$/g, ''),
-        content: m[2].replace(/\n+$/, '')
+        content: stripUnitWriterMarkers(m[2].replace(/\n+$/, ''))
       });
     }
   }
 
   if (files.length === 0 && expectedPaths.length === 1) {
-    files.push({ path: expectedPaths[0], content: cleaned });
+    files.push({ path: expectedPaths[0], content: stripUnitWriterMarkers(cleaned) });
   }
 
-  return files.filter((f) => f.path && f.content != null);
+  return files
+    .filter((f) => f.path && f.content != null)
+    .map((f) => ({ ...f, content: stripUnitWriterMarkers(f.content) }));
 }
 
 function extCompatible(expectedExt, actualExt) {
@@ -2772,6 +2832,7 @@ function sanitizeReactComponentContent(rawContent) {
  * Sanitize generated content based on destination file type.
  */
 function sanitizeGeneratedContent(relativePath, content) {
+  content = stripAiBundleMarkers(stripCodeFences(String(content || '')));
   const normalized = relativePath.replace(/\\/g, '/');
   const base = path.posix.basename(normalized);
 
@@ -2796,7 +2857,7 @@ function sanitizeGeneratedContent(relativePath, content) {
     }
   }
 
-  return `${stripCodeFences(content)}\n`;
+  return `${stripUnitWriterMarkers(stripCodeFences(content))}\n`;
 }
 
 /**
@@ -3019,11 +3080,16 @@ function runNpmCi(cwd) {
  * Verify that the migrated project compiles by running npm install + build.
  * Returns { success: boolean, errors: string, installOk: boolean }.
  */
-async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = false) {
+async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = false, onProgress = null) {
   const isAngular = targetTech.toLowerCase().includes('angular');
   const isReact = targetTech.toLowerCase().includes('react');
   const buildCmd = isAngular ? 'npx' : 'npm';
   const buildArgs = isAngular ? ['ng', 'build'] : ['run', 'build'];
+  const say = (phase, message) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress(phase, message); } catch { /* ignore */ }
+    }
+  };
 
   const nodeModulesPath = path.join(workspacePath, 'node_modules');
   const hasUsableTooling = isAngular
@@ -3036,6 +3102,7 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
   const shouldInstall = !skipInstall || !hasUsableTooling;
 
   if (shouldInstall) {
+    say('installing', 'Installing npm dependencies...');
     console.log(`[${sessionId}] Build verification: running npm install...`);
     const installResult = await runNpmInstall(workspacePath);
     if (!npmInstallLooksSuccessful(workspacePath, installResult)) {
@@ -3051,18 +3118,22 @@ async function verifyBuild(workspacePath, targetTech, sessionId, skipInstall = f
       }
       return { success: false, errors: `npm install failed:\n${errOutput}`, installOk: false };
     }
+    say('building', `Running ${isAngular ? 'ng build' : 'npm run build'}...`);
     console.log(`[${sessionId}] npm install succeeded. Running build...`);
   } else {
+    say('building', `Running ${isAngular ? 'ng build' : 'npm run build'}...`);
     console.log(`[${sessionId}] Build verification: skipping npm install (tooling present). Running build...`);
   }
 
   const buildResult = await runCommand(buildCmd, buildArgs, workspacePath, 300000);
   if (buildResult.exitCode === 0) {
+    say('building', 'Build succeeded.');
     console.log(`[${sessionId}] ✅ Build succeeded!`);
     return { success: true, errors: '', installOk: true };
   }
 
   const errOutput = (buildResult.stderr || buildResult.stdout || '').slice(-4000);
+  say('building', 'Build failed — collecting compiler errors...');
   console.error(`[${sessionId}] Build failed:\n`, errOutput);
   return { success: false, errors: errOutput, installOk: true };
 }
@@ -3232,11 +3303,16 @@ ${libraryFixRules}
  * On failure: asks AI to fix errors, retries up to MAX_BUILD_RETRIES times.
  * Returns { verified: boolean }.
  */
-async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel, sourceFilesMap = null, sourcePackageJson = null) {
+async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvider, aiModel, sourceFilesMap = null, sourcePackageJson = null, onProgress = null) {
   let lastErrors = '';
   const isReact = String(targetTech).toLowerCase().includes('react');
   const isAngular = String(targetTech).toLowerCase().includes('angular');
   let skipNpmInstall = false;
+  const say = (phase, message) => {
+    if (typeof onProgress === 'function') {
+      try { onProgress(phase, message); } catch { /* ignore */ }
+    }
+  };
 
   // TypeScript 5.9+ rejects baseUrl and non-relative path targets in tsconfig*.json.
   const tsconfigRepairs = repairTsconfigForModernTypeScript(workspacePath);
@@ -3255,8 +3331,9 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         console.log(`[${sessionId}] Renamed ${renamed} JSX .ts file(s) to .tsx before build`);
       }
     }
+    say('building', `Final build verification attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS}...`);
     console.log(`[${sessionId}] Final build verification attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS}...`);
-    const result = await verifyBuild(workspacePath, targetTech, sessionId, skipNpmInstall);
+    const result = await verifyBuild(workspacePath, targetTech, sessionId, skipNpmInstall, onProgress);
     if (result.installOk) skipNpmInstall = true;
     if (result.success) {
       return { verified: true, errors: '' };
@@ -3273,12 +3350,14 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         const missingModule = /Cannot find module/.test(result.errors || '');
         if (repairedPkgs > 0 || addedPkgs > 0 || typeDeps > 0 || (missingModule && typeFixed === 0)) {
           console.log(`[${sessionId}] Installing dependencies after postprocess/package fixes...`);
+          say('installing', 'Installing dependencies after package fixes...');
           await runNpmInstall(workspacePath);
           skipNpmInstall = true;
           continue;
         }
         if (typeFixed > 0 || viteDts > 0) {
           console.log(`[${sessionId}] Mechanically fixed type errors in ${typeFixed + viteDts} file(s). Retrying build...`);
+          say('fixing', `Mechanically fixed type errors in ${typeFixed + viteDts} file(s). Retrying build...`);
           continue;
         }
       }
@@ -3293,6 +3372,7 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         const ngFixed = fixAngularCompileErrors(workspacePath, result.errors);
         if (materialPkgs > 0 || addedPkgs > 0) {
           console.log(`[${sessionId}] Added Angular packages. Installing dependencies...`);
+          say('installing', 'Added Angular packages. Installing dependencies...');
           await runNpmInstall(workspacePath);
           skipNpmInstall = true;
           repairAngularWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson });
@@ -3301,10 +3381,12 @@ async function verifyAndFixBuild(sessionId, workspacePath, targetTech, aiProvide
         if (ngFixed > 0) {
           repairAngularWorkspace(workspacePath, { sourceFilesMap, sourcePackageJson });
           console.log(`[${sessionId}] Mechanically fixed Angular compile errors in ${ngFixed} file(s). Retrying build...`);
+          say('fixing', `Mechanically fixed Angular compile errors in ${ngFixed} file(s). Retrying build...`);
           continue;
         }
       }
       console.log(`[${sessionId}] Asking AI to fix build errors (attempt ${attempt})...`);
+      say('fixing', `Asking AI to fix build errors (attempt ${attempt}/${MAX_BUILD_FIX_ATTEMPTS})...`);
       const fixes = await askAIToFixBuildErrors(sessionId, result.errors, workspacePath, aiProvider, aiModel, targetTech);
       if (fixes.length === 0) {
         // Mechanical JSX rename may still save the build on the next attempt.
@@ -4660,10 +4742,15 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
       (unitIndex + 1) % BUILD_EVERY_N_UNITS === 0;
 
     if (shouldBuildNow) {
+      report(
+        'building',
+        `Checkpoint build after unit ${unitIndex + 1}/${migrationUnits.length}...`,
+        { unitIndex: unitIndex + 1, unitTotal: migrationUnits.length }
+      );
       console.log(
         `[${sessionId}] Checkpoint build after unit ${unitIndex + 1}/${migrationUnits.length}...`
       );
-      const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, npmInstallDone);
+      const buildResult = await verifyBuild(migrationWorkspacePath, toTech, sessionId, npmInstallDone, report);
       if (buildResult.installOk) npmInstallDone = true;
       if (buildResult.success) {
         console.log(`[${sessionId}] Checkpoint build ✅`);
@@ -4706,6 +4793,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
   // ensure correct tooling. The AI owns src/app feature pages only — the
   // web_angular kit/config files are restored from the pristine template.
   if (targetLower.includes('react')) {
+    report('unit', 'Restoring React tooling files and running post-generation repairs...');
     console.log(`[${sessionId}] Restoring React tooling files (keeping converted src/)...`);
     injectReactWorkspaceTemplates(migrationWorkspacePath, targetVersions.react, { preserveSrc: true });
     ensureReactRuntimeFiles(migrationWorkspacePath);
@@ -4716,6 +4804,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     });
     enforceReactPackageVersions(migrationWorkspacePath, targetVersions.react);
   } else if (targetLower.includes('angular')) {
+    report('unit', 'Restoring Angular tooling files and running post-generation repairs...');
     console.log(
       `[${sessionId}] Restoring Angular tooling files (keeping converted src/)...`
     );
@@ -4853,6 +4942,7 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     );
   }
 
+  report('building', 'Running final build verification...');
   const buildCheck = await verifyAndFixBuild(
     sessionId,
     migrationWorkspacePath,
@@ -4860,7 +4950,8 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
     aiProvider,
     aiModel || undefined,
     essentialFilesMap,
-    sourcePackageJson
+    sourcePackageJson,
+    report
   );
   if (!buildCheck.verified) {
     const tail = String(buildCheck.errors || '').trim().slice(-1200);
@@ -4871,7 +4962,8 @@ Convert the SOURCE files into a real working UI: Tailwind in templates, lucide-r
   }
 
   // npm ci sanity check — the delivered project must install + build after only `npm ci`
-  const npmCiCheck = await verifyNpmCiBuild(migrationWorkspacePath, toTech, sessionId);
+  report('building', 'Running clean npm ci + build check...');
+  const npmCiCheck = await verifyNpmCiBuild(migrationWorkspacePath, toTech, sessionId, report);
   if (!npmCiCheck.ok) {
     throw new ConversionIncompleteError(
       `Conversion failed: clean npm ci + build did not succeed. The ZIP was not created.\n` +
@@ -5242,8 +5334,17 @@ export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, 
   }
 
   // 4. Verify build + fix loop
-  report('rework', 'Verifying the updated project still builds...');
-  const buildCheck = await verifyAndFixBuild(sessionId, workspacePath, toTech, aiProvider, aiModel);
+  report('building', 'Verifying the updated project still builds...');
+  const buildCheck = await verifyAndFixBuild(
+    sessionId,
+    workspacePath,
+    toTech,
+    aiProvider,
+    aiModel,
+    null,
+    null,
+    report
+  );
   if (!buildCheck.verified) {
     throw new ConversionIncompleteError(
       `Rework failed: the updated project did not compile after ${MAX_BUILD_FIX_ATTEMPTS} fix attempts. ` +
@@ -5252,7 +5353,8 @@ export async function runReworkPipeline(workspacePath, reworkPrompt, sessionId, 
   }
 
   // 5. npm ci sanity check
-  const npmCiCheck = await verifyNpmCiBuild(workspacePath, toTech, sessionId);
+  report('building', 'Running clean npm ci + build check...');
+  const npmCiCheck = await verifyNpmCiBuild(workspacePath, toTech, sessionId, report);
   if (!npmCiCheck.ok) {
     throw new ConversionIncompleteError(
       `Rework failed: clean npm ci + build did not succeed. The ZIP was not created.\n` +

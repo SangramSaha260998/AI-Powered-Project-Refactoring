@@ -12,6 +12,7 @@ import {
   collectConversionDefects,
   collectMissingSourcePages,
   rewriteReactAngularLeftovers,
+  stripAiBundleMarkers,
   rewriteNgxsStateToZustand,
   detectSourceStack,
   isTruncatedSource,
@@ -27,6 +28,7 @@ import {
   fixZustandSelectorFields,
   fixZustandHookUsage,
   injectMissingComponentProps,
+  repairMismatchedBooleanJsxProps,
   syncComponentCallSiteProps,
   fixTaskModelFieldMismatches,
   alignTaskStatusLiterals,
@@ -963,6 +965,42 @@ export function Template() {
   assert(text.includes('{data.task.title}'), 'template {{ }} still becomes JSX expression');
 }
 
+// --- Leftover ===== FILE / END markers must be stripped from .tsx bodies ---
+{
+  const leaked = `===== FILE: src/components/task-task-delete-dialog/TaskDeleteDialog.tsx
+import React from 'react';
+export const TaskDeleteDialog = () => null;
+===== END =====
+`;
+  const stripped = stripAiBundleMarkers(leaked);
+  assert(!/=====/.test(stripped), 'stripAiBundleMarkers removes FILE/END tokens');
+  assert(/import React from 'react'/.test(stripped), 'keeps real source after FILE header');
+  assert(/export const TaskDeleteDialog/.test(stripped), 'keeps component body');
+
+  const viaRewrite = rewriteReactAngularLeftovers(leaked);
+  assert(!/=====/.test(viaRewrite), 'rewriteReactAngularLeftovers strips FILE markers');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-file-markers-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-delete-dialog'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-delete-dialog', 'TaskDeleteDialog.tsx'),
+    leaked
+  );
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/components/task-delete-dialog/TaskDeleteDialog.tsx(1,1): error TS1109: Expression expected.
+src/components/task-delete-dialog/TaskDeleteDialog.tsx(1,11): error TS1005: ';' expected.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors strips FILE markers on TS1109');
+  const after = fs.readFileSync(
+    path.join(tmp, 'src', 'components', 'task-delete-dialog', 'TaskDeleteDialog.tsx'),
+    'utf-8'
+  );
+  assert(!/=====/.test(after), 'workspace TS1109 fix removes markers');
+  assert(/export const TaskDeleteDialog/.test(after), 'workspace TS1109 fix keeps component');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
 // --- Module imports, store/model dedupe, react-hook-form ---
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-imports-'));
@@ -1009,6 +1047,30 @@ export function Template() {
   assert(!/export interface Item/.test(store), 'duplicate Item interface removed from store');
 
   assert(removeUnusedStoreShards(tmp) >= 2, 'unused NGXS shard files removed');
+
+  // Component-local Task with id: string|number must not conflict with models/task.model
+  fs.mkdirSync(path.join(tmp, 'src', 'components', 'task-table'), { recursive: true });
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'models', 'task.model.ts'),
+    `export type TaskStatus = 'todo' | 'in-progress' | 'done';\nexport interface Task { id: string; title: string; description: string; status: TaskStatus; }\n`
+  );
+  fs.writeFileSync(
+    path.join(tmp, 'src', 'components', 'task-table', 'TaskTable.tsx'),
+    `import React from 'react';\nexport interface Task {\n  id: string | number;\n  title: string;\n  description: string;\n  status: 'todo' | 'in-progress' | 'done';\n}\ninterface TaskTableProps { tasks: Task[]; onEdit: (task: Task) => void; }\nexport const TaskTable: React.FC<TaskTableProps> = ({ tasks, onEdit }) => (\n  <div>{tasks.map((t) => <button key={t.id} onClick={() => onEdit(t)}>{t.title}</button>)}</div>\n);\nexport default TaskTable;\n`
+  );
+  const dedupedComponents = dedupeStoreModelTypes(tmp);
+  assert(dedupedComponents >= 1, 'dedupeStoreModelTypes updates component duplicate Task');
+  const table = fs.readFileSync(path.join(tmp, 'src', 'components', 'task-table', 'TaskTable.tsx'), 'utf-8');
+  assert(/from ['"].*models\/task\.model['"]/.test(table), 'TaskTable imports Task from models');
+  assert(!/export interface Task/.test(table), 'local Task interface removed from TaskTable');
+  assert(!/id:\s*string\s*\|\s*number/.test(table), 'conflicting string|number id removed');
+
+  const typeFix = fixReactTypeErrors(
+    tmp,
+    `src/pages/task-list/TaskList.tsx(193,13): error TS2322: Type '(task: import("/opt/render/project/src/server/extracted/x-converted/src/models/task.model").Task) => void' is not assignable to type '(task: import("/opt/render/project/src/server/extracted/x-converted/src/components/task-table/TaskTable").Task) => void'. Types of property 'id' are incompatible. Type 'string | number' is not assignable to type 'string'. Type 'number' is not assignable to type 'string'.`
+  );
+  assert(typeFix >= 0, 'fixReactTypeErrors accepts component/model Task id conflict');
+
 
   repairReactWorkspace(tmp, {});
   const pkg = JSON.parse(fs.readFileSync(path.join(tmp, 'package.json'), 'utf-8'));
@@ -1071,6 +1133,52 @@ export function Template() {
   );
   assert(!/open=\{/.test(withOpenInterface) || /sidebarOpen/.test(withOpenInterface), 'open injected only when interface requires it');
 
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// --- Angular→React: do not bind open={search} (string) onto boolean props ---
+{
+  const src = `import { useState } from 'react';
+export function TaskList() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [search, setSearch] = useState('');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  return (
+    <Drawer open={sidebarOpen}>
+      <TaskFormSidebar task={null} onSave={() => {}} onCancel={() => {}} />
+    </Drawer>
+  );
+}
+`;
+  const injected = injectMissingComponentProps(
+    src,
+    new Map([['TaskFormSidebar', new Set(['open', 'task', 'onSave', 'onCancel'])]])
+  );
+  assert(
+    /<TaskFormSidebar open=\{sidebarOpen\}/.test(injected),
+    'injects boolean sidebarOpen for TaskFormSidebar.open'
+  );
+  assert(!/open=\{search\}/.test(injected), 'does not bind open to search string');
+
+  const alreadyWrong = src.replace(
+    '<TaskFormSidebar ',
+    '<TaskFormSidebar open={search} '
+  );
+  const rewritten = repairMismatchedBooleanJsxProps(alreadyWrong);
+  assert(/open=\{sidebarOpen\}/.test(rewritten), 'rewrites open={search} to sidebarOpen');
+  assert(!/open=\{search\}/.test(rewritten), 'removes string open={search} binding');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-open-bool-'));
+  fs.mkdirSync(path.join(tmp, 'src', 'pages', 'task-list'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'), alreadyWrong);
+  const n = fixReactTypeErrors(
+    tmp,
+    `src/pages/task-list/TaskList.tsx(176,26): error TS2322: Type 'string' is not assignable to type 'boolean'.`
+  );
+  assert(n >= 1, 'fixReactTypeErrors rewrites string→boolean open prop');
+  const afterTsc = fs.readFileSync(path.join(tmp, 'src', 'pages', 'task-list', 'TaskList.tsx'), 'utf-8');
+  assert(/open=\{sidebarOpen\}/.test(afterTsc), 'tsc-driven fix uses sidebarOpen');
+  assert(!/open=\{search\}/.test(afterTsc), 'tsc-driven fix drops search string');
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

@@ -1,4 +1,12 @@
-import { Component, ElementRef, OnDestroy, computed, inject, signal, viewChild } from '@angular/core';
+import {
+  Component,
+  ElementRef,
+  OnDestroy,
+  computed,
+  inject,
+  signal,
+  viewChild,
+} from '@angular/core';
 import { DecimalPipe } from '@angular/common';
 import { ActivatedRoute } from '@angular/router';
 import { Subscription } from 'rxjs';
@@ -647,8 +655,7 @@ Output must compile and run after npm install.`;
     const fromRaw = (q.get('fromTech') || '').trim();
     const toRaw = (q.get('toTech') || '').trim();
     const matchTech = (value: string) =>
-      this.technologies.find((t) => t.technology.toLowerCase() === value.toLowerCase())
-        ?.technology;
+      this.technologies.find((t) => t.technology.toLowerCase() === value.toLowerCase())?.technology;
     const from = fromRaw ? matchTech(fromRaw) : '';
     const to = toRaw ? matchTech(toRaw) : '';
     if (from) {
@@ -947,7 +954,10 @@ Output must compile and run after npm install.`;
           );
           const session: ProjectSession = {
             sessionId,
-            projectName: this.selectedFile()?.name?.replace(/\.zip$/i, '') || this.activeProject()?.projectName || 'Migrated Project',
+            projectName:
+              this.selectedFile()?.name?.replace(/\.zip$/i, '') ||
+              this.activeProject()?.projectName ||
+              'Migrated Project',
             fromTech: this.fromTech() || this.activeProject()?.fromTech,
             toTech: this.toTech() || this.activeProject()?.toTech,
             aiProvider: this.aiProvider() || this.activeProject()?.aiProvider,

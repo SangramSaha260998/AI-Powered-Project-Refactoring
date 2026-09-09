@@ -14,6 +14,7 @@ import {
   getProviderConfigs,
   getProviderFallbackChain,
   getProviderFallbackModels,
+  hasConfiguredFallbackProvider,
   isProviderConfigured,
   isOllamaCloudMode,
   RATE_LIMIT_PAUSE_MS,
@@ -39,6 +40,7 @@ import { resolveTargetVersions, formatVersionMandate, LATEST_ANGULAR } from '../
 import { analyzeSourceProject, analyzeReferenceProject, buildMigrationPlan } from './analyzer.js';
 import { runVisualQa } from './visualQa.js';
 import { ensureDirectoryExists } from '../utils/file.js';
+import { stripUnitWriterMarkers } from '../utils/llmOutput.js';
 import { repairAngularWorkspace, repairReactWorkspace, ensureCnUtil, collectConversionDefects, collectMissingSourcePages, isPlaceholderTemplate, fileContainsJsx, renameJsxTsFilesToTsx, detectSourceStack, isTruncatedSource, addPackagesFromBuildErrors, rewriteReactAngularLeftovers, stripAiBundleMarkers, fixReactTypeErrors, fixAngularCompileErrors, ensureAngularMaterialPackages, repairTsconfigForModernTypeScript, ensureReactViteEnvDts, ensureReactTypeDevDependencies, REACT_VITE_ENV_DTS } from './postprocess.js';
 import { repairPlainHtmlTablesToMatTable } from './angularTableRepair.js';
 import {
@@ -248,11 +250,15 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Makes a chat completion call with the given messages and optional JSON mode.
  *
  * Fallback order (always on, innermost first):
- * 1. Model fallback — when a (key, model) pair crosses its limit, try the next
- *    free model on the SAME API key (e.g. Gemini 2.0 Flash → Flash-Lite).
- * 2. Key rotation — after all models on a key are exhausted, move to the next
- *    API key for the same provider (models restart from #1).
- * 3. Provider fallback — after all keys × models of a provider are exhausted,
+ * 1. Key rotation on 429 — rate limits are usually per API key, so switch to the
+ *    next key immediately instead of burning through every model on a hot key.
+ * 2. Provider fallback on 429 — when every key on the current provider is
+ *    rate-limited for the same model, try the next configured LLM (Groq, Ollama,
+ *    OpenRouter, …) before downgrading to a smaller model on the same provider.
+ * 3. Model fallback — for other transient errors, try the next free model on the
+ *    same API key (e.g. Gemini 3.6 Flash → 3.5 Flash-Lite).
+ * 4. Key rotation — after all models on a key are exhausted, move to the next key.
+ * 5. Provider fallback — after all keys × models of a provider are exhausted,
  *    try the next configured provider in the chain using its own keys/models.
  *
  * Auth/quota errors (401/402) are key-level and skip model rotation entirely.
@@ -284,7 +290,7 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     // Always attempt the user-selected provider; only auto-fallback entries need to be "configured".
     if (!isSelectedPrimary && !isProviderConfigured(providerId)) {
       console.warn(
-        `[Provider Fallback] Skipping "${providerId}" — not configured.`
+        `[Provider Fallback] Skipping "${providerId}" — not configured (no API key in server/.env).`
       );
       continue;
     }
@@ -306,8 +312,17 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
     attemptedAnyProvider = true;
     providersTried += 1;
     let providerHitRateLimit = false;
+    let advanceProvider = false;
 
-    if (providerIndex > 0 || (isPrimary && providerId !== aiProvider)) {
+    if (providerIndex === 0) {
+      const configuredRest = chain.slice(1).filter((id) => isProviderConfigured(id));
+      if (configuredRest.length > 0) {
+        console.log(
+          `[Provider Fallback] Primary: ${PROVIDERS[providerId]?.name || providerId}. ` +
+          `If all keys are exhausted, will try: ${configuredRest.join(' → ')}`
+        );
+      }
+    } else {
       console.warn(
         `[Provider Fallback] Switching to ${PROVIDERS[providerId]?.name || providerId} ` +
         `(${providerId}) — models: [${models.join(', ')}]`
@@ -325,13 +340,13 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
       continue;
     }
 
-    for (let keyIndex = 0; keyIndex < totalKeys; keyIndex++) {
+    for (let keyIndex = 0; keyIndex < totalKeys && !advanceProvider; keyIndex++) {
       const { client, config } = entries[keyIndex];
       const maskedKey = config.apiKey.length > 8
         ? config.apiKey.slice(0, 4) + '...' + config.apiKey.slice(-4)
         : '****';
 
-      for (let modelIndex = 0; modelIndex < totalModels; modelIndex++) {
+      for (let modelIndex = 0; modelIndex < totalModels && !advanceProvider; modelIndex++) {
         const model = models[modelIndex];
 
         const requestOptions = {
@@ -371,7 +386,10 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           return content;
         } catch (err) {
           lastError = err;
-          const { statusCode, reason } = isFallbackWorthyError(err);
+          const { worthy, statusCode, reason } = isFallbackWorthyError(err);
+          if (!worthy) {
+            throw err;
+          }
 
           // Key-level failures (bad/missing auth, exhausted billing quota) —
           // no model change can fix these, so skip straight to the next key.
@@ -385,6 +403,34 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           }
 
           if (statusCode === 429) providerHitRateLimit = true;
+
+          // Rate limits are usually per API key — rotate keys before exhausting every model on one key.
+          if (statusCode === 429 && keyIndex < totalKeys - 1) {
+            const waitMs = getRetryAfterMs(err, 3000);
+            console.warn(
+              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `rate-limited on model "${model}". Trying next key in ${Math.round(waitMs / 1000)}s...`
+            );
+            await pause(waitMs);
+            break; // next key (models restart from #1)
+          }
+
+          // Every key on this provider is rate-limited for this model — try another LLM first.
+          if (
+            statusCode === 429 &&
+            keyIndex === totalKeys - 1 &&
+            hasConfiguredFallbackProvider(chain, providerIndex)
+          ) {
+            const nextProvider = chain.slice(providerIndex + 1).find((id) => isProviderConfigured(id));
+            const waitMs = getRetryAfterMs(err, 2000);
+            console.warn(
+              `[Provider Fallback] All ${totalKeys} ${providerId} API key(s) rate-limited for "${model}". ` +
+              `Trying next LLM (${nextProvider}) in ${Math.round(waitMs / 1000)}s...`
+            );
+            await pause(waitMs);
+            advanceProvider = true;
+            break;
+          }
 
           // Limit crossed for THIS (key, model) pair → try the next free model
           // on the same API key before touching other keys/providers.
@@ -412,15 +458,17 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
           // Every key × model for this provider is exhausted → next provider.
           console.warn(
             `[Provider Fallback] All ${totalKeys} key(s) × ${totalModels} model(s) for ` +
-            `"${providerId}" exhausted (${reason}: ${statusCode}).`
+            `"${providerId}" exhausted (${reason}: ${statusCode}). Trying next LLM provider...`
           );
           await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
-          break; // next provider
+          advanceProvider = true;
+          break;
         }
       }
     }
 
     if (providerHitRateLimit) rateLimitedProviders += 1;
+    if (advanceProvider) continue;
   }
 
   if (!attemptedAnyProvider) {
@@ -2234,16 +2282,18 @@ function parseUnitFileBundle(raw, expectedPaths = []) {
     while ((m = re.exec(cleaned)) !== null) {
       files.push({
         path: m[1].trim().replace(/\\/g, '/').replace(/^[`'"]+|[`'"]+$/g, ''),
-        content: stripAiBundleMarkers(m[2].replace(/\n+$/, ''))
+        content: stripUnitWriterMarkers(m[2].replace(/\n+$/, ''))
       });
     }
   }
 
   if (files.length === 0 && expectedPaths.length === 1) {
-    files.push({ path: expectedPaths[0], content: stripAiBundleMarkers(cleaned) });
+    files.push({ path: expectedPaths[0], content: stripUnitWriterMarkers(cleaned) });
   }
 
-  return files.filter((f) => f.path && f.content != null);
+  return files
+    .filter((f) => f.path && f.content != null)
+    .map((f) => ({ ...f, content: stripUnitWriterMarkers(f.content) }));
 }
 
 function extCompatible(expectedExt, actualExt) {
@@ -2807,7 +2857,7 @@ function sanitizeGeneratedContent(relativePath, content) {
     }
   }
 
-  return `${stripCodeFences(content)}\n`;
+  return `${stripUnitWriterMarkers(stripCodeFences(content))}\n`;
 }
 
 /**

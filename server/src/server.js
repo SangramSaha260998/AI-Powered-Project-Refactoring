@@ -81,13 +81,13 @@ console.log(
   `Provider auto-fallback chain: ${getProviderFallbackChain('genai').join(' → ') || '(none configured)'}`
 );
 console.log(
-  '  (Selected provider is tried first; then the rest of the chain. Override with AI_FALLBACK_CHAIN.)'
+  '  (Selected provider is tried first; recovery prefers GenAI, then OpenRouter. Groq is last — 413 on large prompts.)'
 );
 console.log(
-  'Automatic fallback per call: key → provider (on 429) → model → provider (when fully exhausted).'
+  'Automatic fallback per call: model → key → provider (413 skips remaining models on that provider).'
 );
 console.log(
-  '  Override chain with AI_FALLBACK_CHAIN=genai,groq,ollama,openrouter,tokenrouter'
+  '  Override chain with AI_FALLBACK_CHAIN=genai,openrouter,ollama,tokenrouter,groq'
 );
 
 if (!anyCloudKeyConfigured && !isProviderConfigured('ollama')) {

@@ -616,6 +616,225 @@ export function repairTaskStatusOptionTemplates(destPath, buildErrors = '') {
   return changed;
 }
 
+function findExportedClassFile(destPath, className) {
+  const name = String(className || '').trim();
+  if (!name) return null;
+  const re = new RegExp(`export\\s+class\\s+${name}\\b`);
+  for (const file of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.ts'))) {
+    try {
+      if (re.test(fs.readFileSync(file, 'utf-8'))) return file;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function isLikelyCollectionMember(name) {
+  const n = String(name || '');
+  if (!n || /Labels$|Status$|Options$|Open$|Id$/.test(n)) return false;
+  return /s$|List$|Items$|Rows$|Records$|Entries$|Data$/.test(n);
+}
+
+function matTableRowType(source) {
+  const text = String(source || '');
+  const generic = text.match(/MatTableDataSource\s*<\s*([^>,]+)/);
+  if (generic) return generic[1].trim();
+  const tasksField = text.match(/\b_tasks\s*:\s*([^[\s;]+)\[\]/);
+  if (tasksField) return tasksField[1].trim();
+  const setter = text.match(/\bset\s+\w+\s*\(\s*\w+\s*:\s*([^[\s)]+)\[\]/);
+  if (setter) return setter[1].trim();
+  return 'any';
+}
+
+function ensureMatTableDataSourceField(source) {
+  let updated = String(source || '');
+  const used =
+    /\bthis\.dataSource\b/.test(updated) ||
+    /\bnew\s+MatTableDataSource\b/.test(updated);
+  if (!used && !classDeclaresMember(updated, 'dataSource')) return updated;
+
+  updated = updated.replace(
+    /\bthis\.dataSource\s*=\s*new\s+MatTableDataSource\s*(?:<[^>]+>)?\s*\(\s*([^)]*)\s*\)\s*;/g,
+    (_full, arg) => {
+      const value = String(arg || '').trim() || '[]';
+      return `this.dataSource.data = ${value} || [];`;
+    }
+  );
+
+  if (classDeclaresMember(updated, 'dataSource')) return updated;
+  if (!used && !/\bthis\.dataSource\b/.test(updated)) return updated;
+
+  const rowType = matTableRowType(updated);
+  updated = ensureImport(updated, 'MatTableDataSource', '@angular/material/table');
+  return insertIntoClassBody(
+    updated,
+    `  dataSource = new MatTableDataSource<${rowType}>([]);`
+  );
+}
+
+function ensureDataSourceCollectionAlias(source, name) {
+  let updated = String(source || '');
+  if (!name || classDeclaresMember(updated, name)) return updated;
+  updated = ensureMatTableDataSourceField(updated);
+  if (!classDeclaresMember(updated, 'dataSource') && !/\bthis\.dataSource\.data\b/.test(updated)) {
+    return updated;
+  }
+  const rowType = matTableRowType(updated);
+  return insertIntoClassBody(
+    updated,
+    `  get ${name}(): ${rowType}[] {\n    return this.dataSource.data;\n  }\n  set ${name}(value: ${rowType}[]) {\n    this.dataSource.data = value || [];\n  }`
+  );
+}
+
+function stripShadowedMatCellFields(source, html) {
+  let updated = String(source || '');
+  const vars = new Set();
+  for (const m of String(html || '').matchAll(/\blet\s+(\w+)/g)) vars.add(m[1]);
+  for (const v of vars) {
+    if (!v || v.length > 24) continue;
+    const re = new RegExp(
+      `^[ \\t]*(?:(?:public|protected|private|readonly)\\s+)*${v}\\s*:\\s*any\\s*=\\s*null\\s*;\\s*\\n?`,
+      'gm'
+    );
+    updated = updated.replace(re, '');
+  }
+  return updated;
+}
+
+function widenStatusLabelIndexTypes(source) {
+  return String(source || '')
+    .replace(
+      /(\b(?:readonly\s+)?statusLabels)\s*=\s*(TASK_STATUS_LABELS)\s*;/g,
+      '$1: Record<string, string> = $2;'
+    )
+    .replace(
+      /(\b(?:readonly\s+)?statusLabels)\s*:\s*Record<[^>]+>\s*=/g,
+      '$1: Record<string, string> ='
+    );
+}
+
+function wrapStatusLabelIndexAccess(html) {
+  return String(html || '').replace(
+    /statusLabels\[(?!\$any\()([^\]]+)\]/g,
+    'statusLabels[$any($1)]'
+  );
+}
+
+/**
+ * TS2339: template reads a class member the AI never declared.
+ * Common React leftover: `[tasks]="tasks"` after the list was stored on
+ * MatTableDataSource.data instead of a `tasks` field.
+ */
+export function repairMissingTemplateMembers(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  let changed = 0;
+  const seen = new Set();
+
+  for (const m of text.matchAll(/TS2339:\s*Property '(\w+)' does not exist on type '(\w+)'/g)) {
+    const prop = m[1];
+    const className = m[2];
+    const key = `${className}#${prop}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const tsFile = findExportedClassFile(destPath, className);
+    if (!tsFile || !fs.existsSync(tsFile)) continue;
+
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    const htmlFile = tsFile.replace(/\.ts$/, '.html');
+    const html = fs.existsSync(htmlFile) ? fs.readFileSync(htmlFile, 'utf-8') : '';
+    const orig = source;
+
+    source = stripShadowedMatCellFields(source, html);
+    source = ensureMatTableDataSourceField(source);
+    if (classDeclaresMember(source, prop)) {
+      if (source !== orig) {
+        fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+        changed += 1;
+      }
+      continue;
+    }
+
+    if (prop === 'dataSource') {
+      source = ensureMatTableDataSourceField(source);
+    } else if (prop === 'statusLabels' || prop === 'statusOptions') {
+      source = ensureTaskStatusOptionFields(source, html, tsFile, destPath);
+    } else if (isLikelyCollectionMember(prop)) {
+      source = ensureDataSourceCollectionAlias(source, prop);
+      if (!classDeclaresMember(source, prop)) {
+        source = insertIntoClassBody(source, `  ${prop}: any[] = [];`);
+      }
+    }
+
+    if (source !== orig) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired missing template members in ${changed} file(s)`);
+  }
+  return changed;
+}
+
+/**
+ * TS7053 / TS2538: `statusLabels[row.status]` cannot index Record<TaskStatus, string>
+ * when the template row is `any` or the status is optional.
+ */
+export function repairRecordIndexAccess(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const mentioned = new Set();
+  for (const m of text.matchAll(/([\w./\\-]+\.component\.(?:ts|html))/g)) {
+    mentioned.add(path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, '')));
+  }
+
+  const tsFiles = new Set();
+  for (const file of mentioned) {
+    if (file.endsWith('.ts') && fs.existsSync(file)) tsFiles.add(file);
+    if (file.endsWith('.html')) {
+      const tsFile = file.replace(/\.html$/, '.ts');
+      if (fs.existsSync(tsFile)) tsFiles.add(tsFile);
+    }
+  }
+  if (tsFiles.size === 0) {
+    for (const f of walkFiles(path.join(destPath, 'src'), (n) => n.endsWith('.component.ts'))) {
+      const htmlFile = f.replace(/\.ts$/, '.html');
+      const html = fs.existsSync(htmlFile) ? fs.readFileSync(htmlFile, 'utf-8') : '';
+      const src = fs.readFileSync(f, 'utf-8');
+      if (/statusLabels\[/.test(html) || /statusLabels\s*=/.test(src)) tsFiles.add(f);
+    }
+  }
+
+  let changed = 0;
+  for (const tsFile of tsFiles) {
+    const htmlFile = tsFile.replace(/\.ts$/, '.html');
+    let source = fs.readFileSync(tsFile, 'utf-8');
+    let html = fs.existsSync(htmlFile) ? fs.readFileSync(htmlFile, 'utf-8') : '';
+    const origSource = source;
+    const origHtml = html;
+
+    source = stripShadowedMatCellFields(source, html);
+    source = widenStatusLabelIndexTypes(source);
+    html = wrapStatusLabelIndexAccess(html);
+
+    if (html !== origHtml && fs.existsSync(htmlFile)) {
+      fs.writeFileSync(htmlFile, html.endsWith('\n') ? html : `${html}\n`, 'utf-8');
+      changed += 1;
+    }
+    if (source !== origSource) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired Record index access in ${changed} file(s)`);
+  }
+  return changed;
+}
+
 /**
  * If both `form` and `taskForm` (or similar) exist, keep the one used by the
  * template / primary reactive group and rewrite references.
@@ -701,6 +920,24 @@ function classHasMember(source, name) {
     ].join('|')
   );
   return re.test(source);
+}
+
+/**
+ * True when the class actually declares `name` (field, getter, input).
+ * Unlike classHasMember, `this.foo = ...` inside a method does not count —
+ * that is the TS2339 pattern for undeclared MatTableDataSource.
+ */
+function classDeclaresMember(source, name) {
+  const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const slice = extractExportedClassBody(source);
+  const body = slice?.body || String(source || '');
+  const patterns = [
+    new RegExp(`@(?:Input|Output)\\s*\\([^)]*\\)\\s*(?:readonly\\s+)?(?:set\\s+)?${esc}\\b`),
+    new RegExp(`^[ \\t]*(?:(?:public|protected|private|readonly)\\s+)*${esc}\\s*[!:=]`, 'm'),
+    new RegExp(`\\b(?:get|set)\\s+${esc}\\s*\\(`),
+    new RegExp(`(?:readonly\\s+)?${esc}\\s*=\\s*(?:input|output|model)\\s*(?:<[^>]*>)?\\s*\\(`),
+  ];
+  return patterns.some((re) => re.test(body));
 }
 
 const LIFECYCLE_HOOKS = [
@@ -1142,8 +1379,8 @@ function dedupeMatTableTasksInput(source) {
 }
 
 function repairMatTableDataSourceConflicts(source) {
-  let updated = String(source || '');
-  const hasDsField = /\bdataSource\s*=\s*new\s+MatTableDataSource/.test(updated);
+  let updated = ensureMatTableDataSourceField(source);
+  const hasDsField = classDeclaresMember(updated, 'dataSource');
   const hasInputDs = /@Input\s*\([^)]*\)\s+dataSource\b/.test(updated);
 
   if (hasInputDs) {
@@ -2388,6 +2625,114 @@ function resolveRelativeTsImport(tsPath, importPath) {
   if (fs.existsSync(`${abs}.tsx`)) return `${abs}.tsx`;
   if (fs.existsSync(path.join(abs, 'index.ts'))) return path.join(abs, 'index.ts');
   return null;
+}
+
+const NON_TS_IMPORT_EXT_RE = /\.(s?css|less|json|svg|png|jpe?g|gif|webp|html|md)$/i;
+
+/**
+ * Strip leading `./` / `../` segments so `../../../../models/task.model`
+ * becomes `models/task.model` for suffix matching.
+ */
+function importSpecifierTail(importPath) {
+  return String(importPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^(?:\.\.?\/)+/, '')
+    .replace(/\.(tsx?|jsx?)$/i, '')
+    .replace(/\/index$/i, '');
+}
+
+/**
+ * Find the real file a broken relative import meant to reach.
+ * Matches on the longest path suffix, then on the closest file by depth.
+ */
+function findRelativeImportTarget(destPath, tsFile, importPath) {
+  const tail = importSpecifierTail(importPath);
+  if (!tail) return null;
+
+  const wantedSegments = tail.split('/').filter(Boolean);
+  const base = wantedSegments[wantedSegments.length - 1];
+  if (!base) return null;
+
+  const srcRoot = path.join(destPath, 'src');
+  if (!fs.existsSync(srcRoot)) return null;
+
+  const candidates = [];
+  for (const file of walkFiles(srcRoot, (n) => /\.tsx?$/i.test(n))) {
+    const noExt = file.replace(/\.(tsx?)$/i, '').replace(/\\/g, '/');
+    const asIndex = noExt.replace(/\/index$/i, '');
+    if (path.basename(noExt) !== base && path.basename(asIndex) !== base) continue;
+
+    let matched = 0;
+    const haveSegments = noExt.split('/').filter(Boolean);
+    for (let i = 1; i <= wantedSegments.length && i <= haveSegments.length; i++) {
+      if (wantedSegments[wantedSegments.length - i] === haveSegments[haveSegments.length - i]) {
+        matched = i;
+      } else {
+        break;
+      }
+    }
+    if (matched === 0) continue;
+    const distance = path
+      .relative(path.dirname(tsFile), file)
+      .split(path.sep)
+      .filter((s) => s === '..').length;
+    candidates.push({ file, matched, distance });
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.matched - a.matched || a.distance - b.distance);
+  return candidates[0].file;
+}
+
+/**
+ * TS2307 / "Could not resolve": the AI emitted a relative import with the wrong
+ * number of `../` segments (e.g. `../../../../../../models/task.model` from a
+ * deeply nested page). Recompute the path from the real file location.
+ */
+export function repairBrokenRelativeImports(destPath, buildErrors = '') {
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  const srcRoot = path.join(destPath, 'src');
+  if (!fs.existsSync(srcRoot)) return 0;
+
+  const mentioned = new Set();
+  for (const m of text.matchAll(/((?:src\/)?[\w./\\-]+\.(?:component|page|service|guard|model)\.ts)/g)) {
+    const full = path.join(destPath, m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
+    if (fs.existsSync(full)) mentioned.add(full);
+  }
+  const files =
+    mentioned.size > 0 ? [...mentioned] : walkFiles(srcRoot, (n) => /\.tsx?$/i.test(n));
+
+  let changed = 0;
+  for (const tsFile of files) {
+    let source;
+    try {
+      source = fs.readFileSync(tsFile, 'utf-8');
+    } catch {
+      continue;
+    }
+    const original = source;
+
+    source = source.replace(
+      /(\bfrom\s+['"])(\.[^'"]*)(['"])/g,
+      (full, pre, spec, post) => {
+        if (NON_TS_IMPORT_EXT_RE.test(spec)) return full;
+        if (resolveRelativeTsImport(tsFile, spec)) return full;
+        const target = findRelativeImportTarget(destPath, tsFile, spec);
+        if (!target || target === tsFile) return full;
+        return `${pre}${relativeModulePath(tsFile, target)}${post}`;
+      }
+    );
+
+    if (source !== original) {
+      fs.writeFileSync(tsFile, source.endsWith('\n') ? source : `${source}\n`, 'utf-8');
+      changed += 1;
+    }
+  }
+
+  if (changed > 0) {
+    console.log(`[postprocess] Repaired broken relative imports in ${changed} file(s)`);
+  }
+  return changed;
 }
 
 function isWorkspacePathAlias(importPath) {
@@ -4416,7 +4761,8 @@ const PROMOTE_TO_OUTPUT = new Set([
 const SKIP_AUTO_INPUT = new Set([
   'class', 'style', 'ngClass', 'ngStyle', 'ngIf', 'ngFor', 'ngSwitch', 'ngModel',
   'formGroup', 'formControl', 'formControlName', 'routerLink', 'routerLinkActive',
-  'cdkDrag', 'cdkDropList', 'matTooltip', 'matMenuTriggerFor'
+  'cdkDrag', 'cdkDropList', 'matTooltip', 'matMenuTriggerFor',
+  'dataSource', 'hidden', 'colspan', 'rowspan', 'disabled', 'opened'
 ]);
 
 function classHasInput(source, name) {
@@ -4717,6 +5063,13 @@ function resolveChildComponentFile(tag, bySelector, byClass) {
   const raw = String(tag || '');
   if (!raw) return null;
   const lower = raw.toLowerCase();
+  // Native HTML (`table`, `div`) must not fuzzy-match `app-*-table` selectors.
+  if (!lower.includes('-')) {
+    if (bySelector.has(lower)) return bySelector.get(lower);
+    if (byClass.has(raw)) return byClass.get(raw);
+    if (byClass.has(`${raw}Component`)) return byClass.get(`${raw}Component`);
+    return null;
+  }
   if (bySelector.has(lower)) return bySelector.get(lower);
   const stripped = lower.replace(/^app-/, '');
   if (stripped && bySelector.has(stripped)) return bySelector.get(stripped);
@@ -4955,8 +5308,16 @@ function repairCallbackEmitInTemplates(destPath) {
 }
 
 function wrapDomEventPayloads(destPath, buildErrors) {
-  const text = String(buildErrors || '');
-  if (!/Argument of type 'Event'|TS2345/.test(text)) return 0;
+  const text = String(buildErrors || '').replace(/\u001b\[[0-9;]*m/g, '');
+  if (
+    !/Argument of type 'Event'|TS2345|TS2739|Type 'Event' is missing/.test(text)
+  ) {
+    return 0;
+  }
+  const entityMismatch =
+    /TS2739/.test(text) ||
+    /Type 'Event' is missing/.test(text) ||
+    /not assignable to parameter of type/.test(text);
   const mentioned = new Set();
   for (const m of text.matchAll(/([\w./\\-]+\.component\.html)/g)) {
     mentioned.add(m[1].replace(/\\/g, '/').replace(/^\.?\//, ''));
@@ -4975,27 +5336,46 @@ function wrapDomEventPayloads(destPath, buildErrors) {
       continue;
     }
     const next = html.replace(
-      /\((\w+)\)="(\w+)\(\$event\)"/g,
-      (full, ev, handler, offset) => {
+      /\((\w+)\)="([^"]*\$event[^"]*)"/g,
+      (full, ev, expr, offset) => {
         if (/\$any\(\s*\$event\s*\)/.test(full)) return full;
         const tag = nearestOpenTagName(html, offset);
         const childFile = resolveChildComponentFile(tag, bySelector, byClass);
+        let childSrc = '';
         if (childFile) {
           try {
-            const childSrc = fs.readFileSync(childFile, 'utf-8');
-            if (
-              classHasOutput(childSrc, ev) ||
-              classHasOutput(childSrc, outputNameWithoutOnPrefix(ev)) ||
-              classHasOutput(childSrc, outputNameWithOnPrefix(ev))
-            ) {
-              return full;
-            }
+            childSrc = fs.readFileSync(childFile, 'utf-8');
           } catch {
-            /* fall through */
+            /* ignore */
           }
         }
-        if (!/^on[A-Z]\w+$/.test(ev) && !BARE_OUTPUT_ALIASES.has(ev)) return full;
-        return `(${ev})="${handler}($any($event))"`;
+        let nextEv = ev;
+        if (childSrc && !classHasOutput(childSrc, ev)) {
+          const onName = outputNameWithOnPrefix(ev);
+          const alias = outputNameWithoutOnPrefix(ev);
+          if (onName && classHasOutput(childSrc, onName)) nextEv = onName;
+          else if (alias && classHasOutput(childSrc, alias)) nextEv = alias;
+        }
+        const hasOut = childSrc && classHasOutput(childSrc, nextEv);
+        const isAssign = /^\s*[A-Za-z_]\w*\s*=\s*\$event\s*$/.test(String(expr).trim());
+        const likelyCustom =
+          /^on[A-Z]\w+$/.test(ev) ||
+          BARE_OUTPUT_ALIASES.has(ev) ||
+          PROMOTE_TO_OUTPUT.has(ev) ||
+          /^on[A-Z]\w+$/.test(nextEv) ||
+          BARE_OUTPUT_ALIASES.has(nextEv) ||
+          PROMOTE_TO_OUTPUT.has(nextEv);
+        // Real @Output() call sites already type $event — don't wrap those.
+        // Assignments like `deletingTask = $event` still infer DOM Event when the
+        // binding name does not match the child's output (TS2739).
+        if (hasOut && !isAssign) {
+          return nextEv === ev ? full : `(${nextEv})="${expr}"`;
+        }
+        if (isAssign || (!hasOut && (likelyCustom || entityMismatch))) {
+          const wrapped = String(expr).replace(/\$event/g, '$any($event)');
+          return `(${nextEv})="${wrapped}"`;
+        }
+        return nextEv === ev ? full : `(${nextEv})="${expr}"`;
       }
     );
     if (next !== html) {
@@ -5303,6 +5683,7 @@ export function repairAngularWorkspace(destPath, options = {}) {
     ensureOutputsFromParentEventBindings(destPath);
     repairCallbackEmitInTemplates(destPath);
     repairNgModelValueEventBindings(destPath);
+    dedupeStoreModelTypes(destPath);
   } catch (err) {
     console.warn(`[postprocess] Input/Output binding repair failed: ${err.message}`);
   }
@@ -5545,15 +5926,19 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   }
   const eventIssues =
     /TS2345/.test(text) ||
+    /TS2739/.test(text) ||
     /Argument of type 'Event'/.test(text) ||
+    /Type 'Event' is missing/.test(text) ||
     /Property 'emit' does not exist/.test(text);
   const typeIssues =
     /TS2322/.test(text) ||
     /TS2531/.test(text) ||
+    /TS2739/.test(text) ||
     /Object is possibly 'null'/.test(text) ||
     /is not assignable to type '\w+'/.test(text) ||
     /is not assignable to type/.test(text) ||
-    /Type 'string' is not assignable to type/.test(text);
+    /Type 'string' is not assignable to type/.test(text) ||
+    /Type 'Event' is missing/.test(text);
   const lifecycleIssues =
     /TS2420/.test(text) ||
     /incorrectly implements interface/.test(text) ||
@@ -5570,6 +5955,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     /Expected 0 arguments, but got 1/.test(text);
   const moduleIssues =
     /TS2307/.test(text) ||
+    /Could not resolve ['"]\.{1,2}\//.test(text) ||
+    /Cannot find module ['"]\.{1,2}\//.test(text) ||
     /Could not resolve ['"].*models\//.test(text) ||
     /Cannot find module ['"].*models\//.test(text) ||
     /Could not resolve ["']@angular\/material\/(?:cell-def|header-cell-def|footer-cell-def|header-row-def|row-def|footer-row-def|column-def|def)["']/.test(
@@ -5578,9 +5965,11 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   const duplicateIssues =
     /TS2393/.test(text) ||
     /TS2300/.test(text) ||
+    /TS2440/.test(text) ||
     /TS2717/.test(text) ||
     /Duplicate function implementation/.test(text) ||
     /Duplicate identifier/.test(text) ||
+    /conflicts with local declaration/.test(text) ||
     /Subsequent property declarations must have the same type/.test(text);
   const decoratorIssues =
     /NG2001/.test(text) ||
@@ -5596,6 +5985,13 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
   const statusOptionIssues =
     (/TS2339/.test(text) && /Property '(?:id|label|value)' does not exist/.test(text)) ||
     (/Property 'label' does not exist on type/.test(text) && /\bstatus\b/i.test(text));
+  const missingMemberIssues =
+    /TS2339:\s*Property '\w+' does not exist on type '\w+'/.test(text);
+  const indexAccessIssues =
+    /TS7053/.test(text) ||
+    /can't be used to index type/.test(text) ||
+    /cannot be used as an index type/.test(text) ||
+    (/statusLabels\[/.test(text) && /component\.html/.test(text));
   const skeletonIssues =
     (/NG8002/.test(text) && /ngx-skeleton-loader/i.test(text)) ||
     /isn't a known property of 'ngx-skeleton-loader'/i.test(text) ||
@@ -5625,6 +6021,8 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     !decoratorIssues &&
     !materialValueIssues &&
     !statusOptionIssues &&
+    !missingMemberIssues &&
+    !indexAccessIssues &&
     !skeletonIssues
   ) {
     return 0;
@@ -5660,11 +6058,35 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
     }
   }
 
+  if (missingMemberIssues) {
+    try {
+      repairMissingTemplateMembers(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Missing template member repair failed: ${err.message}`);
+    }
+  }
+
+  if (indexAccessIssues || /statusLabels\[/.test(text)) {
+    try {
+      repairRecordIndexAccess(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Record index repair failed: ${err.message}`);
+    }
+  }
+
   if (materialValueIssues || duplicateIssues) {
     try {
       repairAngularMaterialValueImports(destPath, text);
     } catch (err) {
       console.warn(`[postprocess] Material value import repair failed: ${err.message}`);
+    }
+  }
+
+  if (duplicateIssues || /TS2440/.test(text) || /conflicts with local declaration/.test(text)) {
+    try {
+      dedupeStoreModelTypes(destPath);
+    } catch (err) {
+      console.warn(`[postprocess] Duplicate model type repair failed: ${err.message}`);
     }
   }
 
@@ -5686,6 +6108,12 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       ensureAngularAppModels(destPath);
     } catch (err) {
       console.warn(`[postprocess] Angular model layout repair failed: ${err.message}`);
+    }
+    // Runs after model relocation so paths are computed against final locations.
+    try {
+      repairBrokenRelativeImports(destPath, text);
+    } catch (err) {
+      console.warn(`[postprocess] Relative import repair failed: ${err.message}`);
     }
     try {
       const tableImportRepairs = repairInvalidMaterialTableImports(destPath);
@@ -5725,6 +6153,20 @@ export function fixAngularCompileErrors(destPath, buildErrors) {
       ensureOutputsFromParentEventBindings(destPath);
     } catch (err) {
       console.warn(`[postprocess] Input binding repair failed: ${err.message}`);
+    }
+  }
+
+  if (missingMemberIssues || /MatTableDataSource/.test(text) || /\bdataSource\b/.test(text)) {
+    try {
+      for (const file of walkFiles(srcRoot, (n) => n.endsWith('.component.ts'))) {
+        const before = fs.readFileSync(file, 'utf-8');
+        const after = repairMatTableDataSourceConflicts(before);
+        if (after !== before) {
+          fs.writeFileSync(file, after.endsWith('\n') ? after : `${after}\n`, 'utf-8');
+        }
+      }
+    } catch (err) {
+      console.warn(`[postprocess] MatTable dataSource field repair failed: ${err.message}`);
     }
   }
 

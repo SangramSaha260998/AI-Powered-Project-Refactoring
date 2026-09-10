@@ -130,13 +130,29 @@ const UNIT_SOURCE_CONTEXT_MAX_CHARS = 24000;
 
 /**
  * Errors that should rotate keys and/or move to the next provider.
- * Includes quota/auth codes, server errors, and network failures.
+ * Includes quota/auth codes, payload-too-large (413), server errors, and network failures.
  */
-function isFallbackWorthyError(err) {
-  const statusCode =
+export function isFallbackWorthyError(err) {
+  let statusCode = Number(
     err?.status ||
+    err?.statusCode ||
     (err?.response && (err.response.status || err.response.statusCode)) ||
-    0;
+    0
+  ) || 0;
+
+  const msg = String(err?.message || err?.error?.message || '').toLowerCase();
+  if (!statusCode && /\b413\b/.test(msg) && /too large|entity too large|payload/.test(msg)) {
+    statusCode = 413;
+  }
+
+  const payloadTooLarge =
+    statusCode === 413 ||
+    /request entity too large|entity too large|payload too large|content too large|request too large/.test(msg) ||
+    /context[_ ]length|maximum context|prompt is too long|too many tokens|max.?tokens.*exceed/.test(msg);
+
+  if (payloadTooLarge) {
+    return { worthy: true, statusCode: statusCode || 413, reason: 'payload-too-large' };
+  }
 
   if (RETRYABLE_STATUS_CODES.has(statusCode)) {
     const reason = statusCode === 429 ? 'rate-limit' : 'quota/auth';
@@ -160,7 +176,6 @@ function isFallbackWorthyError(err) {
     return { worthy: true, statusCode: statusCode || code, reason: 'network' };
   }
 
-  const msg = String(err?.message || '').toLowerCase();
   if (
     !statusCode &&
     (msg.includes('fetch failed') ||
@@ -247,21 +262,44 @@ function createClients(aiProvider = 'openrouter', aiModel) {
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Decide the next rotation step after a fallback-worthy LLM error.
+ * Order: model → key → provider, except:
+ *   - 401/402/403 skip remaining models on that key
+ *   - payload-too-large (413) skips remaining models/keys on that provider
+ */
+export function nextLlmRotateAction({
+  reason,
+  statusCode,
+  modelIndex,
+  totalModels,
+  keyIndex,
+  totalKeys,
+  hasNextProvider,
+}) {
+  if (statusCode === 401 || statusCode === 402 || statusCode === 403) {
+    if (keyIndex < totalKeys - 1) return 'next-key';
+    return hasNextProvider ? 'next-provider' : 'exhausted';
+  }
+  if (reason === 'payload-too-large') {
+    return hasNextProvider ? 'next-provider' : 'exhausted';
+  }
+  if (modelIndex < totalModels - 1) return 'next-model';
+  if (keyIndex < totalKeys - 1) return 'next-key';
+  return hasNextProvider ? 'next-provider' : 'exhausted';
+}
+
+/**
  * Makes a chat completion call with the given messages and optional JSON mode.
  *
  * Fallback order (always on, innermost first):
- * 1. Key rotation on 429 — rate limits are usually per API key, so switch to the
- *    next key immediately instead of burning through every model on a hot key.
- * 2. Provider fallback on 429 — when every key on the current provider is
- *    rate-limited for the same model, try the next configured LLM (Groq, Ollama,
- *    OpenRouter, …) before downgrading to a smaller model on the same provider.
- * 3. Model fallback — for other transient errors, try the next free model on the
- *    same API key (e.g. Gemini 3.6 Flash → 3.5 Flash-Lite).
- * 4. Key rotation — after all models on a key are exhausted, move to the next key.
- * 5. Provider fallback — after all keys × models of a provider are exhausted,
- *    try the next configured provider in the chain using its own keys/models.
+ * 1. Model rotation — try the next model on the same key (Gemini 3.6 Flash →
+ *    3.5 Flash → 3.5 Flash-Lite). Quotas are often per-model, so this must run
+ *    before jumping to another LLM.
+ * 2. Key rotation — after every model on this key failed, try the next API key.
+ * 3. Provider fallback — after all keys × models are exhausted, try the next LLM.
  *
- * Auth/quota errors (401/402) are key-level and skip model rotation entirely.
+ * Auth/quota errors (401/402/403) skip remaining models on that key.
+ * Payload-too-large (413) skips remaining models/keys on that provider.
  *
  * @param {string} systemInstruction - System prompt
  * @param {string} userContent       - User prompt
@@ -316,16 +354,15 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
 
     if (providerIndex === 0) {
       const configuredRest = chain.slice(1).filter((id) => isProviderConfigured(id));
-      if (configuredRest.length > 0) {
-        console.log(
-          `[Provider Fallback] Primary: ${PROVIDERS[providerId]?.name || providerId}. ` +
-          `If all keys are exhausted, will try: ${configuredRest.join(' → ')}`
-        );
-      }
+      console.log(
+        `[Provider Fallback] Primary: ${PROVIDERS[providerId]?.name || providerId}. ` +
+        `Models: ${models.join(' → ') || '(none)'} (${entries.length} key(s))` +
+        (configuredRest.length > 0 ? `. If exhausted, will try: ${configuredRest.join(' → ')}` : '')
+      );
     } else {
       console.warn(
         `[Provider Fallback] Switching to ${PROVIDERS[providerId]?.name || providerId} ` +
-        `(${providerId}) — models: [${models.join(', ')}]`
+        `(${providerId}) — models: ${models.join(' → ')} (${entries.length} key(s))`
       );
     }
 
@@ -391,76 +428,63 @@ async function callLLM(systemInstruction, userContent, jsonMode = false, aiProvi
             throw err;
           }
 
-          // Key-level failures (bad/missing auth, exhausted billing quota) —
-          // no model change can fix these, so skip straight to the next key.
-          if (statusCode === 401 || statusCode === 402 || statusCode === 403) {
-            console.warn(
-              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
-              `failed (${reason}: ${statusCode}). Moving to next key...`
-            );
-            await pause(2000);
-            break; // next key (model rotation restarts from #1)
-          }
-
           if (statusCode === 429) providerHitRateLimit = true;
 
-          // Rate limits are usually per API key — rotate keys before exhausting every model on one key.
-          if (statusCode === 429 && keyIndex < totalKeys - 1) {
-            const waitMs = getRetryAfterMs(err, 3000);
+          const hasNextProvider = hasConfiguredFallbackProvider(chain, providerIndex);
+          const nextProviderId = chain.slice(providerIndex + 1).find((id) => isProviderConfigured(id));
+          const action = nextLlmRotateAction({
+            reason,
+            statusCode,
+            modelIndex,
+            totalModels,
+            keyIndex,
+            totalKeys,
+            hasNextProvider,
+          });
+
+          if (action === 'next-model') {
+            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 2000) : 200;
+            const nextModel = models[modelIndex + 1];
             console.warn(
-              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
-              `rate-limited on model "${model}". Trying next key in ${Math.round(waitMs / 1000)}s...`
+              `[Model Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `model ${modelIndex + 1}/${totalModels} "${model}" failed (${reason}: ${statusCode}). ` +
+              `Trying next model "${nextModel}" in ${Math.round(waitMs / 1000)}s...`
             );
             await pause(waitMs);
-            break; // next key (models restart from #1)
+            continue;
           }
 
-          // Every key on this provider is rate-limited for this model — try another LLM first.
-          if (
-            statusCode === 429 &&
-            keyIndex === totalKeys - 1 &&
-            hasConfiguredFallbackProvider(chain, providerIndex)
-          ) {
-            const nextProvider = chain.slice(providerIndex + 1).find((id) => isProviderConfigured(id));
-            const waitMs = getRetryAfterMs(err, 2000);
+          if (action === 'next-key') {
+            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 3000) : 2000;
             console.warn(
-              `[Provider Fallback] All ${totalKeys} ${providerId} API key(s) rate-limited for "${model}". ` +
-              `Trying next LLM (${nextProvider}) in ${Math.round(waitMs / 1000)}s...`
+              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
+              `failed (${reason}: ${statusCode}) after ${modelIndex + 1}/${totalModels} model(s). ` +
+              `Trying next key in ${Math.round(waitMs / 1000)}s...`
             );
             await pause(waitMs);
+            break;
+          }
+
+          if (action === 'next-provider') {
+            const waitMs = reason === 'payload-too-large'
+              ? 0
+              : (statusCode === 429 ? getRetryAfterMs(err, 2000) : 1000);
+            const why = reason === 'payload-too-large'
+              ? `rejected as too large (${statusCode}: ${err.message}). Skipping remaining ${providerId} keys/models`
+              : `all ${totalKeys} key(s) × ${totalModels} model(s) exhausted (${reason}: ${statusCode})`;
+            console.warn(
+              `[Provider Fallback] ${providerId} ${why}. ` +
+              `Switching to ${PROVIDERS[nextProviderId]?.name || nextProviderId}...`
+            );
+            if (waitMs > 0) await pause(waitMs);
             advanceProvider = true;
             break;
           }
 
-          // Limit crossed for THIS (key, model) pair → try the next free model
-          // on the same API key before touching other keys/providers.
-          if (modelIndex < totalModels - 1) {
-            const waitMs = statusCode === 429 ? getRetryAfterMs(err, 5000) : 200;
-            console.warn(
-              `[Model Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) ` +
-              `model ${modelIndex + 1}/${totalModels} "${model}" failed (${reason}: ${statusCode}). ` +
-              `Trying next free model in ${Math.round(waitMs / 1000)}s...`
-            );
-            await pause(waitMs);
-            continue; // next model, same key
-          }
-
-          // All models on this key are exhausted → try the next API key.
-          if (keyIndex < totalKeys - 1) {
-            console.warn(
-              `[Key Rotate] ${providerId} key ${keyIndex + 1}/${totalKeys} (${maskedKey}) — ` +
-              `all ${totalModels} model(s) exhausted (${reason}: ${statusCode}). Trying next key...`
-            );
-            await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
-            break; // next key
-          }
-
-          // Every key × model for this provider is exhausted → next provider.
           console.warn(
-            `[Provider Fallback] All ${totalKeys} key(s) × ${totalModels} model(s) for ` +
-            `"${providerId}" exhausted (${reason}: ${statusCode}). Trying next LLM provider...`
+            `[Provider Fallback] ${providerId} exhausted (${reason}: ${statusCode}) ` +
+            `and no further providers are configured.`
           );
-          await pause(statusCode === 429 ? getRetryAfterMs(err, 3000) : 1000);
           advanceProvider = true;
           break;
         }

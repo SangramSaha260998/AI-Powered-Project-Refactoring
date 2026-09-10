@@ -137,8 +137,8 @@ export const PROVIDERS = {
     // Override with GROQ_MODELS=custom/model1,custom/model2
     models: [
       'groq/compound',
-      'allam-2-7b',
-      'groq/compound-mini'
+      'groq/compound-mini',
+      'allam-2-7b'
     ]
   },
   tokenrouter: {
@@ -169,8 +169,11 @@ export function isOllamaCloudMode() {
 
 /**
  * Default order for automatic cross-provider fallback when a provider's
- * keys are exhausted (quota / auth / rate-limit / network / 5xx).
+ * keys are exhausted (quota / auth / rate-limit / payload-too-large / network / 5xx).
  * Primary (UI-selected) provider is always tried first; then this list minus the primary.
+ *
+ * Google GenAI is first: largest context window, best at blueprint/unit generation.
+ * Groq is last: small HTTP body limits (413) on large file-tree prompts.
  * Override via AI_FALLBACK_CHAIN=genai,openrouter,ollama
  *
  * Ollama Cloud is included automatically when OLLAMA_API_KEY is set.
@@ -178,11 +181,21 @@ export function isOllamaCloudMode() {
  */
 export const DEFAULT_PROVIDER_FALLBACK_CHAIN = [
   'genai',
-  'groq',
-  'ollama',
   'openrouter',
+  'ollama',
   'tokenrouter',
+  'groq',
 ];
+
+function orderFallbackRest(rest) {
+  return [...rest].sort((a, b) => {
+    const ia = DEFAULT_PROVIDER_FALLBACK_CHAIN.indexOf(a);
+    const ib = DEFAULT_PROVIDER_FALLBACK_CHAIN.indexOf(b);
+    const sa = ia === -1 ? DEFAULT_PROVIDER_FALLBACK_CHAIN.length : ia;
+    const sb = ib === -1 ? DEFAULT_PROVIDER_FALLBACK_CHAIN.length : ib;
+    return sa - sb;
+  });
+}
 
 /**
  * Builds the provider attempt order for a migration request.
@@ -199,15 +212,23 @@ export function getProviderFallbackChain(primaryProvider = 'openrouter') {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const base = fromEnv.length > 0 ? fromEnv : DEFAULT_PROVIDER_FALLBACK_CHAIN;
-  const knownConfigured = base.filter((id) => PROVIDERS[id] && isProviderConfigured(id));
+  // Union env + default so GenAI (and other configured LLMs) are never dropped
+  // just because AI_FALLBACK_CHAIN listed a subset.
+  const merged = [...fromEnv, ...DEFAULT_PROVIDER_FALLBACK_CHAIN];
+  const seen = new Set();
+  const knownConfigured = [];
+  for (const id of merged) {
+    if (seen.has(id) || !PROVIDERS[id] || !isProviderConfigured(id)) continue;
+    seen.add(id);
+    knownConfigured.push(id);
+  }
 
   const primary = PROVIDERS[primaryProvider] ? primaryProvider : knownConfigured[0];
   if (!primary) {
     return [];
   }
 
-  const rest = knownConfigured.filter((id) => id !== primary);
+  const rest = orderFallbackRest(knownConfigured.filter((id) => id !== primary));
   return [primary, ...rest];
 }
 
@@ -328,16 +349,90 @@ export function getProviderModels(provider = 'openrouter') {
 }
 
 /**
+ * Canonical large → small order for model rotation.
+ * Unknown ids fall back to parameter-count / lite-mini heuristics.
+ */
+const MODEL_SIZE_ORDER = {
+  genai: [
+    'gemini-3.6-pro',
+    'gemini-3.6-flash',
+    'gemini-3.5-pro',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-2.5-pro',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-1.5-pro',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-8b',
+  ],
+  groq: [
+    'groq/compound',
+    'groq/compound-mini',
+    'llama-3.3-70b-versatile',
+    'allam-2-7b',
+    'llama-3.1-8b-instant',
+  ],
+  ollama: [
+    'gpt-oss:120b',
+    'qwen3-coder:480b',
+    'qwen3-coder:30b',
+    'gpt-oss:20b',
+  ],
+  tokenrouter: [
+    'deepseek/deepseek-v4-pro-0813-free',
+    'qwen/qwen3.8-max-free',
+    'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+  ],
+  openrouter: [
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'nvidia/nemotron-3-super-120b-a12b:free',
+    'google/gemma-4-31b-it:free',
+    'google/gemma-4-26b-a4b-it:free',
+    'inclusionai/ling-3.0-flash:free',
+    'openrouter/auto:free',
+  ],
+};
+
+function modelSizeScore(modelId, ranked) {
+  const id = String(modelId || '');
+  const known = ranked.indexOf(id);
+  if (known !== -1) return (ranked.length - known) * 1e9;
+
+  const lower = id.toLowerCase();
+  const params = [...lower.matchAll(/(\d+(?:\.\d+)?)b\b/g)].map((m) => Number(m[1]));
+  let score = params.length ? Math.max(...params) * 1000 : 100;
+  if (/\blite\b/.test(lower)) score *= 0.4;
+  if (/\bmini\b/.test(lower)) score *= 0.5;
+  if (/\bnano\b/.test(lower)) score *= 0.3;
+  if (/\bpro\b/.test(lower)) score *= 1.4;
+  if (/\bmax\b|\bultra\b/.test(lower)) score *= 1.3;
+  return score;
+}
+
+/**
+ * Sort model ids largest → smallest for a provider.
+ */
+export function sortModelsLargeToSmall(models, provider) {
+  const ranked = MODEL_SIZE_ORDER[provider] || [];
+  return [...models].sort((a, b) => {
+    const diff = modelSizeScore(b, ranked) - modelSizeScore(a, ranked);
+    if (diff !== 0) return diff;
+    return 0;
+  });
+}
+
+/**
  * Builds the ordered list of models to try for a provider's automatic fallback.
- * Order (duplicates removed, first occurrence wins):
- *   1. UI-selected model (primary provider only)
- *   2. Env override (<PREFIX>_MODELS, comma-separated) — server-admin preference
- *   3. Provider's built-in free-model fallback list
- *   4. Provider defaultModel as a final safety net
+ * Always large → small. The UI-selected model (if any) is the starting point;
+ * only that model and smaller ones are tried — never a larger one afterwards.
  *
- * This powers the "model → key → provider" rotation in callLLM(): when a
- * (key, model) pair crosses its rate limit, the next free model on the SAME
- * key is tried before moving to the next key or provider.
+ * Sources (deduped, then ranked):
+ *   1. UI-selected model (primary provider only)
+ *   2. Env override (<PREFIX>_MODELS, comma-separated)
+ *   3. Provider's built-in fallback list
+ *   4. Provider defaultModel
  *
  * @param {string} provider - Provider key from the PROVIDERS registry
  * @param {string} [overrideModel] - Model chosen in the UI (primary provider only)
@@ -360,15 +455,18 @@ export function getProviderFallbackModels(provider = 'openrouter', overrideModel
   ];
 
   const seen = new Set();
-  const result = [];
+  const unique = [];
   for (const model of candidates) {
-    if (!model) continue;
-    if (seen.has(model)) continue;
+    if (!model || seen.has(model)) continue;
     seen.add(model);
-    result.push(model);
+    unique.push(model);
   }
 
-  return result;
+  const ranked = sortModelsLargeToSmall(unique, provider);
+  if (overrideModel && ranked.includes(overrideModel)) {
+    return ranked.slice(ranked.indexOf(overrideModel));
+  }
+  return ranked;
 }
 
 /**

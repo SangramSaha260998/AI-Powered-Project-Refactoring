@@ -358,8 +358,8 @@ router.get('/models/genai', async (req, res) => {
  */
 const TOP_GROQ_MODELS = [
   'groq/compound',
-  'allam-2-7b',
   'groq/compound-mini',
+  'allam-2-7b',
 ];
 
 /**

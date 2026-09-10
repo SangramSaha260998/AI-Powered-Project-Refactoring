@@ -3566,6 +3566,276 @@ export class ItemEditorComponent {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 
+{
+  // TS2739: (remove)="field = $event" is a native Event, not the entity type
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-remove-event-assign-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'components', 'task-table');
+  const modelsDir = path.join(tmp, 'src', 'app', 'models');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.mkdirSync(modelsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelsDir, 'task.model.ts'),
+    `export interface Task { id: string; title: string; description: string; status: string; }\n`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'task-table.component.ts'),
+    `import { Component, EventEmitter, Output } from '@angular/core';
+import { Task } from '../../models/task.model';
+@Component({ selector: 'app-task-table', standalone: true, templateUrl: './task-table.component.html' })
+export class TaskTableComponent {
+  @Output() onRemove = new EventEmitter<Task>();
+  @Output() onEdit = new EventEmitter<Task>();
+}
+`
+  );
+  fs.writeFileSync(path.join(tableDir, 'task-table.component.html'), `<p>table</p>\n`);
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { Task } from '../../../../../models/task.model';
+export interface Task { id: string; title: string; description: string; status: string; }
+import { TaskTableComponent } from '../../components/task-table/task-table.component';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  imports: [TaskTableComponent],
+  templateUrl: './task-list.component.html'
+})
+export class TaskListComponent {
+  deletingTask: Task | null = null;
+  openEdit(_task: Task): void {}
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.html'),
+    `<app-task-table (edit)="openEdit($event)" (remove)="deletingTask = $event"></app-task-table>\n`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2739: Type 'Event' is missing the following properties from type 'Task': id, title, description, status
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.html:61:74:
+  61 │ ...nEdit($event)" (remove)="deletingTask = $event" ></app-task-table>
+Error occurs in the template of component TaskListComponent.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:33:15: templateUrl: './task-list.component.html'
+TS2440: Import declaration conflicts with local declaration of 'Task'.
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:1:9:
+  1 │ import { Task } from '../../../../../models/task.model';
+`
+  );
+  const listHtml = fs.readFileSync(path.join(listDir, 'task-list.component.html'), 'utf-8');
+  const listTs = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs Event assignment + Task import conflict');
+  assert(
+    /\(remove\)="deletingTask = \$any\(\$event\)"/.test(listHtml) ||
+      /\(onRemove\)="deletingTask = \$any\(\$event\)"/.test(listHtml),
+    'remove assignment wraps $any($event)'
+  );
+  assert(/from ['"].*task\.model['"]/.test(listTs), 'keeps Task import from model');
+  assert(!/(?:export\s+)?interface\s+Task\b/.test(listTs), 'local Task interface removed');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-missing-tasks-'));
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'tasks', 'pages', 'item-list');
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(listDir, 'item-list.component.ts'),
+    `import { Component, OnInit } from '@angular/core';
+import { MatTableDataSource } from '@angular/material/table';
+import { Task } from '../../../models/task.model';
+@Component({
+  selector: 'app-item-list',
+  standalone: true,
+  templateUrl: './item-list.component.html'
+})
+export class ItemListComponent implements OnInit {
+  public dataSource = new MatTableDataSource<Task>([]);
+  ngOnInit(): void {
+    this.dataSource.data = [];
+  }
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'item-list.component.html'),
+    `<app-item-table [tasks]="tasks" (edit)="openEdit($event)"></app-item-table>\n`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2339: Property 'tasks' does not exist on type 'ItemListComponent'.
+[plugin angular-compiler] src/app/pages/tasks/pages/item-list/item-list.component.html:1:29:
+  1 │ <app-item-table [tasks]="tasks" (edit)="openEdit($event)"></app-item-table>
+Error occurs in the template of component ItemListComponent.
+src/app/pages/tasks/pages/item-list/item-list.component.ts:7:15:
+  7 │ templateUrl: './item-list.component.html'
+`
+  );
+  const ts = fs.readFileSync(path.join(listDir, 'item-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs missing [tasks] member');
+  assert(/\bget\s+tasks\s*\(/.test(ts), 'tasks getter aliases dataSource.data');
+  assert(/return this\.dataSource\.data/.test(ts), 'getter reads MatTableDataSource data');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-status-index-'));
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'tasks', 'components', 'item-table');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'item-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+import { TASK_STATUS_LABELS } from '../../../models/task.model';
+@Component({
+  selector: 'app-item-table',
+  standalone: true,
+  templateUrl: './item-table.component.html'
+})
+export class ItemTableComponent {
+  row: any = null;
+  public statusLabels = TASK_STATUS_LABELS;
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'item-table.component.html'),
+    `<td mat-cell *matCellDef="let row">{{ statusLabels[row.status] || row.status }}</td>\n`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS7053: Element implicitly has an 'any' type because expression of type 'string' can't be used to index type 'Record<TaskStatus, string>'.
+[plugin angular-compiler] src/app/pages/tasks/components/item-table/item-table.component.html:1:38:
+  1 │ {{ statusLabels[row.status] || row.status }}
+Error occurs in the template of component ItemTableComponent.
+src/app/pages/tasks/components/item-table/item-table.component.ts:6:15:
+  6 │ templateUrl: './item-table.component.html'
+`
+  );
+  const ts = fs.readFileSync(path.join(tableDir, 'item-table.component.ts'), 'utf-8');
+  const html = fs.readFileSync(path.join(tableDir, 'item-table.component.html'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs statusLabels index access');
+  assert(/statusLabels:\s*Record<string,\s*string>/.test(ts), 'statusLabels widened to Record<string, string>');
+  assert(/statusLabels\[\$any\(row\.status\)\]/.test(html), 'index uses $any()');
+  assert(!/^\s*row:\s*any\s*=\s*null/m.test(ts), 'shadow matCellDef row field removed');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-missing-ds-'));
+  const tableDir = path.join(tmp, 'src', 'app', 'pages', 'tasks', 'components', 'item-table');
+  fs.mkdirSync(tableDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(tableDir, 'item-table.component.ts'),
+    `import { Component, Input } from '@angular/core';
+import { MatTableDataSource } from '@angular/material/table';
+import { Task } from '../../../models/task.model';
+@Component({
+  selector: 'app-item-table',
+  standalone: true,
+  templateUrl: './item-table.component.html'
+})
+export class ItemTableComponent {
+  @Input() set tasks(value: Task[]) {
+    this._tasks = value;
+    this.dataSource = new MatTableDataSource<Task>(value);
+  }
+  get tasks(): Task[] {
+    return this._tasks;
+  }
+  private _tasks: Task[] = [];
+}
+`
+  );
+  fs.writeFileSync(
+    path.join(tableDir, 'item-table.component.html'),
+    `<table mat-table [dataSource]="dataSource">
+  <mat-footer-row *matFooterRowDef="['noRecords']" [hidden]="dataSource.data.length > 0"></mat-footer-row>
+</table>
+`
+  );
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `TS2339: Property 'dataSource' does not exist on type 'ItemTableComponent'.
+[plugin angular-compiler] src/app/pages/tasks/components/item-table/item-table.component.html:2:65:
+  2 │ [hidden]="dataSource.data.length > 0"
+Error occurs in the template of component ItemTableComponent.
+src/app/pages/tasks/components/item-table/item-table.component.ts:6:15:
+  6 │ templateUrl: './item-table.component.html'
+TS2339: Property 'dataSource' does not exist on type 'ItemTableComponent'.
+src/app/pages/tasks/components/item-table/item-table.component.ts:12:9:
+  12 │ this.dataSource = new MatTableDataSource<Task>(value);
+`
+  );
+  const ts = fs.readFileSync(path.join(tableDir, 'item-table.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs missing dataSource field');
+  assert(
+    /(?:^|\n)\s*dataSource\s*=\s*new\s+MatTableDataSource<Task>\(\[\]\)/m.test(ts),
+    'declares dataSource = new MatTableDataSource<Task>([])'
+  );
+  assert(/this\.dataSource\.data\s*=/.test(ts), 'setter writes dataSource.data instead of replacing the instance');
+  assert(!/this\.dataSource\s*=\s*new\s+MatTableDataSource/.test(ts), 'does not assign a new MatTableDataSource in the setter');
+  assert(
+    !/@Input\s*\([^)]*\)\s+dataSource\b/.test(ts),
+    'mat-table [dataSource] is not promoted to @Input() on the host component'
+  );
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mig-relimp-'));
+  const modelDir = path.join(tmp, 'src', 'app', 'models');
+  const listDir = path.join(tmp, 'src', 'app', 'pages', 'app', 'tasks', 'pages', 'task-list');
+  fs.mkdirSync(modelDir, { recursive: true });
+  fs.mkdirSync(listDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(modelDir, 'task.model.ts'),
+    `export interface Task { id: string; }
+export type TaskDraft = Omit<Task, 'id'>;
+export const TASK_STATUS_LABELS: Record<string, string> = {};
+`
+  );
+  fs.writeFileSync(
+    path.join(listDir, 'task-list.component.ts'),
+    `import { Component } from '@angular/core';
+import { Task, TaskDraft, TASK_STATUS_LABELS } from '../../../../../../models/task.model';
+@Component({
+  selector: 'app-task-list',
+  standalone: true,
+  templateUrl: './task-list.component.html',
+  styleUrl: './task-list.component.scss'
+})
+export class TaskListComponent {
+  tasks: Task[] = [];
+}
+`
+  );
+  fs.writeFileSync(path.join(listDir, 'task-list.component.html'), `<div></div>\n`);
+
+  const n = fixAngularCompileErrors(
+    tmp,
+    `Could not resolve "../../../../../../models/task.model"
+src/app/pages/app/tasks/pages/task-list/task-list.component.ts:11:52:
+TS2307: Cannot find module '../../../../../../models/task.model' or its corresponding type declarations.
+[plugin angular-compiler] src/app/pages/app/tasks/pages/task-list/task-list.component.ts:11:52:
+`
+  );
+  const ts = fs.readFileSync(path.join(listDir, 'task-list.component.ts'), 'utf-8');
+  assert(n >= 1, 'fixAngularCompileErrors repairs wrong-depth relative imports');
+  assert(
+    /from '\.\.\/\.\.\/\.\.\/\.\.\/\.\.\/models\/task\.model'/.test(ts),
+    'relative model import recomputed to the real file location'
+  );
+  assert(/styleUrl: '\.\/task-list\.component\.scss'/.test(ts), 'scss styleUrl left alone');
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
 if (process.exitCode) {
   console.error('\nSome postprocess tests failed.');
 } else {
